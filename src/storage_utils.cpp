@@ -354,14 +354,33 @@ namespace libtorrent { namespace aux {
 			{
 				ec.ec.clear();
 			}
-			else if (ec && ec.ec != boost::system::errc::invalid_argument
-				&& ec.ec != boost::system::errc::permission_denied)
+			else if (ec.ec == boost::system::errc::invalid_argument
+				|| ec.ec == boost::system::errc::permission_denied)
+			{
+				ec.operation = operation_t::file_rename;
+			}
+			else if (ec)
 			{
 				// the rename failed, for a reason other than the two above,
 				// which are unlikely to be fixed by copying instead (e.g.
 				// EXDEV, when old_name and new_path are on different volumes)
 				ec.ec.clear();
-				copy_file(old_name, new_path, ec);
+#if TORRENT_HAS_SYMLINK
+				if (fs.file_flags(index) & file_storage::flag_symlink)
+				{
+					// copy_file() would follow the symlink and copy whatever
+					// it points to, instead of moving the link itself. Recreate
+					// it at the new location the same way it was originally
+					// created: relative to the link's own directory
+					std::string const target =
+						lexically_relative(parent_path(new_filename), fs.symlink(index));
+					create_symlink(target, new_path, ec);
+				}
+				else
+#endif
+				{
+					copy_file(old_name, new_path, ec);
+				}
 				if (!ec)
 				{
 					error_code ignore;
