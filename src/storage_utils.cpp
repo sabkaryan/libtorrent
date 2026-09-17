@@ -299,6 +299,95 @@ namespace libtorrent { namespace aux {
 		}
 	}
 
+	void rename_file(file_storage const& fs,
+		renamed_files& renamed,
+		file_index_t const index,
+		std::string const& new_filename,
+		std::string const& save_path,
+		storage_error& ec)
+	{
+		TORRENT_ASSERT(index >= file_index_t(0));
+		TORRENT_ASSERT(index < fs.end_file());
+		if (index < file_index_t(0) || index >= fs.end_file())
+			return;
+		std::string const old_name = renamed.file_path(fs, index, save_path);
+
+		// if the old file doesn't exist, just succeed and change the filename
+		// that will be created. This shortcut is important because the
+		// destination directory may not exist yet, which would cause a failure
+		// even though we're not moving a file (yet). It's better for it to
+		// fail later when we try to write to the file the first time, because
+		// the user then will have had a chance to make the destination directory
+		// valid.
+		if (exists(old_name, ec.ec, dont_follow_links))
+		{
+			std::string const new_path =
+				is_complete(new_filename) ? new_filename : combine_path(save_path, new_filename);
+			std::string const new_dir = parent_path(new_path);
+
+			error_code best_effort;
+			if (exists(new_path, best_effort, dont_follow_links))
+			{
+				// We don't want to overwrite an existing file
+				ec.ec = error_code(boost::system::errc::file_exists, generic_category());
+				ec.file(index);
+				ec.operation = operation_t::file_rename;
+				return;
+			}
+
+			// create any missing directories that the new filename
+			// lands in
+			create_directories(new_dir, ec.ec);
+			if (ec.ec)
+			{
+				ec.file(index);
+				ec.operation = operation_t::mkdir;
+				return;
+			}
+
+			rename(old_name, new_path, ec.ec);
+
+			// if old_name doesn't exist, that's not an error
+			// here. Once we start writing to the file, it will
+			// be written to the new filename
+			if (ec.ec == boost::system::errc::no_such_file_or_directory)
+			{
+				ec.ec.clear();
+			}
+			else if (ec && ec.ec != boost::system::errc::invalid_argument
+				&& ec.ec != boost::system::errc::permission_denied)
+			{
+				// the rename failed, for a reason other than the two above,
+				// which are unlikely to be fixed by copying instead (e.g.
+				// EXDEV, when old_name and new_path are on different volumes)
+				ec.ec.clear();
+				copy_file(old_name, new_path, ec);
+				if (!ec)
+				{
+					error_code ignore;
+					remove(old_name, ignore);
+				}
+			}
+
+			if (ec)
+			{
+				ec.file(index);
+				return;
+			}
+		}
+		else if (ec.ec)
+		{
+			// if exists fails, report that error
+			ec.file(index);
+			ec.operation = operation_t::file_stat;
+			return;
+		}
+
+		// if old path doesn't exist, just record the rename
+		// so it will get the new name when it is created.
+		renamed.rename_file(fs, index, new_filename);
+	}
+
 namespace {
 
 std::int64_t get_filesize(stat_cache& stat, file_index_t const file_index
