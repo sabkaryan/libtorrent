@@ -716,6 +716,21 @@ namespace libtorrent {
 		return sync_call_ret<bool>(false, &aux::torrent::user_have_piece, piece);
 	}
 
+	int torrent_handle::forget_piece(piece_index_t piece) const
+	{
+#ifdef BOOST_NO_EXCEPTIONS
+		// sync_call_ret returns the default when the handle is invalid
+		return sync_call_ret<int>(5, &aux::torrent::forget_piece, piece);
+#else
+		try {
+			return sync_call_ret<int>(5, &aux::torrent::forget_piece, piece);
+		} catch (system_error const& e) {
+			if (e.code() == errors::invalid_torrent_handle) return 5;
+			throw;
+		}
+#endif
+	}
+
 	void torrent_handle::set_sequential_range(piece_index_t const first_piece, piece_index_t const last_piece) const
 	{
 		TORRENT_ASSERT_PRECOND(first_piece >= piece_index_t(0) && last_piece >= first_piece);

@@ -325,6 +325,21 @@ namespace aux {
 		// to disk, and false otherwise.
 		bool have_piece(piece_index_t piece) const;
 
+		// Stop considering ``piece`` as downloaded, so it is picked and
+		// downloaded again, without disconnecting peers or re-checking the
+		// torrent. Pending requests for the piece from peers are rejected.
+		// The data on disk is not touched; the caller may release its bytes
+		// (e.g. punch a hole in the file) once this call has returned.
+		// This is a synchronous call. It returns:
+		//   0 the piece was forgotten
+		//   1 we did not have the piece (nothing done)
+		//   2 the torrent has released its piece picker (it is a seed);
+		//     nothing done. Re-add the torrent or force_recheck() instead
+		//   3 the piece is currently being downloaded; nothing done
+		//   4 invalid piece index or no metadata
+		//   5 the handle is invalid
+		int forget_piece(piece_index_t piece) const;
+
 #if TORRENT_ABI_VERSION == 1
 		// internal
 		TORRENT_DEPRECATED
