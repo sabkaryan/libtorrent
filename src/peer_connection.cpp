@@ -5634,6 +5634,27 @@ namespace {
 		// block, the peer is still useful
 		m_disk_read_failures = 0;
 
+		// the request passed the have-check in incoming_request(), but the
+		// piece may have been dropped while the read was in flight (see
+		// torrent::forget_piece()). Apply the same rule on the way out:
+		// never send data for a piece we don't have. This sits before the
+		// suggest logic so we don't suggest a piece we no longer have.
+		if (t && !t->user_have_piece(r.piece)
+#ifndef TORRENT_DISABLE_PREDICTIVE_PIECES
+			&& !t->is_predictive_piece(r.piece)
+#endif
+			&& !t->seed_mode())
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			peer_log(peer_log_alert::info, peer_log_alert::invalid_request
+				, "piece: %d s: %x l: %x we don't have this piece anymore"
+				, static_cast<int>(r.piece), std::uint32_t(r.start), std::uint32_t(r.length));
+#endif
+			m_counters.inc_stats_counter(counters::num_stale_piece_rejects);
+			if (!m_disconnecting) write_reject_request(r);
+			return;
+		}
+
 		if (t && m_settings.get_int(settings_pack::suggest_mode)
 			== settings_pack::suggest_read_cache)
 		{
@@ -5648,26 +5669,6 @@ namespace {
 		if (!t)
 		{
 			disconnect(error.ec, operation_t::file_read);
-			return;
-		}
-
-		// the request passed the have-check in incoming_request(), but the
-		// piece may have been dropped while the read was in flight (see
-		// torrent::forget_piece()). Apply the same rule on the way out:
-		// never send data for a piece we don't have.
-		if (!t->user_have_piece(r.piece)
-#ifndef TORRENT_DISABLE_PREDICTIVE_PIECES
-			&& !t->is_predictive_piece(r.piece)
-#endif
-			&& !t->seed_mode())
-		{
-#ifndef TORRENT_DISABLE_LOGGING
-			peer_log(peer_log_alert::info, peer_log_alert::piece_failed
-				, "piece: %d s: %x l: %x we don't have this piece anymore"
-				, static_cast<int>(r.piece), std::uint32_t(r.start), std::uint32_t(r.length));
-#endif
-			m_counters.inc_stats_counter(counters::num_stale_piece_rejects);
-			write_reject_request(r);
 			return;
 		}
 
