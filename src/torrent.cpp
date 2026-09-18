@@ -4763,7 +4763,9 @@ namespace {
 		m_file_progress.clear();
 		m_file_progress.init(*m_picker, m_torrent_file->layout());
 
-		inc_stats_counter(counters::num_have_pieces, -1);
+		// counters::num_have_pieces is deliberately left alone: it is a
+		// monotonic stats counter ("pieces we have ever completed"), not a
+		// gauge, and must never be decremented (see inc_stats_counter())
 
 		// re-evaluate interest in all peers and, if we used to be finished,
 		// go back to downloading (same as when a file priority is raised
