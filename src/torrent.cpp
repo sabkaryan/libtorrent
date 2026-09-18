@@ -4726,6 +4726,55 @@ namespace {
 		update_want_tick();
 	}
 
+	int torrent::forget_piece(piece_index_t const index)
+	{
+		TORRENT_ASSERT(is_single_thread());
+		INVARIANT_CHECK;
+
+		if (!valid_metadata()) return 4;
+		if (index < piece_index_t(0) || index >= m_torrent_file->end_piece()) return 4;
+		if (!has_picker()) return 2;
+		if (!m_picker->have_piece(index)) return 1;
+		if (m_picker->is_downloading(index)) return 3;
+
+		bool const was_finished = is_finished();
+
+		// mirror of the two internal call sites (resume data with
+		// unfinished pieces, and v2 hash failure): drop the piece from the
+		// picker and update the gauge state
+		m_picker->we_dont_have(index);
+		update_gauge();
+
+		// we may have announced HAVE for this piece. Reject any pending
+		// requests for it and let peers that support it know we don't
+		// have it anymore (the same as piece_failed() does for predictive
+		// pieces). Peers may disconnect while iterating.
+		for (auto i = begin(); i != end();)
+		{
+			peer_connection* p = *i;
+			++i;
+			p->reject_piece(index);
+			if (p->is_disconnecting()) continue;
+			p->write_dont_have(index);
+		}
+
+		// file_progress has no way to remove a piece; rebuild it from the
+		// picker, the same way force_recheck() does
+		m_file_progress.clear();
+		m_file_progress.init(*m_picker, m_torrent_file->layout());
+
+		inc_stats_counter(counters::num_have_pieces, -1);
+
+		// re-evaluate interest in all peers and, if we used to be finished,
+		// go back to downloading (same as when a file priority is raised
+		// from dont_download)
+		update_peer_interest(was_finished);
+
+		set_need_save_resume(torrent_handle::if_download_progress);
+		state_updated();
+		return 0;
+	}
+
 	boost::tribool torrent::on_blocks_hashed(piece_index_t const piece
 		, span<sha256_hash const> const block_hashes)
 	{

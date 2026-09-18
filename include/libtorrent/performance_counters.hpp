@@ -348,6 +348,11 @@ namespace libtorrent {
 			disk_read_latency19,
 			disk_read_latency20,
 
+			// number of block reads that completed for a piece we no longer
+			// have (e.g. after torrent::forget_piece()) and were rejected
+			// instead of being sent. See peer_connection::on_disk_read_complete
+			num_stale_piece_rejects,
+
 			num_stats_counters
 		};
 

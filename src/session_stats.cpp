@@ -264,6 +264,7 @@ namespace {
 		METRIC(ses, num_outgoing_have_all),
 		METRIC(ses, num_outgoing_have_none),
 		METRIC(ses, num_outgoing_reject),
+		METRIC(ses, num_stale_piece_rejects),
 		METRIC(ses, num_outgoing_allowed_fast),
 		METRIC(ses, num_outgoing_ext_handshake),
 		METRIC(ses, num_outgoing_pex),

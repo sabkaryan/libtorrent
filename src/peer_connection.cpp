@@ -5651,6 +5651,26 @@ namespace {
 			return;
 		}
 
+		// the request passed the have-check in incoming_request(), but the
+		// piece may have been dropped while the read was in flight (see
+		// torrent::forget_piece()). Apply the same rule on the way out:
+		// never send data for a piece we don't have.
+		if (!t->user_have_piece(r.piece)
+#ifndef TORRENT_DISABLE_PREDICTIVE_PIECES
+			&& !t->is_predictive_piece(r.piece)
+#endif
+			&& !t->seed_mode())
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			peer_log(peer_log_alert::info, peer_log_alert::piece_failed
+				, "piece: %d s: %x l: %x we don't have this piece anymore"
+				, static_cast<int>(r.piece), std::uint32_t(r.start), std::uint32_t(r.length));
+#endif
+			m_counters.inc_stats_counter(counters::num_stale_piece_rejects);
+			write_reject_request(r);
+			return;
+		}
+
 #ifndef TORRENT_DISABLE_LOGGING
 		peer_log(peer_log_alert::outgoing_message
 			, peer_log_alert::piece, "piece: %d s: %x l: %x"
