@@ -884,6 +884,20 @@ namespace libtorrent::aux {
 
 	public:
 
+		// the inverse of we_have(): stop considering ``index`` a piece we
+		// have, so it is picked and downloaded again. Peers with pending
+		// requests for it get a reject (and a dont-have message, if they
+		// support it). Nothing is done to the file on disk; the caller is
+		// free to release the piece's bytes (e.g. by punching a hole)
+		// *after* this returns. Return codes:
+		//   0 forgotten
+		//   1 we didn't have the piece (no-op)
+		//   2 no piece picker (the torrent is a seed and has released it)
+		//   3 the piece is currently being downloaded (not touched)
+		//   4 invalid index or no metadata
+		// Must be called from the network thread.
+		int forget_piece(piece_index_t index);
+
 		// the number of pieces that have passed
 		// hash check, but aren't necessarily
 		// flushed to disk yet
