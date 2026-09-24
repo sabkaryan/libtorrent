@@ -76,10 +76,11 @@ settings_pack forget_settings()
 }
 
 // adds a v1 torrent whose file does not exist yet, waits until it is checked
-torrent_handle add_empty(lt::session& ses, std::string const& save_path)
+torrent_handle add_empty(lt::session& ses, std::string const& save_path
+	, int const pieces = num_pieces)
 {
 	add_torrent_params atp = ::create_torrent(nullptr, "forget_piece", piece_size
-		, num_pieces, false, create_torrent::v1_only);
+		, pieces, false, create_torrent::v1_only);
 	atp.save_path = save_path;
 	atp.flags &= ~torrent_flags::auto_managed;
 	atp.flags &= ~torrent_flags::paused;
@@ -258,7 +259,10 @@ TORRENT_TEST(forget_piece_leaves_nothing_to_flush)
 	ses.add_extension([&ioc, file, state](torrent_handle const& h, client_data_t)
 		-> std::shared_ptr<torrent_plugin>
 		{ return std::make_shared<forget_on_pass>(h.native_handle(), ioc, file, state); });
-	torrent_handle const th = add_empty(ses, save_path);
+	// one piece more than is added: if every piece passed before it was
+	// written, a torrent made of just those would finish and drop its piece
+	// picker, and forget_piece() would answer 2 to the retries
+	torrent_handle const th = add_empty(ses, save_path, num_pieces + 1);
 
 	// one piece at a time, so the network thread is idle when a piece passes
 	// and the forget_piece() posted by the plugin runs right away
