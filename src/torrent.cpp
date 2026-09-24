@@ -2758,10 +2758,8 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		}
 
 #ifndef TORRENT_DISABLE_LOGGING
-		std::stringstream hash;
-		hash << piece_hash;
 		debug_log("on_piece_hashed, piece: %d piece_hash: %s"
-			, static_cast<int>(piece), hash.str().c_str());
+			, static_cast<int>(piece), aux::to_hex(piece_hash).c_str());
 #endif
 		if ((hash_passed[0] && !hash_passed[1]) || (!hash_passed[0] && hash_passed[1]))
 		{
