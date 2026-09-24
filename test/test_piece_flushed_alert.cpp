@@ -296,6 +296,67 @@ TORRENT_TEST(piece_flushed_from_peer)
 	remove_all(seed_path, ec);
 	remove_all(save_path, ec);
 }
+
+namespace {
+
+// pieces downloaded from a peer pass their hash check while their writes are
+// held; then `stop` pauses or removes the torrent, and the writes are let go.
+// Stopping a torrent flushes its cached blocks, so every piece is written and
+// reported as it is
+void flushed_after_stop(char const* const name_suffix
+	, std::function<void(lt::session&, torrent_handle const&)> const& stop)
+{
+	std::string const seed_path = complete((std::string("piece_flushed_seed_") + name_suffix).c_str());
+	std::string const save_path = complete((std::string("piece_flushed_peer_") + name_suffix).c_str());
+	error_code ec;
+	remove_all(seed_path, ec);
+	remove_all(save_path, ec);
+	create_directory(seed_path, ec);
+	create_directory(save_path, ec);
+	write_whole_file(combine_path(seed_path, name));
+
+	lt::session seed(flushed_settings());
+	torrent_handle const seed_th = seed.add_torrent(make_params(seed_path));
+	for (int i = 0; i < 100 && !seed_th.status().is_seeding; ++i)
+		std::this_thread::sleep_for(50ms);
+	TEST_CHECK(seed_th.status().is_seeding);
+
+	lt::session ses(flushed_settings());
+	torrent_handle const th = ses.add_torrent(make_params(save_path));
+	std::string const file = combine_path(save_path, name);
+
+	piece_alerts rec;
+	collect(ses, rec, file, [&] { return th.status().state == torrent_status::downloading; }, 10s);
+
+	set_hold_writes(true);
+	th.connect_peer(tcp::endpoint(make_address_v4("127.0.0.1"), seed.listen_port()));
+
+	collect(ses, rec, file, [&] { return rec.all_finished(); }, 20s);
+	TEST_CHECK(rec.all_finished());
+	TEST_EQUAL(rec.count(rec.flushed), 0);
+
+	stop(ses, th);
+	set_hold_writes(false);
+	collect(ses, rec, file, [&] { return rec.all_flushed(); }, 10s);
+	check_every_piece(rec);
+
+	collect(ses, rec, file, [] { return false; }, 500ms);
+	check_every_piece(rec);
+	remove_all(seed_path, ec);
+	remove_all(save_path, ec);
+}
+
+} // anonymous namespace
+
+TORRENT_TEST(piece_flushed_from_peer_then_paused)
+{
+	flushed_after_stop("paused", [](lt::session&, torrent_handle const& th) { th.pause(); });
+}
+
+TORRENT_TEST(piece_flushed_from_peer_then_removed)
+{
+	flushed_after_stop("removed", [](lt::session& ses, torrent_handle const& th) { ses.remove_torrent(th); });
+}
 #endif
 
 // pieces taken from resume data are in the file already: each gets its
