@@ -12801,6 +12801,28 @@ namespace {
 				st->pieces.resize(num_pieces, false);
 			}
 		}
+
+		if (flags & torrent_handle::query_flushed_pieces)
+		{
+			// a clear bit means "not known to be written" (see
+			// torrent_status::flushed_pieces). Without a piece picker, having
+			// all pieces means they are all in the files: a torrent in seed
+			// mode was given complete files, and maybe_done_flushing() drops
+			// the picker only once every piece is written, not as soon as every
+			// piece has passed its hash check. This branch depends on that
+			// condition
+			int const num_pieces = m_torrent_file->num_pieces();
+			if (has_picker())
+			{
+				st->flushed_pieces.resize(num_pieces, false);
+				for (auto const i : st->flushed_pieces.range())
+					if (m_picker->is_piece_flushed(i)) st->flushed_pieces.set_bit(i);
+			}
+			else
+			{
+				st->flushed_pieces.resize(num_pieces, m_have_all);
+			}
+		}
 		st->num_pieces = num_have();
 #if TORRENT_USE_INVARIANT_CHECKS
 		{

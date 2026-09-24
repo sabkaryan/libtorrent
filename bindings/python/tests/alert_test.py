@@ -922,6 +922,27 @@ class PieceFinishedAlertTest(TorrentAlertTest):
         self.assertEqual(alert.piece_index, 0)
 
 
+class PieceFlushedAlertTest(TorrentAlertTest):
+    ALERT_MASK = lt.alert_category.piece_progress
+
+    def test_piece_flushed_alert(self) -> None:
+        handle = self.session.add_torrent(self.atp)
+        # add_piece() doesn't work in checking state
+        wait_until_done_checking(handle, timeout=5)
+        handle.add_piece(0, self.torrent.pieces[0], 0)
+
+        alert = self.wait_for(lt.piece_flushed_alert, timeout=5)
+
+        self.assert_alert(alert, lt.alert_category.piece_progress, "piece_flushed")
+        self.assert_torrent_alert(alert, handle)
+        self.assertEqual(alert.piece_index, 0)
+
+        # the snapshot of the same thing
+        status = handle.status(lt.status_flags_t.query_flushed_pieces)
+        self.assertTrue(status.flushed_pieces[0])
+        self.assertEqual(status.pieces, [])
+
+
 class BlockFinishedAlertTest(PeerAlertTest):
     ALERT_MASK = lt.alert_category.block_progress
 

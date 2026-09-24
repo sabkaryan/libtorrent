@@ -712,6 +712,7 @@ void bind_torrent_handle()
 		s.attr("query_pieces") = torrent_handle::query_pieces;
 		s.attr("query_verified_pieces") = torrent_handle::query_verified_pieces;
 		s.attr("query_renamed_files") = torrent_handle::query_renamed_files;
+		s.attr("query_flushed_pieces") = torrent_handle::query_flushed_pieces;
 	}
 
 	class_<open_file_state>("open_file_state")
@@ -775,6 +776,7 @@ void bind_torrent_handle()
 		s.attr("query_pieces") = torrent_handle::query_pieces;
 		s.attr("query_verified_pieces") = torrent_handle::query_verified_pieces;
 		s.attr("query_renamed_files") = torrent_handle::query_renamed_files;
+		s.attr("query_flushed_pieces") = torrent_handle::query_flushed_pieces;
 	}
 }
 

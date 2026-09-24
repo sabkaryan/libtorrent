@@ -904,8 +904,13 @@ TORRENT_VERSION_NAMESPACE_4
 	// and passes the hash check. This alert derives from torrent_alert
 	// which contains the torrent_handle to the torrent the piece belongs to.
 	// Note that being downloaded and passing the hash check may happen before
-	// the piece is also fully flushed to disk. So torrent_handle::have_piece()
-	// may still return false
+	// the piece is also fully flushed to disk: with a backend that writes
+	// through (mmap_disk_io, posix_disk_io) the bytes are in the files by now,
+	// but since libtorrent 2.1 the default backend, pread_disk_io, writes them
+	// back afterwards. torrent_handle::have_piece() and
+	// torrent_status::pieces report the same as this alert; for the bytes
+	// being in the files see piece_flushed_alert and
+	// torrent_status::flushed_pieces
 	struct TORRENT_EXPORT piece_finished_alert final : torrent_alert
 	{
 		// internal
@@ -3310,7 +3315,9 @@ struct TORRENT_EXPORT oversized_file_alert final : torrent_alert
 	// as pread_disk_io, which hashes blocks from memory and writes them back
 	// afterwards, the bytes may reach the files later. An application that reads
 	// the downloaded files directly, rather than through
-	// torrent_handle::read_piece(), should wait for this alert.
+	// torrent_handle::read_piece(), should wait for this alert. The snapshot of
+	// the same thing, e.g. when the application starts listening, is
+	// torrent_status::flushed_pieces.
 	//
 	// For a piece that passed its hash check it is posted at or after the
 	// piece's piece_finished_alert, never before; with a backend that writes

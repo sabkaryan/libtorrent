@@ -65,6 +65,9 @@ void bind_torrent_status()
 			.add_property(
 				"verified_pieces", make_getter(&torrent_status::verified_pieces, by_value())
 			)
+			.add_property(
+				"flushed_pieces", make_getter(&torrent_status::flushed_pieces, by_value())
+			)
 			.def_readonly("num_pieces", &torrent_status::num_pieces)
 			.def_readonly("total_done", &torrent_status::total_done)
 			.def_readonly("total", &torrent_status::total)

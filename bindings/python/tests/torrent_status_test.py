@@ -78,6 +78,7 @@ class TorrentStatusTest(unittest.TestCase):
 
         self.assertEqual(self.status.pieces, [False] * len(self.torrent.pieces))
         self.assertIsInstance(self.status.verified_pieces, list)
+        self.assertEqual(self.status.flushed_pieces, [False] * len(self.torrent.pieces))
         self.assertIsInstance(self.status.num_pieces, int)
 
         self.assertIsInstance(self.status.total_done, int)

@@ -64,6 +64,7 @@ class EnumTest(unittest.TestCase):
         self.assertIsInstance(lt.torrent_handle.query_last_seen_complete, int)
         self.assertIsInstance(lt.torrent_handle.query_pieces, int)
         self.assertIsInstance(lt.torrent_handle.query_verified_pieces, int)
+        self.assertIsInstance(lt.torrent_handle.query_flushed_pieces, int)
 
     def test_file_open_mode(self) -> None:
         self.assertIsInstance(lt.file_open_mode.read_only, int)
@@ -108,6 +109,7 @@ class EnumTest(unittest.TestCase):
         self.assertIsInstance(lt.status_flags_t.query_pieces, int)
         self.assertIsInstance(lt.status_flags_t.query_verified_pieces, int)
         self.assertIsInstance(lt.status_flags_t.query_renamed_files, int)
+        self.assertIsInstance(lt.status_flags_t.query_flushed_pieces, int)
 
 
 class TorrentHandleTest(unittest.TestCase):

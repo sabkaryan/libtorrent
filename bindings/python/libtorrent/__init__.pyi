@@ -2601,6 +2601,10 @@ class piece_finished_alert(torrent_alert):
     @property
     def piece_index(self) -> int: ...
 
+class piece_flushed_alert(torrent_alert):
+    @property
+    def piece_index(self) -> int: ...
+
 class portmap_alert(alert):
     @property
     def external_port(self) -> int: ...
@@ -4027,6 +4031,7 @@ class status_flags_t(metaclass=_BoostBaseClass):
     __instance_size__: int
     query_accurate_download_counters: int
     query_distributed_copies: int
+    query_flushed_pieces: int
     query_last_seen_complete: int
     query_pieces: int
     query_renamed_files: int
@@ -4302,6 +4307,7 @@ class torrent_handle(metaclass=_BoostBaseClass):
     piece_granularity: int
     query_accurate_download_counters: int
     query_distributed_copies: int
+    query_flushed_pieces: int
     query_last_seen_complete: int
     query_pieces: int
     query_renamed_files: int
@@ -5283,6 +5289,8 @@ class torrent_status(metaclass=_BoostBaseClass):
     def finished_time(self) -> int: ...
     @property
     def flags(self) -> int: ...
+    @property
+    def flushed_pieces(self) -> list[bool]: ...
     @property
     def handle(self) -> torrent_handle: ...
     @property

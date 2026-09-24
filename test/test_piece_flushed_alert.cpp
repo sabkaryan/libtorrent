@@ -151,6 +151,29 @@ void check_every_piece(piece_alerts const& rec)
 	}
 }
 
+// the snapshot of the same thing: flushed_pieces holds exactly the pieces
+// written to the files. Also checks that pieces (passed their hash check)
+// covers every flushed piece
+void check_flushed_snapshot(torrent_handle const& th, int const expect_flushed)
+{
+	torrent_status const st = th.status(torrent_handle::query_pieces
+		| torrent_handle::query_flushed_pieces);
+	TEST_EQUAL(st.flushed_pieces.size(), num_pieces);
+	TEST_EQUAL(st.flushed_pieces.count(), expect_flushed);
+	if (st.flushed_pieces.size() == num_pieces && st.pieces.size() == num_pieces)
+	{
+		for (piece_index_t p{0}; p < piece_index_t{num_pieces}; ++p)
+			if (st.flushed_pieces.get_bit(p)) TEST_CHECK(st.pieces.get_bit(p));
+	}
+	// not filled in unless asked for
+	TEST_CHECK(th.status(torrent_handle::query_pieces).flushed_pieces.empty());
+	// and filled in without query_pieces as well: the two are independent
+	torrent_status const alone = th.status(torrent_handle::query_flushed_pieces);
+	TEST_EQUAL(alone.flushed_pieces.size(), num_pieces);
+	TEST_EQUAL(alone.flushed_pieces.count(), expect_flushed);
+	TEST_CHECK(alone.pieces.empty());
+}
+
 } // anonymous namespace
 
 // a backend that writes through (posix_disk_io): every block is in the file
@@ -177,6 +200,7 @@ TORRENT_TEST(piece_flushed_write_through)
 
 	collect(ses, rec, file, [&] { return rec.all_finished() && rec.all_flushed(); }, 10s);
 	check_every_piece(rec);
+	check_flushed_snapshot(th, num_pieces);
 
 	// and nothing more
 	collect(ses, rec, file, [] { return false; }, 500ms);
@@ -214,6 +238,8 @@ TORRENT_TEST(piece_flushed_write_back_cache)
 	TEST_EQUAL(rec.count(rec.flushed), 0);
 	// the writes really are held back
 	TEST_CHECK(piece_in_file(file, piece_index_t{0}) != data);
+	check_flushed_snapshot(th, 0);
+	TEST_EQUAL(th.status(torrent_handle::query_pieces).pieces.count(), num_pieces);
 
 	set_hold_writes(false);
 	collect(ses, rec, file, [&] { return rec.all_flushed(); }, 10s);
@@ -222,6 +248,8 @@ TORRENT_TEST(piece_flushed_write_back_cache)
 	collect(ses, rec, file, [] { return false; }, 500ms);
 	check_every_piece(rec);
 	TEST_CHECK(th.status().is_seeding);
+	// a seed that has dropped its piece picker has every piece in the files
+	check_flushed_snapshot(th, num_pieces);
 	remove_all(save_path, ec);
 }
 
@@ -257,6 +285,7 @@ TORRENT_TEST(piece_flushed_from_peer)
 	collect(ses, rec, file, [&] { return rec.all_finished(); }, 20s);
 	TEST_CHECK(rec.all_finished());
 	TEST_EQUAL(rec.count(rec.flushed), 0);
+	check_flushed_snapshot(th, 0);
 
 	set_hold_writes(false);
 	collect(ses, rec, file, [&] { return rec.all_flushed(); }, 10s);
@@ -292,5 +321,6 @@ TORRENT_TEST(piece_flushed_resume_data)
 	collect(ses, rec, file, [] { return false; }, 500ms);
 	check_every_piece(rec);
 	TEST_CHECK(th.status().is_seeding);
+	check_flushed_snapshot(th, num_pieces);
 	remove_all(save_path, ec);
 }

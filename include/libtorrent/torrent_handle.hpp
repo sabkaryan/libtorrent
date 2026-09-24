@@ -321,8 +321,12 @@ namespace aux {
 		// then the functions do nothing.
 		void set_sequential_range(piece_index_t first_piece, piece_index_t last_piece) const;
 		void set_sequential_range(piece_index_t first_piece) const;
-		// Returns true if this piece has been completely downloaded and written
-		// to disk, and false otherwise.
+		// Returns true if this piece has been completely downloaded and passed
+		// its hash check, and false otherwise. Its bytes may not be in the
+		// files yet: since libtorrent 2.1 the default disk I/O (pread_disk_io)
+		// writes a piece's blocks back after hashing them from memory. See
+		// torrent_status::flushed_pieces and piece_flushed_alert for the
+		// pieces that are in the files.
 		bool have_piece(piece_index_t piece) const;
 
 		// Stop considering ``piece`` as downloaded, so it is picked and
@@ -396,6 +400,9 @@ namespace aux {
 		static inline constexpr status_flags_t query_save_path = 7_bit;
 		// includes ``renamed_files``, a map of files that have been renamed in this torrent.
 		static inline constexpr status_flags_t query_renamed_files = 8_bit;
+		// populate the ``flushed_pieces`` field in torrent_status: the pieces
+		// whose blocks have all been written to the files.
+		static inline constexpr status_flags_t query_flushed_pieces = 9_bit;
 
 		// ``status()`` will return a structure with information about the status
 		// of this torrent. If the torrent_handle is invalid, it will throw

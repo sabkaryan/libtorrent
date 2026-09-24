@@ -212,12 +212,41 @@ TORRENT_VERSION_NAMESPACE_4
 		// a bitmask that represents which pieces we have (set to true) and the
 		// pieces we don't have. It's a pointer and may be set to 0 if the
 		// torrent isn't downloading or seeding.
+		//
+		// Having a piece means it passed its hash check, not that its bytes
+		// are in the files. With a disk I/O backend that writes through
+		// (mmap_disk_io, posix_disk_io) the two coincide; since libtorrent 2.1
+		// the default backend, pread_disk_io, hashes blocks from its cache and
+		// writes them back afterwards, so the bytes may reach the files later.
+		// For the pieces whose bytes are in the files see flushed_pieces.
 		typed_bitfield<piece_index_t> pieces;
 
 		// a bitmask representing which pieces has had their hash checked. This
 		// only applies to torrents in *seed mode*. If the torrent is not in seed
 		// mode, this bitmask may be empty.
 		typed_bitfield<piece_index_t> verified_pieces;
+
+		// a bitmask of the pieces whose blocks have all been written to the
+		// files: the snapshot of what piece_flushed_alert reports as it
+		// happens. Every piece in here is also in ``pieces``, but not the other
+		// way around: ``pieces`` holds the pieces that passed their hash check,
+		// and with a disk I/O backend that caches writes their bytes may reach
+		// the files later. An application that reads the downloaded files
+		// directly should use this one. Only filled in when status() is called
+		// with torrent_handle::query_flushed_pieces.
+		//
+		// The snapshot can only under-report: a piece written after the call
+		// is missing from it, but a piece in it stays written until the torrent
+		// drops the piece (for instance forget_piece(), force_recheck(), or a
+		// hash failure found through v2 block hashes). So it is safe to read a
+		// piece found here as long as the application does not drop it itself
+		// meanwhile.
+		//
+		// A clear bit means the piece is not known to be written, not that its
+		// bytes are absent: a torrent that has not checked its files yet, for
+		// instance, reports no piece at all. Wait for piece_flushed_alert
+		// rather than treat a clear bit as final.
+		typed_bitfield<piece_index_t> flushed_pieces;
 
 		// the total number of bytes of the file(s) that we have. All this does
 		// not necessarily has to be downloaded during this session (that's
