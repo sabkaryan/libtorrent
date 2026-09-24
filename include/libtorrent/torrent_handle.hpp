@@ -338,6 +338,11 @@ namespace aux {
 		//   3 the piece is currently being downloaded, or it passed the hash
 		//     check but not all of its blocks have been written to disk yet;
 		//     nothing done, try again later
+		// Limitation: in a torrent with only v2 hashes, a piece that could
+		// only be verified after its piece layer arrived (e.g. when added
+		// from a magnet link) may be taken as written before all of its
+		// blocks are on disk, and forget_piece() may return 0 for it too
+		// early. Releasing its bytes right away is not safe in that case.
 		//   4 invalid piece index or no metadata
 		//   5 the handle is invalid
 		int forget_piece(piece_index_t piece) const;
