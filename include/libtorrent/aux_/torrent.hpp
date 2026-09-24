@@ -1051,6 +1051,12 @@ namespace libtorrent::aux {
 		// we can delete the piece picker
 		void maybe_done_flushing();
 
+		// marks a block as written in the piece picker. If that makes a piece
+		// that passed its hash check flushed, posts its piece_flushed_alert
+		// (we_have() covers the pieces that are flushed before they pass)
+		void block_written(piece_block const& block, torrent_peer* peer);
+		void post_piece_flushed(piece_index_t index);
+
 		// this is called when the torrent has completed
 		// the download. It will post an event, disconnect
 		// all seeds and let the tracker know we're finished.

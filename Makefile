@@ -928,6 +928,7 @@ TEST_SOURCES = \
   test_disk_cache.cpp \
   test_disk_io.cpp \
   test_forget_piece.cpp \
+  test_piece_flushed_alert.cpp \
   test_slow_hash.cpp \
   test_dos_blocker.cpp \
   test_ed25519.cpp \

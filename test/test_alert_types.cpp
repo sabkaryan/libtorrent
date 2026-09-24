@@ -169,10 +169,11 @@ TORRENT_TEST(alerts_types)
 	TEST_ALERT_TYPE(file_priorities_alert, 105, alert_priority::critical, alert_category::status);
 	TEST_ALERT_TYPE(file_status_alert, 106, alert_priority::critical, alert_category::status);
 	TEST_ALERT_TYPE(ip_ban_alert, 107, alert_priority::normal, alert_category::ip_block);
+	TEST_ALERT_TYPE(piece_flushed_alert, 108, alert_priority::normal, alert_category::piece_progress);
 
 #undef TEST_ALERT_TYPE
 
-	TEST_EQUAL(num_alert_types, 108);
+	TEST_EQUAL(num_alert_types, 109);
 	TEST_EQUAL(num_alert_types, count_alert_types);
 }
 
@@ -195,6 +196,27 @@ TORRENT_TEST(ip_ban_alert)
 
 #ifndef TORRENT_DISABLE_ALERT_MSG
 	TEST_CHECK(a->message().find("10.0.0.1") != std::string::npos);
+#endif
+}
+
+TORRENT_TEST(piece_flushed_alert)
+{
+	aux::alert_manager mgr(1, piece_flushed_alert::static_category);
+
+	TEST_EQUAL(mgr.should_post<piece_flushed_alert>(), true);
+
+	mgr.emplace_alert<piece_flushed_alert>(torrent_handle(), piece_index_t{7});
+
+	TEST_CHECK(mgr.wait_for_alert(seconds(0)));
+	std::vector<alert*> alerts;
+	mgr.get_all(alerts);
+	TEST_EQUAL(alerts.size(), 1);
+	auto const* a = alert_cast<piece_flushed_alert>(alerts.front());
+	TEST_CHECK(a != nullptr);
+	TEST_EQUAL(a->piece_index, piece_index_t{7});
+
+#ifndef TORRENT_DISABLE_ALERT_MSG
+	TEST_CHECK(a->message().find("piece: 7") != std::string::npos);
 #endif
 }
 

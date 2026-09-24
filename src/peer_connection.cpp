@@ -3259,13 +3259,11 @@ namespace {
 
 		if (!t->has_picker()) return;
 
-		piece_picker& picker = t->picker();
-
-		TORRENT_ASSERT(picker.num_peers(block_finished) == 0);
+		TORRENT_ASSERT(t->picker().num_peers(block_finished) == 0);
 
 //		std::fprintf(stderr, "peer_connection mark_as_finished peer: %p piece: %d block: %d\n"
 //			, peer_info_struct(), block_finished.piece_index, block_finished.block_index);
-		picker.mark_as_finished(block_finished, peer_info_struct());
+		t->block_written(block_finished, peer_info_struct());
 
 		t->maybe_done_flushing();
 
@@ -3283,6 +3281,7 @@ namespace {
 #if TORRENT_USE_ASSERTS
 		if (t->has_picker())
 		{
+			piece_picker const& picker = t->picker();
 			auto const& q = picker.get_download_queue();
 
 			for (auto const& dp : q)

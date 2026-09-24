@@ -130,6 +130,7 @@ struct tracker_list_alert;
 struct file_priorities_alert;
 struct file_status_alert;
 struct ip_ban_alert;
+struct piece_flushed_alert;
 
 // include/libtorrent/announce_entry.hpp
 TORRENT_VERSION_NAMESPACE_2

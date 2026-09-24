@@ -43,8 +43,9 @@ foreach(TARGET_SRC ${tests})
 	add_test(${TARGET} ${TARGET})
 endforeach()
 
-# test_forget_piece interposes pwrite() and needs dlsym()
+# these interpose pwrite() (write_gate.hpp) and need dlsym()
 target_link_libraries(test_forget_piece ${CMAKE_DL_LIBS})
+target_link_libraries(test_piece_flushed_alert ${CMAKE_DL_LIBS})
 
 if (webtorrent AND TARGET test_rtc)
 	# torrent-rasterbar links datachannel-static privately when building

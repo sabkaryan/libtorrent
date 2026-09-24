@@ -1589,7 +1589,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// add_piece() multiple times
 		if (picker().is_finished(block_finished)) return;
 
-		picker().mark_as_finished(block_finished, nullptr);
+		block_written(block_finished, nullptr);
 		maybe_done_flushing();
 
 		if (alerts().should_post<block_finished_alert>())
@@ -4682,6 +4682,12 @@ namespace {
 
 		if (m_ses.alerts().should_post<piece_finished_alert>())
 			m_ses.alerts().emplace_alert<piece_finished_alert>(get_handle(), index);
+
+		// a piece whose blocks were all written before it passed (a backend
+		// that writes through, resume data, checking) is in the files now.
+		// Otherwise block_written() posts this once the last block is written.
+		// Posted before anything below can drop the piece picker
+		if (!has_picker() || m_picker->is_piece_flushed(index)) post_piece_flushed(index);
 
 		// update m_file_progress (if we have one)
 		m_file_progress.update(m_torrent_file->layout(), index
@@ -9140,11 +9146,32 @@ namespace {
 		m_finished_timer.set_live(live && is_finished(), now);
 	}
 
+	void torrent::block_written(piece_block const& block, torrent_peer* const peer)
+	{
+		TORRENT_ASSERT(has_picker());
+		bool const was_flushed = m_picker->is_piece_flushed(block.piece_index);
+		m_picker->mark_as_finished(block, peer);
+		if (!was_flushed && m_picker->is_piece_flushed(block.piece_index))
+			post_piece_flushed(block.piece_index);
+	}
+
+	void torrent::post_piece_flushed(piece_index_t const index)
+	{
+		if (m_ses.alerts().should_post<piece_flushed_alert>())
+			m_ses.alerts().emplace_alert<piece_flushed_alert>(get_handle(), index);
+	}
+
 	void torrent::maybe_done_flushing()
 	{
 		if (!has_picker()) return;
 
-		if (m_picker->is_seeding())
+		// is_seeding() only says that every piece passed its hash check. A
+		// piece that passed but still has blocks to write (in a write-back
+		// disk cache) stays in the download queue until they are written, so
+		// the picker is done once that queue is empty too. Dropping it before
+		// would drop those writes' completions, and so the pieces'
+		// piece_flushed_alert
+		if (m_picker->is_seeding() && m_picker->get_download_queue_size() == 0)
 		{
 			// no need for the piece picker anymore
 			// when we're suggesting read cache pieces, we

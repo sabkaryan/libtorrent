@@ -77,7 +77,7 @@ namespace libtorrent {
 	constexpr int user_alert_id = 10000;
 
 	// this constant represents "max_alert_index" + 1
-	constexpr int num_alert_types = 108;
+	constexpr int num_alert_types = 109;
 
 	// internal
 	constexpr int abi_alert_count = 128;
@@ -3301,6 +3301,36 @@ struct TORRENT_EXPORT oversized_file_alert final : torrent_alert
 
 		// the IP address that was banned
 		aux::noexcept_movable<address> banned_address;
+	};
+
+	// posted once for a piece when all of its blocks have been written to the
+	// files: their bytes have been handed to the file system and are visible to
+	// anyone reading the files. piece_finished_alert only says that a piece
+	// passed its hash check. With a disk I/O backend that caches writes, such
+	// as pread_disk_io, which hashes blocks from memory and writes them back
+	// afterwards, the bytes may reach the files later. An application that reads
+	// the downloaded files directly, rather than through
+	// torrent_handle::read_piece(), should wait for this alert.
+	//
+	// For a piece that passed its hash check it is posted at or after the
+	// piece's piece_finished_alert, never before; with a backend that writes
+	// through, the two are posted back to back. It says nothing about
+	// durability (no fsync is implied). It is not posted for a piece whose write
+	// failed or that was cleared before being written (a hash failure,
+	// force_recheck()), nor for a piece made up only of pad files.
+	struct TORRENT_EXPORT piece_flushed_alert final : torrent_alert
+	{
+		// internal
+		TORRENT_UNEXPORT piece_flushed_alert(aux::stack_allocator& alloc,
+			torrent_handle const& h, piece_index_t piece_num);
+
+		TORRENT_DEFINE_ALERT(piece_flushed_alert, 108)
+
+		static constexpr alert_category_t static_category = alert_category::piece_progress;
+		std::string message() const override;
+
+		// the index of the piece whose blocks have all been written
+		piece_index_t const piece_index;
 	};
 
 	// internal

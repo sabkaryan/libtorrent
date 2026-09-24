@@ -663,6 +663,24 @@ namespace libtorrent {
 		, piece_index(piece_num)
 	{}
 
+	piece_flushed_alert::piece_flushed_alert(aux::stack_allocator& alloc
+		, torrent_handle const& h, piece_index_t piece_num)
+		: torrent_alert(alloc, h)
+		, piece_index(piece_num)
+	{}
+
+	std::string piece_flushed_alert::message() const
+	{
+#ifdef TORRENT_DISABLE_ALERT_MSG
+		return {};
+#else
+		char ret[200];
+		std::snprintf(ret, sizeof(ret), "%s piece: %d written to disk"
+			, torrent_alert::message().c_str(), static_cast<int>(piece_index));
+		return ret;
+#endif
+	}
+
 	std::string piece_finished_alert::message() const
 	{
 #ifdef TORRENT_DISABLE_ALERT_MSG
@@ -3204,7 +3222,8 @@ namespace {
 			"tracker_list",
 			"file_priorities",
 			"file_status",
-			"ip_ban"}};
+			"ip_ban",
+			"piece_flushed"}};
 
 		TORRENT_ASSERT(alert_type >= 0);
 		TORRENT_ASSERT(alert_type < num_alert_types);
