@@ -353,6 +353,12 @@ namespace libtorrent {
 			// instead of being sent. See peer_connection::on_disk_read_complete
 			num_stale_piece_rejects,
 
+			// number of block writes to a piece whose hash had already been
+			// returned, rejected because the piece's previous cache entry was
+			// still being flushed or hashed; the block is requested again.
+			// See disk_cache::insert()
+			num_rejected_piece_rewrites,
+
 			num_stats_counters
 		};
 

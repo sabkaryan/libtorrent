@@ -45,6 +45,18 @@ bool compute_force_flush(cached_piece_entry const& piece)
 		|| bool(piece.flags & cached_piece_entry::piece_hash_returned_flag));
 }
 
+// nothing holds this entry: no flush or hasher works on it (they release the
+// cache mutex while they do, relying on the entry staying put), no job is
+// attached to it and every write it had has been flushed
+bool is_idle(cached_piece_entry const& e)
+{
+	return !(e.flags & (cached_piece_entry::flushing_flag | cached_piece_entry::hashing_flag))
+		&& e.hash_job == nullptr
+		&& e.clear_piece == nullptr
+		&& e.num_jobs == 0
+		&& e.v2_pending == 0;
+}
+
 std::uint16_t compute_flushed_cursor(span<const cached_block_entry> blocks)
 {
 	std::uint16_t ret = 0;
@@ -273,6 +285,26 @@ insert_result_flags disk_cache::insert(piece_location const loc
 
 	auto& view = m_pieces.template get<0>();
 	auto i = view.find(loc);
+
+	// a piece can be written again after its hash has been returned: the
+	// bittorrent layer may drop a piece it has and download it again
+	// (torrent::forget_piece()). The piece's previous entry stays in the cache
+	// until a flush pass evicts it (flush_to_disk()), and writing into it would
+	// answer the next hash request with the previous piece hash, since
+	// hasher_cursor and ph are already at the end. So such a write starts the
+	// piece over: the previous entry is evicted here, the way flush_to_disk()
+	// would. While a flush or a hasher still works on it, it can't be, and the
+	// write is rejected; the caller fails it with operation_aborted and the
+	// block is requested again. (upstream libtorrent asserts below that this
+	// never happens; forget_piece() is not upstream)
+	if (i != view.end() && (i->flags & cached_piece_entry::piece_hash_returned_flag))
+	{
+		if (!is_idle(*i)) return write_rejected;
+		free_piece(*i);
+		view.erase(i);
+		i = view.end();
+	}
+
 	if (i == view.end())
 	{
 		int const num_blocks = (params.piece_size + default_block_size - 1) / default_block_size;

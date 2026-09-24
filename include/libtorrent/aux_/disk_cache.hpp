@@ -553,6 +553,12 @@ struct TORRENT_EXTRA_EXPORT disk_cache
 	// the disk cache is full and the peer needs back-pressure applied to it.
 	static constexpr insert_result_flags exceeded_limit = 1_bit;
 
+	// the block was not inserted: its piece's hash has already been returned
+	// and the piece's previous cache entry is still being flushed or hashed.
+	// The caller fails the write with operation_aborted, so the block is
+	// requested again. See insert()
+	static constexpr insert_result_flags write_rejected = 2_bit;
+
 	// piece metadata required when inserting the first block of a new piece.
 	struct piece_entry_params
 	{

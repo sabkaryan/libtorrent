@@ -352,6 +352,11 @@ namespace {
 		// hash a piece (when verifying against the piece hash),
 		METRIC(disk, num_read_back),
 
+		// the number of block writes rejected because their piece's hash had
+		// been returned while the piece's previous cache entry was still
+		// being flushed or hashed. The block is requested again
+		METRIC(disk, num_rejected_piece_rewrites),
+
 		// The number of file pool hits (the file we want is already open) and
 		// misses (we need to open the file).
 		METRIC(disk, file_pool_hits),

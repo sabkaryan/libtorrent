@@ -10,6 +10,7 @@ see LICENSE file.
 #include "test.hpp"
 #include "setup_transfer.hpp" // for create_torrent
 #include "settings.hpp" // for settings()
+#include "test_utils.hpp" // for _piece
 
 #include "libtorrent/session.hpp"
 #include "libtorrent/session_params.hpp"
@@ -22,9 +23,18 @@ see LICENSE file.
 #include "libtorrent/extensions.hpp"
 #include "libtorrent/aux_/torrent.hpp"
 #include "libtorrent/aux_/session_impl.hpp"
+#include "libtorrent/pread_disk_io.hpp"
+#include "libtorrent/disk_interface.hpp"
+#include "libtorrent/performance_counters.hpp"
+#include "libtorrent/storage_defs.hpp"
+#include "libtorrent/file_storage.hpp"
+#include "libtorrent/hasher.hpp"
+#include "libtorrent/io_context.hpp"
+#include "libtorrent/aux_/vector.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -49,6 +59,22 @@ void maybe_slow_down()
 {
 	if (slow_writes) std::this_thread::sleep_for(std::chrono::milliseconds(20));
 }
+
+// a held disk: while hold_writes is set, every pwrite()/pwritev() waits at
+// this gate until it is cleared; writes_waiting counts the calls waiting
+std::mutex gate_mutex;
+std::condition_variable gate_cv;
+bool hold_writes = false;
+int writes_waiting = 0;
+void maybe_hold()
+{
+	std::unique_lock<std::mutex> l(gate_mutex);
+	if (!hold_writes) return;
+	++writes_waiting;
+	gate_cv.notify_all();
+	gate_cv.wait(l, [] { return !hold_writes; });
+	--writes_waiting;
+}
 }
 
 extern "C" ssize_t pwritev(int fd, struct iovec const* iov, int iovcnt, off_t offset)
@@ -56,6 +82,7 @@ extern "C" ssize_t pwritev(int fd, struct iovec const* iov, int iovcnt, off_t of
 	using fn = ssize_t (*)(int, struct iovec const*, int, off_t);
 	static fn const real = reinterpret_cast<fn>(::dlsym(RTLD_NEXT, "pwritev"));
 	maybe_slow_down();
+	maybe_hold();
 	return real(fd, iov, iovcnt, offset);
 }
 
@@ -64,6 +91,7 @@ extern "C" ssize_t pwrite(int fd, void const* buf, size_t count, off_t offset)
 	using fn = ssize_t (*)(int, void const*, size_t, off_t);
 	static fn const real = reinterpret_cast<fn>(::dlsym(RTLD_NEXT, "pwrite"));
 	maybe_slow_down();
+	maybe_hold();
 	return real(fd, buf, count, offset);
 }
 #endif
@@ -395,3 +423,125 @@ TORRENT_TEST(forget_piece_on_finished_torrent_keeping_its_picker)
 	ses.remove_torrent(th);
 	remove_all(save_path, ec);
 }
+
+#if defined TORRENT_LINUX
+// the disk side of forget_piece(): a piece that passed and was forgotten is
+// downloaded again. With pread_disk_io a block of it may arrive while the old
+// blocks of the piece are still being flushed, holding the piece's previous
+// cache entry. That write must be failed with operation_aborted (the peer
+// requests the block again) instead of going into the old entry, and
+// counted. Once the flush is done, the piece starts over and is hashed anew
+TORRENT_TEST(rewrite_aborted_while_old_blocks_are_flushing)
+{
+	using namespace std::chrono_literals;
+	std::string const save_path = complete("forget_piece_rewrite");
+	error_code ec;
+	remove_all(save_path, ec);
+	create_directory(save_path, ec);
+
+	io_context ioc;
+	counters cnt;
+	settings_pack pack = settings();
+	pack.set_int(settings_pack::aio_threads, 1);
+	pack.set_int(settings_pack::hashing_threads, 1);
+	std::unique_ptr<disk_interface> disk = pread_disk_io_constructor(ioc, pack, cnt);
+
+	int const blocks = 2;
+	int const len = blocks * default_block_size;
+	file_storage fs;
+	fs.set_piece_length(len);
+	fs.add_file("rewrite", len);
+	fs.set_num_pieces(1);
+	aux::vector<download_priority_t, file_index_t> prios;
+	renamed_files rf;
+	storage_params params(fs, rf, save_path, "", storage_mode_sparse, prios
+		, sha1_hash("01234567890123456789"), true, false);
+	storage_holder st = disk->new_torrent(params, {});
+
+	auto run_until = [&](auto done)
+	{
+		auto const end = std::chrono::steady_clock::now() + 10s;
+		while (!done() && std::chrono::steady_clock::now() < end)
+		{
+			disk->submit_jobs();
+			ioc.run_for(5ms);
+			ioc.restart();
+		}
+		return done();
+	};
+
+	bool checked = false;
+	add_torrent_params atp;
+	disk->async_check_files(st, &atp, aux::vector<std::string, file_index_t>{}
+		, [&](status_t, storage_error const&) { checked = true; });
+	TEST_CHECK(run_until([&] { return checked; }));
+
+	auto piece_hash = [&](char const fill)
+	{
+		std::vector<char> const buf(static_cast<std::size_t>(len), fill);
+		return hasher(buf).final();
+	};
+	std::vector<char> const a(static_cast<std::size_t>(default_block_size), 'A');
+	std::vector<char> const b(static_cast<std::size_t>(default_block_size), 'B');
+
+	// the piece arrives and passes; its flush is held at the disk
+	{
+		std::lock_guard<std::mutex> l(gate_mutex);
+		hold_writes = true;
+	}
+	int a_written = 0;
+	for (int i = 0; i < blocks; ++i)
+	{
+		disk->async_write(st, peer_request{0_piece, i * default_block_size, default_block_size}
+			, a.data(), {}, [&](storage_error const& e) { TEST_CHECK(!e); ++a_written; });
+	}
+	sha1_hash first;
+	disk->async_hash(st, 0_piece, {}, disk_interface::v1_hash
+		, [&](piece_index_t, sha1_hash const& h, storage_error const&) { first = h; });
+	TEST_CHECK(run_until([&] {
+		std::lock_guard<std::mutex> l(gate_mutex);
+		return !first.is_all_zeros() && writes_waiting > 0;
+	}));
+	TEST_CHECK(first == piece_hash('A'));
+	TEST_EQUAL(a_written, 0);
+
+	// the piece was forgotten and a block of it arrives again
+	bool b_done = false;
+	storage_error b_error;
+	disk->async_write(st, peer_request{0_piece, 0, default_block_size}
+		, b.data(), {}, [&](storage_error const& e) { b_error = e; b_done = true; });
+	TEST_CHECK(run_until([&] { return b_done; }));
+	TEST_CHECK(b_error.ec == boost::asio::error::operation_aborted);
+	TEST_EQUAL(cnt[counters::num_rejected_piece_rewrites], 1);
+
+	// the old blocks reach the disk
+	{
+		std::lock_guard<std::mutex> l(gate_mutex);
+		hold_writes = false;
+	}
+	gate_cv.notify_all();
+	TEST_CHECK(run_until([&] { return a_written == blocks; }));
+
+	// the piece is downloaded again and hashed from the new blocks
+	int b_written = 0;
+	for (int i = 0; i < blocks; ++i)
+	{
+		disk->async_write(st, peer_request{0_piece, i * default_block_size, default_block_size}
+			, b.data(), {}, [&](storage_error const& e) { TEST_CHECK(!e); ++b_written; });
+	}
+	sha1_hash second;
+	disk->async_hash(st, 0_piece, {}, disk_interface::v1_hash
+		, [&](piece_index_t, sha1_hash const& h, storage_error const&) { second = h; });
+	TEST_CHECK(run_until([&] { return !second.is_all_zeros(); }));
+	TEST_CHECK(second == piece_hash('B'));
+	TEST_EQUAL(cnt[counters::num_rejected_piece_rewrites], 1);
+
+	// tear down the way a torrent does
+	bool stopped = false;
+	disk->async_stop_torrent(st, [&] { stopped = true; });
+	TEST_CHECK(run_until([&] { return stopped && b_written == blocks; }));
+	st.reset();
+	disk->abort(true);
+	remove_all(save_path, ec);
+}
+#endif

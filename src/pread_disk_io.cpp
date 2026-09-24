@@ -833,6 +833,20 @@ bool pread_disk_io::add_write_to_cache(aux::pread_disk_job* j, std::shared_ptr<d
 {
 	auto const result = insert_write(j, std::move(o));
 
+	if (result & aux::disk_cache::write_rejected)
+	{
+		// the piece's previous cache entry is still being flushed or hashed
+		// (see disk_cache::insert()). Fail the write, the block is requested
+		// again. Completing it settles its fence accounting like any job
+		m_stats_counters.inc_stats_counter(counters::num_rejected_piece_rewrites);
+		j->ret = disk_status::fatal_disk_error;
+		j->error = storage_error(boost::asio::error::operation_aborted);
+		jobqueue_t rejected;
+		rejected.push_back(j);
+		add_completed_jobs(std::move(rejected));
+		return false;
+	}
+
 	// v1 wake-up signal comes from the cache; for v2 the insert may have
 	// pushed a queue entry the cache has no way to flag.
 	if ((result & aux::disk_cache::need_hasher_kick) || j->storage->v2()) kick_write_hashers();
@@ -2226,8 +2240,10 @@ void pread_disk_io::add_completed_jobs_impl(jobqueue_t jobs, jobqueue_t& complet
 		pread_disk_io* self;
 		jobqueue_t to_pool;
 		jobqueue_t cache_hits;
+		// writes disk_cache::insert() rejected, failed below
+		jobqueue_t rejected_writes;
 		bool need_kick;
-	} ctx{this, {}, {}, false};
+	} ctx{this, {}, {}, {}, false};
 
 	// set when a completed fence re-raised a stacked fence and its storage was
 	// queued in m_fence_flush in the loop below; after the loop we drain it (or
@@ -2239,7 +2255,9 @@ void pread_disk_io::add_completed_jobs_impl(jobqueue_t jobs, jobqueue_t& complet
 		if (std::holds_alternative<aux::job::write>(j->action))
 		{
 			auto const result = ctx.self->insert_write(j, {});
-			if ((result & aux::disk_cache::need_hasher_kick) || j->storage->v2())
+			if (result & aux::disk_cache::write_rejected)
+				ctx.rejected_writes.push_back(j);
+			else if ((result & aux::disk_cache::need_hasher_kick) || j->storage->v2())
 				ctx.need_kick = true;
 		}
 		else if (std::holds_alternative<aux::job::read>(j->action) && ctx.self->prepare_read(j))
@@ -2297,6 +2315,19 @@ void pread_disk_io::add_completed_jobs_impl(jobqueue_t jobs, jobqueue_t& complet
 	m_completed_jobs.append(m_ios, std::move(jobs));
 
 	// --- deferred work, now that no fence mutex is held ---
+
+	// fail the reposted writes the cache rejected, as add_write_to_cache()
+	// does. A fence lowers only once the storage has no outstanding writes or
+	// hashes, so none of its entries should be flushing or hashing here; this
+	// keeps a rejected write from leaking its outstanding-job count if one is
+	while (!ctx.rejected_writes.empty())
+	{
+		auto* j = static_cast<aux::pread_disk_job*>(ctx.rejected_writes.pop_front());
+		m_stats_counters.inc_stats_counter(counters::num_rejected_piece_rewrites);
+		j->ret = disk_status::fatal_disk_error;
+		j->error = storage_error(boost::asio::error::operation_aborted);
+		completed.push_back(j);
+	}
 
 	// wake the hasher for the blocks the repost callback inserted (drains the v2
 	// queue inline when there are no hash threads).

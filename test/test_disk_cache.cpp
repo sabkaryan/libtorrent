@@ -1150,3 +1150,108 @@ TORRENT_TEST(truncated_v2_piece_v2)
 TORRENT_TEST(truncated_v2_piece_hybrid)
 	{ test_piece_size2_smaller_than_piece_size(test_mode::v1 | test_mode::v2); }
 
+
+namespace {
+
+sha1_hash hash_of(char const fill, int const blocks)
+{
+	std::vector<char> buf(std::size_t(blocks) * std::size_t(default_block_size), fill);
+	return hasher(buf).final();
+}
+
+// asks for the v1 hash of piece 0 the way pread_disk_io::async_hash() does
+sha1_hash ask_hash(cache_fixture& f, disk_cache::hash_result& res)
+{
+	auto hash_job = std::make_unique<pread_disk_job>();
+	hash_job->action = job::hash{{}, 0_piece, span<sha256_hash>{}, sha1_hash{}};
+	res = f.cache.try_hash_piece(f.loc(0_piece), hash_job.get());
+	sha1_hash const h = std::get<job::hash>(hash_job->action).piece_hash;
+	f.live_jobs.push_back(std::move(hash_job));
+	return h;
+}
+
+}
+
+// a piece whose hash has been returned and whose blocks are all on disk keeps
+// its cache entry until the next flush pass evicts it. If the piece is written
+// again before that (the bittorrent layer dropped it and downloads it again),
+// the new blocks must be hashed, not answered with the old piece's hash
+TORRENT_TEST(rewrite_after_hash_returned)
+{
+	cache_fixture f(2, test_mode::v1);
+	f.insert(0_piece, 0, false, 'A');
+	f.insert(0_piece, 1, false, 'A');
+	f.kick_hashers();
+	// every block reaches the disk before the hash is asked for, so this flush
+	// pass cannot evict the entry
+	TEST_EQUAL(f.flush(), 2);
+
+	disk_cache::hash_result r;
+	TEST_CHECK(ask_hash(f, r) == hash_of('A', 2));
+	TEST_EQUAL(r, disk_cache::hash_result::job_completed);
+
+	// written again, with no flush pass in between
+	f.insert(0_piece, 0, false, 'B');
+	f.insert(0_piece, 1, false, 'B');
+	f.kick_hashers();
+	sha1_hash const second = ask_hash(f, r);
+	TEST_EQUAL(r, disk_cache::hash_result::job_completed);
+	TEST_CHECK(second == hash_of('B', 2));
+	TEST_CHECK(second != hash_of('A', 2));
+
+	TEST_EQUAL(f.flush(), 2);
+	TEST_EQUAL(int(f.cache.size()), 0);
+}
+
+// the same piece written again while its old blocks are being flushed: the
+// flush has released the cache mutex and relies on the entry staying put, so
+// the new write must be refused (the caller aborts it and the block is
+// requested again) and the old entry left alone
+TORRENT_TEST(rewrite_while_old_blocks_are_flushing)
+{
+	cache_fixture f(2, test_mode::v1);
+	f.insert(0_piece, 0, false, 'A');
+	f.insert(0_piece, 1, false, 'A');
+	f.kick_hashers();
+
+	// the hash is returned before any block is flushed
+	disk_cache::hash_result r;
+	TEST_CHECK(ask_hash(f, r) == hash_of('A', 2));
+	TEST_EQUAL(r, disk_cache::hash_result::job_completed);
+
+	int calls = 0;
+	insert_result_flags during_flush{};
+	int flushed = 0;
+	f.cache.flush_to_disk(
+		[&](bitfield& done, span<disk_job* const> blocks) -> int {
+			// the cache mutex is released here and the entry is being flushed
+			if (calls++ == 0)
+				during_flush = f.insert(0_piece, 0, false, 'B');
+			int count = 0;
+			for (int i = 0; i < int(blocks.size()); ++i)
+			{
+				if (!blocks[i]) continue;
+				done.set_bit(i);
+				++count;
+			}
+			flushed += count;
+			return count;
+		},
+		0,
+		[](jobqueue_t, disk_job*) {},
+		false);
+
+	TEST_CHECK(during_flush & disk_cache::write_rejected);
+	TEST_EQUAL(flushed, 2);
+	// the old entry was flushed and evicted as usual
+	TEST_EQUAL(int(f.cache.size()), 0);
+
+	// once the flush is done, the piece can be written again
+	TEST_CHECK(!(f.insert(0_piece, 0, false, 'B') & disk_cache::write_rejected));
+	TEST_CHECK(!(f.insert(0_piece, 1, false, 'B') & disk_cache::write_rejected));
+	f.kick_hashers();
+	TEST_CHECK(ask_hash(f, r) == hash_of('B', 2));
+	TEST_EQUAL(r, disk_cache::hash_result::job_completed);
+	TEST_EQUAL(f.flush(), 2);
+	TEST_EQUAL(int(f.cache.size()), 0);
+}
