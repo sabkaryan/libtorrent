@@ -36,6 +36,7 @@ see LICENSE file.
 #include <fstream>
 #include <cstdarg>
 #include <cstdio> // for vsnprintf
+#include <thread>
 
 using namespace lt;
 using namespace std::placeholders;
@@ -459,7 +460,8 @@ std::shared_ptr<torrent_info const> setup_peer(tcp::socket& s, io_context& ioc
 	, std::shared_ptr<lt::session>& ses, bool incoming = true
 	, bool const magnet_link = false, bool const dht = false
 	, torrent_flags_t const flags = torrent_flags_t{}
-	, torrent_handle* th = nullptr)
+	, torrent_handle* th = nullptr
+	, std::function<void(settings_pack&)> const& customize = {})
 {
 	std::ofstream out_file;
 	std::ofstream* file = nullptr;
@@ -495,6 +497,8 @@ std::shared_ptr<torrent_info const> setup_peer(tcp::socket& s, io_context& ioc
 #if TORRENT_ABI_VERSION == 1
 	sett.set_bool(settings_pack::rate_limit_utp, true);
 #endif
+	// before the peer connects: a connection reads some settings once
+	if (customize) customize(sett);
 	ses.reset(new lt::session(sett));
 
 	p.flags &= ~torrent_flags::paused;
@@ -1175,6 +1179,124 @@ TORRENT_TEST(extension_handshake)
 	TEST_CHECK(extensions["m"]["ut_metadata"].integer() != 0);
 	TEST_CHECK(extensions["m"]["ut_pex"].integer() != 0);
 #endif
+}
+
+namespace {
+
+// reads what the peer sends within `wait` and returns its requests
+std::vector<peer_request> read_requests(tcp::socket& s, span<char> buffer
+	, lt::time_duration const wait)
+{
+	std::vector<peer_request> ret;
+	auto const end = clock_type::now() + wait;
+	while (clock_type::now() < end)
+	{
+		error_code ec;
+		if (s.available(ec) < 4)
+		{
+			if (ec) break;
+			std::this_thread::sleep_for(lt::milliseconds(10));
+			continue;
+		}
+		int const len = read_message(s, buffer);
+		if (len == -1) break;
+		auto const message = buffer.first(len);
+		print_message(message);
+		if (len != 13 || message[0] != 0x6) continue;
+		char const* ptr = message.data() + 1;
+		peer_request r;
+		r.piece = piece_index_t(aux::read_int32(ptr));
+		r.start = aux::read_int32(ptr);
+		r.length = aux::read_int32(ptr);
+		ret.push_back(r);
+	}
+	return ret;
+}
+
+void send_piece(tcp::socket& s, peer_request const& r, std::vector<char> const& piece)
+{
+	std::vector<char> buf(std::size_t(4 + 9 + r.length));
+	char* ptr = buf.data();
+	aux::write_uint32(9 + r.length, ptr);
+	aux::write_uint8(7, ptr);
+	aux::write_int32(static_cast<int>(r.piece), ptr);
+	aux::write_int32(r.start, ptr);
+	std::memcpy(ptr, piece.data() + r.start, std::size_t(r.length));
+	error_code ec;
+	boost::asio::write(s, boost::asio::buffer(buf), boost::asio::transfer_all(), ec);
+	if (ec) TEST_ERROR(ec.message());
+}
+
+// a seed that advertises `reqq` in its extension handshake and serves the
+// downloader in rounds: it takes every request the downloader has outstanding,
+// then sends all of those blocks. Returns the size of each round, i.e. how
+// many requests the downloader had outstanding at once
+std::vector<int> request_rounds(int const max_out_request_queue, int const reqq)
+{
+	info_hash_t ih;
+	std::shared_ptr<lt::session> ses;
+	io_context ios;
+	tcp::socket s(ios);
+	auto const ti = setup_peer(s, ios, ih, ses, true, false, false, {}, nullptr
+		, [&](settings_pack& p) {
+			p.set_int(settings_pack::max_out_request_queue, max_out_request_queue);
+			// requests for whole pieces are not bounded by the queue size
+			p.set_int(settings_pack::whole_pieces_threshold, 0);
+		});
+
+	char recv_buffer[1000];
+	do_handshake(s, ih, recv_buffer);
+	print_session_log(*ses);
+
+	entry extensions;
+	extensions["m"] = entry::dictionary_type();
+	extensions["reqq"] = reqq;
+	send_extension_handshake(s, extensions);
+	send_have_all(s);
+	send_unchoke(s);
+
+	// every piece of the test torrent holds the same bytes (create_torrent())
+	std::vector<char> piece(std::size_t(ti->piece_length()));
+	for (int i = 0; i < int(piece.size()); ++i)
+		piece[std::size_t(i)] = char((i % 26) + 'A');
+
+	std::vector<int> rounds;
+	for (int i = 0; i < 8; ++i)
+	{
+		auto const requests = read_requests(s, recv_buffer, lt::milliseconds(500));
+		print_session_log(*ses);
+		if (requests.empty()) break;
+		rounds.push_back(int(requests.size()));
+		for (auto const& r : requests) send_piece(s, r, piece);
+	}
+	std::printf("request rounds (max_out_request_queue: %d reqq: %d):"
+		, max_out_request_queue, reqq);
+	for (int const n : rounds) std::printf(" %d", n);
+	std::printf("\n");
+	return rounds;
+}
+
+} // anonymous namespace
+
+// the reqq a peer advertises is the number of requests it accepts. It must not
+// raise the number we send it above max_out_request_queue
+TORRENT_TEST(reqq_does_not_raise_request_queue)
+{
+	std::vector<int> const rounds = request_rounds(4, 2000);
+	// slow start grows the queue by one block per block received, so the
+	// second round would be twice the first without the limit
+	TEST_CHECK(rounds.size() >= 2);
+	for (int const n : rounds) TEST_CHECK(n <= 4);
+}
+
+// but a peer that accepts fewer requests than max_out_request_queue still gets
+// no more than its reqq
+TORRENT_TEST(reqq_lowers_request_queue)
+{
+	std::vector<int> const rounds = request_rounds(8, 3);
+	TEST_CHECK(rounds.size() >= 2);
+	// the first requests go out before the queue size is first updated
+	for (std::size_t i = 1; i < rounds.size(); ++i) TEST_CHECK(rounds[i] <= 3);
 }
 
 #ifndef TORRENT_DISABLE_EXTENSIONS

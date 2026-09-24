@@ -2079,8 +2079,11 @@ namespace {
 			aux::verify_encoding(m_client_version);
 		}
 
+		// reqq is the number of requests the peer accepts. It can lower our
+		// limit (max_out_request_queue), but not raise it
 		int const reqq = int(root.dict_find_int_value("reqq"));
-		if (reqq > 0) max_out_request_queue(reqq);
+		if (reqq > 0) max_out_request_queue(std::min(reqq
+			, m_settings.get_int(settings_pack::max_out_request_queue)));
 
 		if (root.dict_find_int_value("upload_only", 0))
 			set_upload_only(true);
