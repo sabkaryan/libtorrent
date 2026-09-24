@@ -335,7 +335,9 @@ namespace aux {
 		//   1 we did not have the piece (nothing done)
 		//   2 the torrent has released its piece picker (it is a seed);
 		//     nothing done. Re-add the torrent or force_recheck() instead
-		//   3 the piece is currently being downloaded; nothing done
+		//   3 the piece is currently being downloaded, or it passed the hash
+		//     check but not all of its blocks have been written to disk yet;
+		//     nothing done, try again later
 		//   4 invalid piece index or no metadata
 		//   5 the handle is invalid
 		int forget_piece(piece_index_t piece) const;
