@@ -31,10 +31,13 @@ see LICENSE file.
 #include "libtorrent/hasher.hpp"
 #include "libtorrent/io_context.hpp"
 #include "libtorrent/aux_/vector.hpp"
+#include "libtorrent/posix_disk_io.hpp"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
+#include <functional>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -492,5 +495,123 @@ TORRENT_TEST(rewrite_aborted_while_old_blocks_are_flushing)
 	st.reset();
 	disk->abort(true);
 	remove_all(save_path, ec);
+}
+#endif
+
+#if defined TORRENT_LINUX
+// A read of a piece may still be in flight when the piece is forgotten, the
+// caller punches it out and the piece is downloaded again. If the read hit the
+// hole it got zeros, and by the time it completes the piece is there again, so
+// checking that we have the piece is not enough to keep the zeros from being
+// sent. Here seed A serves peer B: A's read of a block waits, the piece is
+// forgotten and punched out, the read reads the hole and waits again, the
+// piece is added back and passes, and only then does the read complete. B must
+// not get the zeros, so none of its pieces may fail the hash check.
+TORRENT_TEST(forget_piece_stale_read_in_flight)
+{
+	int const small_piece = 64 * 1024;
+	int const pieces = 2;
+	std::string const seed_path = complete("forget_piece_read_seed");
+	std::string const peer_path = complete("forget_piece_read_peer");
+	error_code ec;
+	remove_all(seed_path, ec);
+	remove_all(peer_path, ec);
+	create_directory(seed_path, ec);
+	create_directory(peer_path, ec);
+
+	add_torrent_params atp = ::create_torrent(nullptr, "forget_read", small_piece
+		, pieces, false, create_torrent::v1_only);
+	atp.flags &= ~torrent_flags::auto_managed;
+	atp.flags &= ~torrent_flags::paused;
+	std::vector<char> data(static_cast<std::size_t>(small_piece));
+	for (std::size_t i = 0; i < data.size(); ++i) data[i] = char((i % 26) + 'A');
+	std::string const seed_file = combine_path(seed_path, "forget_read");
+	{
+		std::ofstream f(seed_file, std::ios::binary);
+		for (int i = 0; i < pieces; ++i) f.write(data.data(), std::streamsize(data.size()));
+	}
+
+	auto wait_until = [](std::function<bool()> const& done)
+	{
+		auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+		while (!done() && std::chrono::steady_clock::now() < end)
+			std::this_thread::sleep_for(std::chrono::milliseconds(5));
+		return done();
+	};
+
+	// A keeps its piece picker as a seed (suggest_read_cache), so that
+	// forget_piece() works on it. Its disk I/O is pread_disk_io, whose reads
+	// the gate holds
+	settings_pack pa = forget_settings();
+	pa.set_int(settings_pack::suggest_mode, settings_pack::suggest_read_cache);
+	lt::session a(pa);
+	add_torrent_params atp_a = atp;
+	atp_a.save_path = seed_path;
+	torrent_handle const ta = a.add_torrent(atp_a);
+	TEST_CHECK(wait_until([&] { return ta.status().is_seeding; }));
+
+	// B's disk I/O (posix_disk_io) goes through stdio, which the gates leave alone
+	session_params pb(forget_settings());
+	pb.disk_io_constructor = posix_disk_io_constructor;
+	lt::session b(std::move(pb));
+	add_torrent_params atp_b = atp;
+	atp_b.save_path = peer_path;
+
+	set_hold_reads(true, false);
+	torrent_handle const tb = b.add_torrent(atp_b);
+	tb.connect_peer(tcp::endpoint(make_address_v4("127.0.0.1"), a.listen_port()));
+
+	// A's first read of a block for B waits before it reads
+	TEST_CHECK(wait_until([] { std::lock_guard<std::mutex> l(gate_mutex); return reads_waiting_before > 0; }));
+	piece_index_t piece{0};
+	{
+		std::lock_guard<std::mutex> l(gate_mutex);
+		piece = piece_index_t(int(held_read_offset / small_piece));
+	}
+
+	// the piece is forgotten and punched out while that read waits
+	TEST_EQUAL(ta.forget_piece(piece), 0);
+	{
+		int const fd = ::open(seed_file.c_str(), O_RDWR);
+		TEST_CHECK(fd >= 0);
+		TEST_EQUAL(::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE
+			, std::int64_t(static_cast<int>(piece)) * small_piece, small_piece), 0);
+		::close(fd);
+	}
+
+	// the read now reads the hole and waits before it returns
+	set_hold_reads(false, true);
+	TEST_CHECK(wait_until([] { std::lock_guard<std::mutex> l(gate_mutex); return reads_waiting_after > 0; }));
+
+	// the piece comes back and passes
+	ta.add_piece(piece, data.data());
+	bool passed = false;
+	TEST_CHECK(wait_until([&]
+	{
+		std::vector<alert*> alerts;
+		a.pop_alerts(&alerts);
+		for (alert* al : alerts)
+			if (auto const* pf = alert_cast<piece_finished_alert>(al))
+				if (pf->piece_index == piece) passed = true;
+		return passed;
+	}));
+
+	// and only now does the read complete
+	set_hold_reads(false, false);
+
+	int hash_failures = 0;
+	wait_until([&]
+	{
+		std::vector<alert*> alerts;
+		b.pop_alerts(&alerts);
+		for (alert* al : alerts)
+			if (alert_cast<hash_failed_alert>(al)) ++hash_failures;
+		return tb.status().is_seeding;
+	});
+	TEST_CHECK(tb.status().is_seeding);
+	TEST_EQUAL(hash_failures, 0);
+
+	remove_all(seed_path, ec);
+	remove_all(peer_path, ec);
 }
 #endif

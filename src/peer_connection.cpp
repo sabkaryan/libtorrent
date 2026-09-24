@@ -5403,9 +5403,10 @@ namespace {
 					flags |= disk_interface::volatile_read;
 
 				auto const issue_time = clock_type::now();
+				std::uint16_t const piece_gen = t->piece_generation(r.piece);
 				m_disk_thread.async_read(t->storage(), r
-					, [conn = self(), r, issue_time](disk_buffer_holder buf, storage_error const& ec)
-					{ conn->wrap(&peer_connection::on_disk_read_complete, std::move(buf), ec, r, issue_time); }
+					, [conn = self(), r, issue_time, piece_gen](disk_buffer_holder buf, storage_error const& ec)
+					{ conn->wrap(&peer_connection::on_disk_read_complete, std::move(buf), ec, r, issue_time, piece_gen); }
 					, flags);
 			}
 			m_last_sent_payload.set(m_connect, clock_type::now());
@@ -5583,7 +5584,8 @@ namespace {
 
 	void peer_connection::on_disk_read_complete(disk_buffer_holder buffer
 		, storage_error const& error
-		, peer_request const& r, time_point const issue_time)
+		, peer_request const& r, time_point const issue_time
+		, std::uint16_t const piece_gen)
 	{
 		TORRENT_ASSERT(is_single_thread());
 		TORRENT_ASSERT(r.length >= 0);
@@ -5636,18 +5638,24 @@ namespace {
 		// the request passed the have-check in incoming_request(), but the
 		// piece may have been dropped while the read was in flight (see
 		// torrent::forget_piece()). Apply the same rule on the way out:
-		// never send data for a piece we don't have. This sits before the
-		// suggest logic so we don't suggest a piece we no longer have.
-		if (t && !t->user_have_piece(r.piece)
+		// never send data for a piece we don't have. Having it again is not
+		// enough either: if it was forgotten after this read was issued, the
+		// read may have hit bytes the caller had released, even though the
+		// piece was downloaded again since. This sits before the suggest
+		// logic so we don't suggest a piece we no longer have.
+		bool const forgotten = t && t->piece_generation(r.piece) != piece_gen;
+		if (t && (forgotten || (!t->user_have_piece(r.piece)
 #ifndef TORRENT_DISABLE_PREDICTIVE_PIECES
 			&& !t->is_predictive_piece(r.piece)
 #endif
-			&& !t->seed_mode())
+			&& !t->seed_mode())))
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			peer_log(peer_log_alert::info, peer_log_alert::invalid_request
-				, "piece: %d s: %x l: %x we don't have this piece anymore"
-				, static_cast<int>(r.piece), std::uint32_t(r.start), std::uint32_t(r.length));
+				, "piece: %d s: %x l: %x %s"
+				, static_cast<int>(r.piece), std::uint32_t(r.start), std::uint32_t(r.length)
+				, forgotten ? "piece was forgotten while this read was in flight"
+					: "we don't have this piece anymore");
 #endif
 			m_counters.inc_stats_counter(counters::num_stale_piece_rejects);
 			if (!m_disconnecting) write_reject_request(r);

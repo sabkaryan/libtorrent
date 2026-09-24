@@ -529,6 +529,12 @@ namespace libtorrent::aux {
 		// at dispatch time to detect and ignore stale completions.
 		std::uint8_t picker_generation() const { return m_picker_generation; }
 
+		// how many times the piece has been forgotten (forget_piece()). A disk
+		// read issued before that may have read bytes the caller has since
+		// released; its completion compares the generation to find out
+		std::uint16_t piece_generation(piece_index_t const index) const
+		{ return m_piece_generation.empty() ? std::uint16_t(0) : m_piece_generation[index]; }
+
 		aux::session_settings const& settings() const;
 		aux::session_interface& session() { return m_ses; }
 
@@ -1670,6 +1676,9 @@ namespace libtorrent::aux {
 		// exists. force_recheck() does not happen at a frequency anywhere
 		// near wrapping an 8 bit counter.
 		std::uint8_t m_picker_generation = 0;
+
+		// see piece_generation(). Allocated on the first forget_piece()
+		aux::vector<std::uint16_t, piece_index_t> m_piece_generation;
 
 		// if the error occurred on a file, this is the index of that file
 		// there are a few special cases, when this is negative. See

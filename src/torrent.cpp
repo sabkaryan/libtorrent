@@ -4747,6 +4747,12 @@ namespace {
 		// unfinished pieces, and v2 hash failure): drop the piece from the
 		// picker and update the gauge state
 		m_picker->we_dont_have(index);
+		// reads of this piece still in flight may read bytes the caller is now
+		// free to release; their completion must not send them, even once the
+		// piece has been downloaded again
+		if (m_piece_generation.empty())
+			m_piece_generation.resize(m_torrent_file->num_pieces(), std::uint16_t(0));
+		++m_piece_generation[index];
 		// a finished torrent that keeps its picker (suggest_read_cache) also
 		// marks itself as having every piece, which it no longer does, and a
 		// seed without this piece is not a seed anymore. Leave the seeding
