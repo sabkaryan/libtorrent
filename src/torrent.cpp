@@ -4741,6 +4741,13 @@ namespace {
 		// unfinished pieces, and v2 hash failure): drop the piece from the
 		// picker and update the gauge state
 		m_picker->we_dont_have(index);
+		// a finished torrent that keeps its picker (suggest_read_cache) also
+		// marks itself as having every piece, which it no longer does, and a
+		// seed without this piece is not a seed anymore. Leave the seeding
+		// state; update_peer_interest() below then decides whether the
+		// torrent is still finished (the piece is not wanted) or downloads it
+		if (m_have_all) set_have_all(false);
+		if (m_state == torrent_status::seeding) set_state(torrent_status::finished);
 		update_gauge();
 
 		// we may have announced HAVE for this piece. Reject any pending

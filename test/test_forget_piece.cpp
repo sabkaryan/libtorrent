@@ -347,8 +347,51 @@ TORRENT_TEST(forget_piece_leaves_nothing_to_flush)
 	TEST_EQUAL(state->punched + late_punched, num_pieces);
 	TEST_EQUAL(state->unexpected, 0);
 	TEST_EQUAL(resurrected, 0);
+	// the test only proves something if some pieces passed before they were
+	// on disk; if the slow-write interposer stopped working, none would
+	TEST_CHECK(state->busy > 0);
 
 	ses.remove_torrent(th);
 	remove_all(save_path, ec);
 }
 #endif
+
+// With suggest_mode = suggest_read_cache a finished torrent keeps its piece
+// picker but also marks itself as having every piece. Forgetting a piece must
+// still make the torrent download it again.
+TORRENT_TEST(forget_piece_on_finished_torrent_keeping_its_picker)
+{
+	std::string const save_path = complete("forget_piece_read_cache");
+	error_code ec;
+	remove_all(save_path, ec);
+	settings_pack pack = forget_settings();
+	pack.set_int(settings_pack::suggest_mode, settings_pack::suggest_read_cache);
+	lt::session ses(pack);
+	torrent_handle const th = add_empty(ses, save_path);
+
+	std::vector<char> const data = piece_data();
+	for (int p = 0; p < num_pieces; ++p)
+		th.add_piece(piece_index_t(p), data.data());
+	bool seeding = false;
+	for (int i = 0; i < 200 && !seeding; ++i)
+	{
+		seeding = th.status().is_seeding;
+		if (!seeding) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	TEST_CHECK(seeding);
+
+	TEST_EQUAL(forget_when_idle(th, piece_index_t(0), nullptr), 0);
+	torrent_status st;
+	for (int i = 0; i < 100; ++i)
+	{
+		st = th.status();
+		if (!st.is_seeding && !st.is_finished) break;
+		std::this_thread::sleep_for(std::chrono::milliseconds(50));
+	}
+	TEST_CHECK(!th.have_piece(piece_index_t(0)));
+	TEST_CHECK(!st.is_seeding);
+	TEST_CHECK(!st.is_finished);
+
+	ses.remove_torrent(th);
+	remove_all(save_path, ec);
+}
