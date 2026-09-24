@@ -42,59 +42,11 @@ see LICENSE file.
 
 
 #if defined TORRENT_LINUX
-#include <atomic>
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/uio.h>
 #include <linux/falloc.h>
-
-// a slow disk: while slow_writes is set, every pwrite()/pwritev() made by the
-// disk threads takes at least 20 ms. This widens the time between a piece
-// passing its hash check and its blocks reaching the disk, which on a fast
-// disk is shorter than one round trip through the network thread.
-namespace {
-std::atomic<bool> slow_writes{false};
-void maybe_slow_down()
-{
-	if (slow_writes) std::this_thread::sleep_for(std::chrono::milliseconds(20));
-}
-
-// a held disk: while hold_writes is set, every pwrite()/pwritev() waits at
-// this gate until it is cleared; writes_waiting counts the calls waiting
-std::mutex gate_mutex;
-std::condition_variable gate_cv;
-bool hold_writes = false;
-int writes_waiting = 0;
-void maybe_hold()
-{
-	std::unique_lock<std::mutex> l(gate_mutex);
-	if (!hold_writes) return;
-	++writes_waiting;
-	gate_cv.notify_all();
-	gate_cv.wait(l, [] { return !hold_writes; });
-	--writes_waiting;
-}
-}
-
-extern "C" ssize_t pwritev(int fd, struct iovec const* iov, int iovcnt, off_t offset)
-{
-	using fn = ssize_t (*)(int, struct iovec const*, int, off_t);
-	static fn const real = reinterpret_cast<fn>(::dlsym(RTLD_NEXT, "pwritev"));
-	maybe_slow_down();
-	maybe_hold();
-	return real(fd, iov, iovcnt, offset);
-}
-
-extern "C" ssize_t pwrite(int fd, void const* buf, size_t count, off_t offset)
-{
-	using fn = ssize_t (*)(int, void const*, size_t, off_t);
-	static fn const real = reinterpret_cast<fn>(::dlsym(RTLD_NEXT, "pwrite"));
-	maybe_slow_down();
-	maybe_hold();
-	return real(fd, buf, count, offset);
-}
 #endif
+#include "write_gate.hpp"
 
 using namespace lt;
 
@@ -485,10 +437,7 @@ TORRENT_TEST(rewrite_aborted_while_old_blocks_are_flushing)
 	std::vector<char> const b(static_cast<std::size_t>(default_block_size), 'B');
 
 	// the piece arrives and passes; its flush is held at the disk
-	{
-		std::lock_guard<std::mutex> l(gate_mutex);
-		hold_writes = true;
-	}
+	set_hold_writes(true);
 	int a_written = 0;
 	for (int i = 0; i < blocks; ++i)
 	{
@@ -515,11 +464,7 @@ TORRENT_TEST(rewrite_aborted_while_old_blocks_are_flushing)
 	TEST_EQUAL(cnt[counters::num_rejected_piece_rewrites], 1);
 
 	// the old blocks reach the disk
-	{
-		std::lock_guard<std::mutex> l(gate_mutex);
-		hold_writes = false;
-	}
-	gate_cv.notify_all();
+	set_hold_writes(false);
 	TEST_CHECK(run_until([&] { return a_written == blocks; }));
 
 	// the piece is downloaded again and hashed from the new blocks

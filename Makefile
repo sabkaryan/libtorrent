@@ -1050,6 +1050,7 @@ TEST_SOURCES = \
   swarm_suite.hpp \
   test_utils.hpp \
   disk_cache_test_utils.hpp \
+  write_gate.hpp \
   settings.hpp \
   make_torrent.hpp \
   bittorrent_peer.hpp \
