@@ -22,6 +22,7 @@ see LICENSE file.
 #include "libtorrent/posix_disk_io.hpp"
 #include "libtorrent/aux_/path.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <functional>
@@ -250,6 +251,61 @@ TORRENT_TEST(piece_flushed_write_back_cache)
 	TEST_CHECK(th.status().is_seeding);
 	// a seed that has dropped its piece picker has every piece in the files
 	check_flushed_snapshot(th, num_pieces);
+	remove_all(save_path, ec);
+}
+
+// a disk slower than the pieces come: one flush writes the cached pieces one
+// after the other, and each piece is reported as it is written, not when the
+// whole flush is done
+TORRENT_TEST(piece_flushed_as_each_piece_is_written)
+{
+	std::string const save_path = complete("piece_flushed_each");
+	error_code ec;
+	remove_all(save_path, ec);
+	create_directory(save_path, ec);
+
+	lt::session ses(flushed_settings());
+	torrent_handle const th = ses.add_torrent(make_params(save_path));
+	std::string const file = combine_path(save_path, name);
+
+	piece_alerts rec;
+	collect(ses, rec, file, [&] { return th.status().state == torrent_status::downloading; }, 10s);
+
+	// every piece passes its hash check while nothing can be written
+	set_hold_writes(true);
+	std::vector<char> const data = piece_data();
+	for (piece_index_t p{0}; p < piece_index_t{num_pieces}; ++p)
+		th.add_piece(p, data.data());
+	collect(ses, rec, file, [&] { return rec.all_finished(); }, 10s);
+	TEST_CHECK(rec.all_finished());
+	TEST_EQUAL(rec.count(rec.flushed), 0);
+
+	// then a slow disk: each write takes 20 ms or more
+	slow_writes = true;
+	set_hold_writes(false);
+	std::vector<time_point> flushed_at;
+	auto const end = clock_type::now() + 10s;
+	while (int(flushed_at.size()) < num_pieces && clock_type::now() < end)
+	{
+		ses.wait_for_alert(100ms);
+		std::vector<alert*> alerts;
+		ses.pop_alerts(&alerts);
+		for (alert* a : alerts)
+			if (alert_cast<piece_flushed_alert>(a)) flushed_at.push_back(a->timestamp());
+	}
+	slow_writes = false;
+	TEST_EQUAL(int(flushed_at.size()), num_pieces);
+	if (!flushed_at.empty())
+	{
+		auto const spread = total_milliseconds(
+			*std::max_element(flushed_at.begin(), flushed_at.end())
+			- *std::min_element(flushed_at.begin(), flushed_at.end()));
+		std::printf("piece_flushed_alert spread: %d ms over %d pieces\n"
+			, int(spread), int(flushed_at.size()));
+		// the pieces are written one at a time, 20 ms or more each: the first
+		// is reported well before the last
+		TEST_CHECK(spread >= 60);
+	}
 	remove_all(save_path, ec);
 }
 
