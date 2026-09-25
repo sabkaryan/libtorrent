@@ -413,6 +413,126 @@ TORRENT_TEST(piece_flushed_from_peer_then_removed)
 {
 	flushed_after_stop("removed", [](lt::session& ses, torrent_handle const& th) { ses.remove_torrent(th); });
 }
+
+namespace {
+
+// asks for resume data and waits for the answer, recording piece alerts on
+// the way. Returns false if saving was skipped (save_resume_data_failed_alert)
+bool save_resume(lt::session& ses, torrent_handle const& th, piece_alerts& rec
+	, resume_data_flags_t const flags, add_torrent_params& out)
+{
+	th.save_resume_data(flags);
+	auto const end = clock_type::now() + 10s;
+	while (clock_type::now() < end)
+	{
+		ses.wait_for_alert(100ms);
+		std::vector<alert*> alerts;
+		ses.pop_alerts(&alerts);
+		for (alert* a : alerts)
+		{
+			if (auto const* pf = alert_cast<piece_finished_alert>(a))
+				++rec.finished[std::size_t(static_cast<int>(pf->piece_index))];
+			else if (auto const* fl = alert_cast<piece_flushed_alert>(a))
+				++rec.flushed[std::size_t(static_cast<int>(fl->piece_index))];
+			else if (auto const* sr = alert_cast<save_resume_data_alert>(a))
+			{
+				out = sr->params;
+				return true;
+			}
+			else if (alert_cast<save_resume_data_failed_alert>(a))
+				return false;
+		}
+	}
+	TEST_ERROR("no answer to save_resume_data()");
+	return false;
+}
+
+} // anonymous namespace
+
+// resume data lists the pieces whose bytes are in the files. A torrent whose
+// every piece passed its hash check already counts as a seed, but with a
+// write-back cache the bytes may not be written yet
+TORRENT_TEST(resume_data_has_only_written_pieces)
+{
+	std::string const save_path = complete("piece_flushed_resume_seed");
+	error_code ec;
+	remove_all(save_path, ec);
+	create_directory(save_path, ec);
+
+	lt::session ses(flushed_settings());
+	torrent_handle const th = ses.add_torrent(make_params(save_path));
+	std::string const file = combine_path(save_path, name);
+
+	piece_alerts rec;
+	collect(ses, rec, file, [&] { return th.status().state == torrent_status::downloading; }, 10s);
+
+	set_hold_writes(true);
+	std::vector<char> const data = piece_data();
+	for (piece_index_t p{0}; p < piece_index_t{num_pieces}; ++p)
+		th.add_piece(p, data.data());
+	collect(ses, rec, file, [&] { return rec.all_finished(); }, 10s);
+	TEST_CHECK(rec.all_finished());
+	TEST_EQUAL(rec.count(rec.flushed), 0);
+
+	add_torrent_params held;
+	TEST_CHECK(save_resume(ses, th, rec, {}, held));
+	TEST_EQUAL(held.have_pieces.count(), 0);
+
+	set_hold_writes(false);
+	collect(ses, rec, file, [&] { return rec.all_flushed(); }, 10s);
+	TEST_CHECK(rec.all_flushed());
+
+	add_torrent_params written;
+	TEST_CHECK(save_resume(ses, th, rec, {}, written));
+	TEST_EQUAL(written.have_pieces.count(), num_pieces);
+	remove_all(save_path, ec);
+}
+
+// resume data saved after a piece passed its hash check but before its bytes
+// were written does not have it. Writing it must ask for resume data to be
+// saved again, or the piece is only in the next save that happens for another
+// reason. Seen best with the last piece, after which no other piece passes
+TORRENT_TEST(resume_data_needs_saving_when_the_last_piece_is_written)
+{
+	std::string const save_path = complete("piece_flushed_resume_last");
+	error_code ec;
+	remove_all(save_path, ec);
+	create_directory(save_path, ec);
+
+	lt::session ses(flushed_settings());
+	torrent_handle const th = ses.add_torrent(make_params(save_path));
+	std::string const file = combine_path(save_path, name);
+
+	piece_alerts rec;
+	collect(ses, rec, file, [&] { return th.status().state == torrent_status::downloading; }, 10s);
+
+	piece_index_t const last{num_pieces - 1};
+	std::vector<char> const data = piece_data();
+	for (piece_index_t p{0}; p < last; ++p)
+		th.add_piece(p, data.data());
+	collect(ses, rec, file, [&] { return rec.count(rec.flushed) == num_pieces - 1; }, 10s);
+	TEST_EQUAL(rec.count(rec.flushed), num_pieces - 1);
+
+	set_hold_writes(true);
+	th.add_piece(last, data.data());
+	collect(ses, rec, file, [&] { return rec.all_finished(); }, 10s);
+	TEST_CHECK(rec.all_finished());
+
+	// saved while the last piece's bytes are held back
+	add_torrent_params before;
+	TEST_CHECK(save_resume(ses, th, rec, {}, before));
+	TEST_EQUAL(before.have_pieces.count(), num_pieces - 1);
+
+	set_hold_writes(false);
+	collect(ses, rec, file, [&] { return rec.all_flushed(); }, 10s);
+	TEST_CHECK(rec.all_flushed());
+
+	TEST_CHECK(th.need_save_resume_data());
+	add_torrent_params after;
+	TEST_CHECK(save_resume(ses, th, rec, torrent_handle::only_if_modified, after));
+	TEST_EQUAL(after.have_pieces.count(), num_pieces);
+	remove_all(save_path, ec);
+}
 #endif
 
 // pieces taken from resume data are in the file already: each gets its

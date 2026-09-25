@@ -7688,15 +7688,22 @@ namespace {
 		TORRENT_ASSERT(ret.have_pieces.empty());
 		if (max_piece > piece_index_t(0))
 		{
-			if (is_seed())
-			{
-				ret.have_pieces.resize(static_cast<int>(max_piece), true);
-			}
-			else if (has_picker())
+			// resume data lists the pieces that are in the files. The piece
+			// picker knows which those are, and is asked first: is_seed() is
+			// true as soon as every piece has passed its hash check, which
+			// with a write-back disk cache may be before its bytes are
+			// written. A torrent keeps its picker until every piece is written
+			// (maybe_done_flushing()); one without a picker that is a seed has
+			// all of them (or was given them, in seed mode)
+			if (has_picker())
 			{
 				ret.have_pieces.resize(static_cast<int>(max_piece), false);
 				for (auto const i : ret.have_pieces.range())
 					if (m_picker->is_piece_flushed(i)) ret.have_pieces.set_bit(i);
+			}
+			else if (is_seed())
+			{
+				ret.have_pieces.resize(static_cast<int>(max_piece), true);
 			}
 
 			if (m_seed_mode)
@@ -9158,7 +9165,13 @@ namespace {
 		bool const was_flushed = m_picker->is_piece_flushed(block.piece_index);
 		m_picker->mark_as_finished(block, peer);
 		if (!was_flushed && m_picker->is_piece_flushed(block.piece_index))
+		{
+			// resume data lists the pieces that are in the files, so this is
+			// progress for it too: resume data saved after the piece passed
+			// its hash check, but before this write, does not have it
+			set_need_save_resume(torrent_handle::if_download_progress);
 			post_piece_flushed(block.piece_index);
+		}
 	}
 
 	void torrent::post_piece_flushed(piece_index_t const index)
