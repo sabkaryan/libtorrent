@@ -1889,15 +1889,10 @@ void pread_disk_io::try_flush_cache(int const target_cache_size
 	jobqueue_t completed_jobs;
 	m_cache.flush_to_disk(
 		[&](bitfield& flushed, span<aux::disk_job* const> blocks) {
-			// complete the jobs of the pieces this pass has flushed so far
-			// before writing the next one. A pass lasts as long as pieces
-			// become ready to flush, which is as long as the disk is slower
-			// than the network, so holding the completions to the end of the
-			// pass would hold back piece_flushed_alert (and every other
-			// consequence of a completed write) for that long. This is
-			// called with no mutex held, and the cache has accounted for the
-			// blocks flushed so far (flush_piece_impl returned for them)
-			if (!completed_jobs.empty())
+			// complete the pieces flushed so far before writing the next one.
+			// Not without disk threads: add_completed_jobs() then flushes the
+			// cache itself (schedule_flush), which would nest a pass in this one
+			if (!completed_jobs.empty() && m_generic_threads.max_threads() > 0)
 				add_completed_jobs(std::move(completed_jobs));
 			return flush_cache_blocks(flushed, blocks, completed_jobs);
 		},
