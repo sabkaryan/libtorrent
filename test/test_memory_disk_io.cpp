@@ -204,15 +204,9 @@ struct disk_env
 			int const block = off / lt::default_block_size;
 			if (std::find(skip.begin(), skip.end(), block) != skip.end()) continue;
 			lt::peer_request const r{piece, off, std::min(lt::default_block_size, len - off)};
-			// flush_piece is set because pread_disk_io, on a v1+v2 torrent
-			// whose block ends in a pad file and with hashing_threads > 0,
-			// keeps that block cached without it, and a later hash2 of the
-			// block then reads it with the v2 length (open upstream issue).
-			// The memory path ignores the flag
-			bool const last = off + lt::default_block_size >= len;
 			disk->async_write(st, r, data.data() + off, {}
 				, [this](lt::storage_error const& e) { TEST_CHECK(!e); ++writes_done; }
-				, last ? lt::disk_interface::flush_piece : lt::disk_job_flags_t{});
+				, lt::disk_job_flags_t{});
 			++writes_issued;
 		}
 		disk->submit_jobs();
