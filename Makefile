@@ -391,6 +391,7 @@ SOURCES = \
   posix_disk_io.cpp               \
   posix_part_file.cpp             \
   posix_storage.cpp               \
+  memory_slab.cpp                 \
   pread_disk_io.cpp               \
   pread_storage.cpp               \
   proxy_base.cpp                  \
