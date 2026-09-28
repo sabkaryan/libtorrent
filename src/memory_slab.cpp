@@ -14,6 +14,7 @@ see LICENSE file.
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
 
 #ifdef TORRENT_WINDOWS
 #include "libtorrent/aux_/windows.hpp"
@@ -89,19 +90,21 @@ namespace {
 
 	memory_slab_allocator::~memory_slab_allocator()
 	{
-		for (slab const& s : m_slabs)
-			unmap_slab(s.base, m_slab_bytes);
+		for (auto const& entry : m_slabs)
+			unmap_slab(entry.first, m_slab_bytes);
 	}
 
 	char* memory_slab_allocator::allocate()
 	{
-		for (slab& s : m_slabs)
+		if (!m_slabs_with_free.empty())
 		{
-			if (s.free_blocks.empty()) continue;
+			char* const base = *m_slabs_with_free.begin();
+			slab& s = m_slabs.find(base)->second;
 			char* const block = s.free_blocks.back();
 			s.free_blocks.pop_back();
 			++s.used_blocks;
 			++m_blocks_in_use;
+			if (s.free_blocks.empty()) m_slabs_with_free.erase(base);
 			recommit_block(block);
 			return block;
 		}
@@ -110,7 +113,6 @@ namespace {
 		if (base == nullptr) return nullptr;
 
 		slab s;
-		s.base = base;
 		s.free_blocks.reserve(static_cast<std::size_t>(m_blocks_per_slab));
 		for (int i = m_blocks_per_slab - 1; i >= 0; --i)
 			s.free_blocks.push_back(base + std::ptrdiff_t(i) * default_block_size);
@@ -118,7 +120,9 @@ namespace {
 		char* const block = s.free_blocks.back();
 		s.free_blocks.pop_back();
 		s.used_blocks = 1;
-		m_slabs.push_back(std::move(s));
+		bool const has_spare_blocks = !s.free_blocks.empty();
+		m_slabs.emplace(base, std::move(s));
+		if (has_spare_blocks) m_slabs_with_free.insert(base);
 		++m_blocks_in_use;
 		return block;
 	}
@@ -149,55 +153,53 @@ namespace {
 			i = j;
 		}
 
-		for (char* const block : blocks)
+		// walk the address-sorted batch against the slabs (also ordered by
+		// base address) in a single merge pass, instead of looking each
+		// block's owner up independently: O(batch + mapped slabs) rather
+		// than O(batch x mapped slabs)
+		TORRENT_ASSERT(!m_slabs.empty());
+		auto slab_it = m_slabs.begin();
+		for (char* const block : sorted)
 		{
-			slab* const owner = find_slab(block);
-			TORRENT_ASSERT(owner != nullptr);
-			if (owner == nullptr) continue;
-			owner->free_blocks.push_back(block);
-			--owner->used_blocks;
+			while (std::next(slab_it) != m_slabs.end() && std::next(slab_it)->first <= block)
+				++slab_it;
+			TORRENT_ASSERT(block >= slab_it->first && block < slab_it->first + m_slab_bytes);
+			slab& owner = slab_it->second;
+			owner.free_blocks.push_back(block);
+			--owner.used_blocks;
 			--m_blocks_in_use;
+			m_slabs_with_free.insert(slab_it->first);
 		}
 
 		release_empty_slabs();
 	}
 
-	memory_slab_allocator::slab* memory_slab_allocator::find_slab(char* const block)
-	{
-		for (slab& s : m_slabs)
-		{
-			if (block >= s.base && block < s.base + m_slab_bytes)
-				return &s;
-		}
-		return nullptr;
-	}
-
 	void memory_slab_allocator::release_empty_slabs()
 	{
 		bool have_spare = false;
-		for (std::size_t i = 0; i < m_slabs.size(); )
+		for (auto it = m_slabs.begin(); it != m_slabs.end(); )
 		{
-			slab& s = m_slabs[i];
+			slab& s = it->second;
 			if (s.used_blocks != 0)
 			{
-				++i;
+				++it;
 				continue;
 			}
 			if (!have_spare)
 			{
 				have_spare = true;
-				++i;
+				++it;
 				continue;
 			}
-			if (unmap_slab(s.base, m_slab_bytes))
+			if (unmap_slab(it->first, m_slab_bytes))
 			{
-				m_slabs.erase(m_slabs.begin() + std::ptrdiff_t(i));
-				// do not advance i: the next slab has shifted into this index
+				m_slabs_with_free.erase(it->first);
+				it = m_slabs.erase(it);
 				continue;
 			}
 			// could not give the slab back to the system; keep tracking it
 			// rather than losing our only handle to it
-			++i;
+			++it;
 		}
 	}
 }

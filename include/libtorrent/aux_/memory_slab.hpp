@@ -10,6 +10,8 @@ see LICENSE file.
 #ifndef TORRENT_MEMORY_SLAB_HPP_INCLUDED
 #define TORRENT_MEMORY_SLAB_HPP_INCLUDED
 
+#include <map>
+#include <set>
 #include <vector>
 
 #include "libtorrent/config.hpp"
@@ -43,19 +45,23 @@ namespace libtorrent::aux {
 		// one anonymous mapping of m_slab_bytes, carved into fixed-size blocks
 		struct slab
 		{
-			char* base = nullptr;
 			int used_blocks = 0;
 			// free blocks of this slab, as a LIFO stack
 			std::vector<char*> free_blocks;
 		};
 
-		slab* find_slab(char* block);
 		void release_empty_slabs();
 
 		int const m_slab_bytes;
 		int const m_blocks_per_slab;
 		int m_blocks_in_use = 0;
-		std::vector<slab> m_slabs;
+		// slabs kept ordered by base address, so a batch of blocks (already
+		// sorted by address for madvise coalescing) can be matched to their
+		// owning slabs in one merge pass instead of a linear scan per block
+		std::map<char*, slab> m_slabs;
+		// bases of the slabs in m_slabs that currently have a free block,
+		// so allocate() does not have to scan every mapped slab to find one
+		std::set<char*> m_slabs_with_free;
 	};
 }
 

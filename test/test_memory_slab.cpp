@@ -12,6 +12,7 @@ see LICENSE file.
 #include "libtorrent/disk_interface.hpp" // default_block_size
 #include <algorithm>
 #include <cstring>
+#include <random>
 #include <vector>
 
 using lt::aux::memory_slab_allocator;
@@ -52,4 +53,33 @@ TORRENT_TEST(slab_unmaps_empty_slabs)
 	a.free(b);
 	TEST_EQUAL(a.blocks_in_use(), 0);
 	TEST_EQUAL(a.mapped_slabs(), 1);
+}
+
+// many concurrently mapped slabs: free() must find each block's owner, and
+// allocate() must find a slab with a free block, without scanning every
+// mapped slab
+TORRENT_TEST(slab_many_slabs)
+{
+	int const n = 2048;
+	memory_slab_allocator a(lt::default_block_size); // one block per slab
+	std::vector<char*> b;
+	b.reserve(static_cast<std::size_t>(n));
+	for (int i = 0; i < n; ++i) b.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), n);
+	TEST_EQUAL(a.mapped_slabs(), n);
+	for (char* p : b) TEST_CHECK(p != nullptr);
+
+	std::mt19937 rng(0xf00d);
+	std::shuffle(b.begin(), b.end(), rng);
+
+	a.free(b);
+	TEST_EQUAL(a.blocks_in_use(), 0);
+	TEST_EQUAL(a.mapped_slabs(), 1);
+
+	std::vector<char*> c;
+	c.reserve(static_cast<std::size_t>(n));
+	for (int i = 0; i < n; ++i) c.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), n);
+	TEST_EQUAL(a.mapped_slabs(), n);
+	for (char* p : c) TEST_CHECK(p != nullptr);
 }
