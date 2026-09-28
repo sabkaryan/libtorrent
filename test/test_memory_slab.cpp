@@ -83,3 +83,30 @@ TORRENT_TEST(slab_many_slabs)
 	TEST_EQUAL(a.mapped_slabs(), n);
 	for (char* p : c) TEST_CHECK(p != nullptr);
 }
+
+// a pointer that belongs to no slab (foreign, already freed twice, or from
+// an already-unmapped slab) is skipped rather than corrupting whichever
+// slab the merge pass in free() happens to be pointing at. In a debug
+// build this is caught by TORRENT_ASSERT_FAIL() and aborts, so this test
+// only runs in a release-style build with asserts off, where the assert
+// compiles away and the skip path itself is what needs checking.
+#if !TORRENT_USE_ASSERTS
+TORRENT_TEST(slab_free_skips_foreign_pointer)
+{
+	memory_slab_allocator a(2 * lt::default_block_size);
+	std::vector<char*> b;
+	for (int i = 0; i < 4; ++i) b.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), 4);
+	TEST_EQUAL(a.mapped_slabs(), 2);
+
+	// a block-sized buffer that was never handed out by this allocator
+	std::vector<char> foreign(static_cast<std::size_t>(lt::default_block_size));
+
+	std::vector<char*> batch = b;
+	batch.push_back(foreign.data());
+
+	a.free(batch);
+	TEST_EQUAL(a.blocks_in_use(), 0);
+	TEST_EQUAL(a.mapped_slabs(), 1);
+}
+#endif

@@ -14,7 +14,6 @@ see LICENSE file.
 
 #include <algorithm>
 #include <cstddef>
-#include <iterator>
 
 #ifdef TORRENT_WINDOWS
 #include "libtorrent/aux_/windows.hpp"
@@ -139,36 +138,48 @@ namespace {
 		std::vector<char*> sorted(blocks.begin(), blocks.end());
 		std::sort(sorted.begin(), sorted.end());
 
-		// madvise (or decommit) adjacent blocks with a single call, coalescing
-		// the ranges instead of calling once per block
-		std::size_t i = 0;
-		while (i < sorted.size())
-		{
-			std::size_t j = i + 1;
-			while (j < sorted.size()
-				&& sorted[j] == sorted[j - 1] + default_block_size)
-				++j;
-			auto const bytes = (j - i) * static_cast<std::size_t>(default_block_size);
-			decommit_range(sorted[i], bytes);
-			i = j;
-		}
-
 		// walk the address-sorted batch against the slabs (also ordered by
 		// base address) in a single merge pass, instead of looking each
 		// block's owner up independently: O(batch + mapped slabs) rather
-		// than O(batch x mapped slabs)
-		TORRENT_ASSERT(!m_slabs.empty());
+		// than O(batch x mapped slabs). A block that is not inside any
+		// currently mapped slab -- a foreign pointer, a double free, or a
+		// block of a slab that was already unmapped -- is a caller bug: it
+		// is asserted in a debug build and, in a release build (where the
+		// assert compiles away), simply skipped rather than attributed to
+		// whichever slab slab_it happens to be pointing at. Only accepted
+		// blocks take part in the madvise coalescing below.
+		std::vector<char*> accepted;
+		accepted.reserve(sorted.size());
 		auto slab_it = m_slabs.begin();
 		for (char* const block : sorted)
 		{
-			while (std::next(slab_it) != m_slabs.end() && std::next(slab_it)->first <= block)
+			while (slab_it != m_slabs.end() && slab_it->first + m_slab_bytes <= block)
 				++slab_it;
-			TORRENT_ASSERT(block >= slab_it->first && block < slab_it->first + m_slab_bytes);
+			if (slab_it == m_slabs.end() || block < slab_it->first)
+			{
+				TORRENT_ASSERT_FAIL();
+				continue;
+			}
 			slab& owner = slab_it->second;
 			owner.free_blocks.push_back(block);
 			--owner.used_blocks;
 			--m_blocks_in_use;
 			m_slabs_with_free.insert(slab_it->first);
+			accepted.push_back(block);
+		}
+
+		// madvise (or decommit) adjacent accepted blocks with a single call,
+		// coalescing the ranges instead of calling once per block
+		std::size_t i = 0;
+		while (i < accepted.size())
+		{
+			std::size_t j = i + 1;
+			while (j < accepted.size()
+				&& accepted[j] == accepted[j - 1] + default_block_size)
+				++j;
+			auto const bytes = (j - i) * static_cast<std::size_t>(default_block_size);
+			decommit_range(accepted[i], bytes);
+			i = j;
 		}
 
 		release_empty_slabs();
