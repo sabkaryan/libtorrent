@@ -55,6 +55,7 @@ set(libtorrent_include_files
 	libtorrent.hpp
 	load_torrent.hpp
 	magnet_uri.hpp
+	memory_disk_io.hpp
 	mmap_disk_io.hpp
 	natpmp.hpp
 	operations.hpp
@@ -209,6 +210,8 @@ set(libtorrent_aux_include_files
 	merge_block_requests.hpp
 	merkle.hpp
 	merkle_tree.hpp
+	memory_slab.hpp
+	memory_storage.hpp
 	mmap_storage.hpp
 	precomputed_block_hashes.hpp
 	netlink.hpp

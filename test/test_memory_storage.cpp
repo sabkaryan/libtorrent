@@ -146,6 +146,36 @@ TORRENT_TEST(storage_retired_entry_freed_only_when_unpinned)
 	TEST_EQUAL(alloc.blocks_in_use(), 0);
 }
 
+// a retired entry held by two jobs is freed exactly when the last pin goes
+TORRENT_TEST(storage_retired_entry_freed_at_last_pin)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * bs);
+	memory_storage st(fs, true, false, alloc);
+	piece_index_t const p{3};
+
+	auto const old = st.start(p, piece_place::memory);
+	TEST_CHECK(st.write_block(*old, 0, block_of('o')));
+	old->pins = 2;
+	st.retire(p);
+	TEST_EQUAL(st.retired_bytes(), bs);
+	TEST_EQUAL(st.held_partial(), 0);
+
+	st.unpin(old);
+	TEST_EQUAL(old->pins, 1);
+	TEST_EQUAL(st.retired_bytes(), bs);
+	TEST_EQUAL(old->num_blocks, 1);
+	TEST_CHECK(st.block_data(*old, 0) != nullptr);
+	TEST_EQUAL(alloc.blocks_in_use(), 1);
+
+	st.unpin(old);
+	TEST_EQUAL(old->pins, 0);
+	TEST_EQUAL(st.retired_bytes(), 0);
+	TEST_EQUAL(old->num_blocks, 0);
+	TEST_CHECK(st.block_data(*old, 0) == nullptr);
+	TEST_EQUAL(alloc.blocks_in_use(), 0);
+}
+
 TORRENT_TEST(storage_decide_rules)
 {
 	lt::file_storage const fs = two_files();

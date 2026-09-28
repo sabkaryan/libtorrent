@@ -624,6 +624,7 @@ HEADERS = \
   aux_/merkle.hpp                   \
   aux_/merkle_tree.hpp              \
   aux_/mmap.hpp                     \
+  aux_/memory_slab.hpp              \
   aux_/memory_storage.hpp           \
   aux_/mmap_storage.hpp             \
   aux_/precomputed_block_hashes.hpp \

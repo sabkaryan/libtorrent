@@ -71,7 +71,11 @@ namespace libtorrent::aux {
 	{
 		// fs must outlive the storage, and so must alloc
 		memory_storage(file_storage const& fs, bool v1, bool v2, memory_slab_allocator& alloc);
-		// frees the blocks of every entry, current or retired
+		// frees the blocks of the current entries. The storage must outlive
+		// every pin on its entries: the owner (the pool) keeps it alive until
+		// the pins drop, since a job may read a pinned entry's blocks without
+		// the pool's mutex. Asserts that no entry is pinned; with asserts off
+		// a pinned entry's blocks are not freed
 		~memory_storage();
 		memory_storage(memory_storage const&) = delete;
 		memory_storage& operator=(memory_storage const&) = delete;

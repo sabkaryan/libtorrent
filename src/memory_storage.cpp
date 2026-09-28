@@ -43,14 +43,18 @@ namespace libtorrent::aux {
 
 	memory_storage::~memory_storage()
 	{
-		// the pool must not destroy a storage whose entries are pinned. Free
-		// everything anyway, so no block outlives its storage
+		// the owner keeps the storage alive until every pin on its entries
+		// is released: a job may read the blocks of a pinned entry without
+		// the pool's mutex. A retired entry leaves m_retired when its last
+		// pin goes, so a non-empty list means a pin outlived the storage
+		TORRENT_ASSERT(m_retired.empty());
 		for (auto& slot : m_pieces)
-			if (slot.current) free_blocks(*slot.current);
-		for (auto const& e : m_retired)
 		{
-			TORRENT_ASSERT(e->pins > 0);
-			free_blocks(*e);
+			if (!slot.current) continue;
+			TORRENT_ASSERT(slot.current->pins == 0);
+			// with asserts off, a pinned entry keeps its blocks (they go back
+			// with the allocator) rather than being freed under its reader
+			if (slot.current->pins == 0) free_blocks(*slot.current);
 		}
 	}
 
