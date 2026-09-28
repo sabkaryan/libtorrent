@@ -84,12 +84,15 @@ TORRENT_TEST(slab_many_slabs)
 	for (char* p : c) TEST_CHECK(p != nullptr);
 }
 
-// a pointer that belongs to no slab (foreign, already freed twice, or from
-// an already-unmapped slab) is skipped rather than corrupting whichever
-// slab the merge pass in free() happens to be pointing at. In a debug
-// build this is caught by TORRENT_ASSERT_FAIL() and aborts, so this test
-// only runs in a release-style build with asserts off, where the assert
-// compiles away and the skip path itself is what needs checking.
+// a pointer that lies outside every currently mapped slab -- a foreign
+// pointer, or a block of a slab that was already unmapped -- is skipped by
+// the merge pass in free() rather than corrupting whichever slab slab_it
+// happens to be pointing at. (A double free or a misaligned pointer INSIDE
+// a still-live slab is a different failure mode, caught by that slab's
+// used_bitmap instead -- see the tests below.) In a debug build this is
+// caught by TORRENT_ASSERT_FAIL() and aborts, so this test only runs in a
+// release-style build with asserts off, where the assert compiles away and
+// the skip path itself is what needs checking.
 #if !TORRENT_USE_ASSERTS
 TORRENT_TEST(slab_free_skips_foreign_pointer)
 {
@@ -109,4 +112,121 @@ TORRENT_TEST(slab_free_skips_foreign_pointer)
 	TEST_EQUAL(a.blocks_in_use(), 0);
 	TEST_EQUAL(a.mapped_slabs(), 1);
 }
+
+// a block freed twice through two separate free() calls is rejected the
+// second time: its used_bitmap bit was already cleared by the first free,
+// so the second is a no-op instead of pushing the same address onto
+// free_blocks twice. The next two allocate() calls must hand back two
+// different addresses, not the same one to two callers.
+TORRENT_TEST(slab_free_rejects_double_free_across_calls)
+{
+	memory_slab_allocator a(2 * lt::default_block_size);
+	std::vector<char*> b;
+	for (int i = 0; i < 2; ++i) b.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), 2);
+
+	a.free(b[0]);
+	TEST_EQUAL(a.blocks_in_use(), 1);
+
+	a.free(b[0]); // double free: rejected, no further bookkeeping change
+	TEST_EQUAL(a.blocks_in_use(), 1);
+	TEST_EQUAL(a.mapped_slabs(), 1);
+
+	char* p = a.allocate();
+	char* q = a.allocate();
+	TEST_CHECK(p != q);
+}
+
+// the same double free, but both occurrences are in one batch passed to
+// free(span): the first occurrence in address order clears the bit, the
+// repeated one right after it is rejected within the same call.
+TORRENT_TEST(slab_free_rejects_double_free_within_span)
+{
+	memory_slab_allocator a(2 * lt::default_block_size);
+	std::vector<char*> b;
+	for (int i = 0; i < 2; ++i) b.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), 2);
+
+	std::vector<char*> batch;
+	batch.push_back(b[0]);
+	batch.push_back(b[0]); // same pointer twice in one span
+	a.free(batch);
+	TEST_EQUAL(a.blocks_in_use(), 1);
+	TEST_EQUAL(a.mapped_slabs(), 1);
+
+	char* p = a.allocate();
+	char* q = a.allocate();
+	TEST_CHECK(p != q);
+}
+
+// a pointer inside a live slab but not on a block boundary is rejected,
+// not treated as if it were the block it happens to fall inside.
+TORRENT_TEST(slab_free_rejects_misaligned_pointer)
+{
+	memory_slab_allocator a(2 * lt::default_block_size);
+	std::vector<char*> b;
+	for (int i = 0; i < 2; ++i) b.push_back(a.allocate());
+	TEST_EQUAL(a.blocks_in_use(), 2);
+
+	a.free(b[0] + 1); // misaligned: inside the slab, not on a block boundary
+	TEST_EQUAL(a.blocks_in_use(), 2);
+	TEST_EQUAL(a.mapped_slabs(), 1);
+
+	a.free(b[0]);
+	TEST_EQUAL(a.blocks_in_use(), 1);
+
+	char* p = a.allocate();
+	char* q = a.allocate();
+	TEST_CHECK(p != q);
+}
 #endif
+
+// two different slabs that happen to be address-adjacent must not be
+// coalesced into one madvise/decommit call: mmap often packs same-size
+// anonymous mappings back to back, and the coalescing run is cut at the
+// slab boundary regardless -- a single madvise spanning two adjacent Linux
+// mappings is legal, but the Windows equivalent, VirtualFree(MEM_DECOMMIT),
+// only accepts a range inside one VirtualAlloc region and fails across two.
+TORRENT_TEST(slab_free_cuts_madvise_at_slab_boundary)
+{
+	memory_slab_allocator a(lt::default_block_size); // one block per slab
+	int const attempts = 64;
+	std::vector<char*> blocks;
+	blocks.reserve(static_cast<std::size_t>(attempts));
+	for (int i = 0; i < attempts; ++i) blocks.push_back(a.allocate());
+
+	std::vector<char*> sorted_blocks = blocks;
+	std::sort(sorted_blocks.begin(), sorted_blocks.end());
+
+	char* first = nullptr;
+	char* second = nullptr;
+	for (std::size_t i = 0; i + 1 < sorted_blocks.size(); ++i)
+	{
+		if (sorted_blocks[i + 1] == sorted_blocks[i] + lt::default_block_size)
+		{
+			first = sorted_blocks[i];
+			second = sorted_blocks[i + 1];
+			break;
+		}
+	}
+
+	if (first == nullptr)
+	{
+		std::printf("note: none of %d one-block slabs landed address-adjacent;"
+			" skipping the slab-boundary madvise-cut check\n", attempts);
+	}
+	else
+	{
+		std::vector<char*> pair;
+		pair.push_back(first);
+		pair.push_back(second);
+		a.free(pair);
+		TEST_EQUAL(a.last_free_decommit_calls(), 2);
+	}
+
+	std::vector<char*> rest;
+	for (char* p : blocks)
+		if (p != first && p != second) rest.push_back(p);
+	a.free(rest);
+	TEST_EQUAL(a.blocks_in_use(), 0);
+}

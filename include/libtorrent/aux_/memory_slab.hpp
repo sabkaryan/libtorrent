@@ -40,6 +40,10 @@ namespace libtorrent::aux {
 		int mapped_slabs() const { return static_cast<int>(m_slabs.size()); }
 		int slab_bytes() const { return m_slab_bytes; }
 
+		// test hook: number of madvise/decommit calls the most recent free()
+		// call issued, after cutting the coalesced ranges at slab boundaries
+		int last_free_decommit_calls() const { return m_last_free_decommit_calls; }
+
 	private:
 
 		// one anonymous mapping of m_slab_bytes, carved into fixed-size blocks
@@ -48,6 +52,13 @@ namespace libtorrent::aux {
 			int used_blocks = 0;
 			// free blocks of this slab, as a LIFO stack
 			std::vector<char*> free_blocks;
+			// used_bitmap[i] is true while block i (0-based, from this
+			// slab's base) is currently handed out by allocate(); free()
+			// only accepts a block that is aligned to a block boundary here
+			// and whose bit is set, rejecting a double free (two calls, or
+			// repeated within one span) or a misaligned pointer instead of
+			// silently corrupting this slab's bookkeeping
+			std::vector<bool> used_bitmap;
 		};
 
 		void release_empty_slabs();
@@ -55,6 +66,7 @@ namespace libtorrent::aux {
 		int const m_slab_bytes;
 		int const m_blocks_per_slab;
 		int m_blocks_in_use = 0;
+		int m_last_free_decommit_calls = 0;
 		// slabs kept ordered by base address, so a batch of blocks (already
 		// sorted by address for madvise coalescing) can be matched to their
 		// owning slabs in one merge pass instead of a linear scan per block

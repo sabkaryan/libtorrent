@@ -77,6 +77,14 @@ namespace {
 #endif
 	}
 
+	// 0-based index of block within a slab starting at base; only valid
+	// once the caller has checked that block is aligned to a block
+	// boundary relative to base
+	std::size_t block_index(char* const base, char* const block)
+	{
+		return static_cast<std::size_t>(block - base) / static_cast<std::size_t>(default_block_size);
+	}
+
 } // anonymous namespace
 
 	memory_slab_allocator::memory_slab_allocator(int const slab_bytes)
@@ -101,6 +109,7 @@ namespace {
 			slab& s = m_slabs.find(base)->second;
 			char* const block = s.free_blocks.back();
 			s.free_blocks.pop_back();
+			s.used_bitmap[block_index(base, block)] = true;
 			++s.used_blocks;
 			++m_blocks_in_use;
 			if (s.free_blocks.empty()) m_slabs_with_free.erase(base);
@@ -113,11 +122,13 @@ namespace {
 
 		slab s;
 		s.free_blocks.reserve(static_cast<std::size_t>(m_blocks_per_slab));
+		s.used_bitmap.assign(static_cast<std::size_t>(m_blocks_per_slab), false);
 		for (int i = m_blocks_per_slab - 1; i >= 0; --i)
 			s.free_blocks.push_back(base + std::ptrdiff_t(i) * default_block_size);
 
 		char* const block = s.free_blocks.back();
 		s.free_blocks.pop_back();
+		s.used_bitmap[block_index(base, block)] = true;
 		s.used_blocks = 1;
 		bool const has_spare_blocks = !s.free_blocks.empty();
 		m_slabs.emplace(base, std::move(s));
@@ -133,6 +144,7 @@ namespace {
 
 	void memory_slab_allocator::free(span<char* const> const blocks)
 	{
+		m_last_free_decommit_calls = 0;
 		if (blocks.empty()) return;
 
 		std::vector<char*> sorted(blocks.begin(), blocks.end());
@@ -141,45 +153,82 @@ namespace {
 		// walk the address-sorted batch against the slabs (also ordered by
 		// base address) in a single merge pass, instead of looking each
 		// block's owner up independently: O(batch + mapped slabs) rather
-		// than O(batch x mapped slabs). A block that is not inside any
-		// currently mapped slab -- a foreign pointer, a double free, or a
-		// block of a slab that was already unmapped -- is a caller bug: it
-		// is asserted in a debug build and, in a release build (where the
-		// assert compiles away), simply skipped rather than attributed to
-		// whichever slab slab_it happens to be pointing at. Only accepted
-		// blocks take part in the madvise coalescing below.
-		std::vector<char*> accepted;
-		accepted.reserve(sorted.size());
+		// than O(batch x mapped slabs). A block is accepted only if it
+		// lies inside a currently mapped slab, is aligned to a block
+		// boundary there, and its bit is currently set in that slab's
+		// used_bitmap. A block of a slab that was already unmapped, or a
+		// foreign pointer, fails the first test; a pointer into a live
+		// slab that is not on a block boundary fails the second; a double
+		// free (two separate calls, or the same pointer repeated within
+		// one span) fails the third, because the first occurrence already
+		// cleared its bit. All three are caller bugs: asserted in a debug
+		// build and, in a release build (where the assert compiles away),
+		// simply skipped -- no bookkeeping, no madvise/decommit -- rather
+		// than attributed to whichever slab slab_it happens to be
+		// pointing at.
+		//
+		// Accepted, address-adjacent blocks are coalesced into a single
+		// madvise/decommit call, but that run is cut whenever the owning
+		// slab changes, even when two slabs happen to be address-adjacent
+		// (mmap often packs same-size anonymous mappings back to back): a
+		// single madvise spanning two separate mappings is fine on Linux,
+		// but the Windows equivalent, VirtualFree(MEM_DECOMMIT), only
+		// accepts a range inside one VirtualAlloc region and fails across
+		// two.
 		auto slab_it = m_slabs.begin();
+		char* run_start = nullptr;
+		char* run_end = nullptr; // one past the last accepted block of the run
+		char* run_owner = nullptr; // base of the slab the run belongs to
 		for (char* const block : sorted)
 		{
 			while (slab_it != m_slabs.end() && slab_it->first + m_slab_bytes <= block)
 				++slab_it;
-			if (slab_it == m_slabs.end() || block < slab_it->first)
+
+			bool accepted = false;
+			std::size_t index = 0;
+			if (slab_it != m_slabs.end() && block >= slab_it->first)
+			{
+				auto const offset = block - slab_it->first;
+				if (offset % default_block_size == 0)
+				{
+					index = static_cast<std::size_t>(offset / default_block_size);
+					accepted = slab_it->second.used_bitmap[index];
+				}
+			}
+
+			if (!accepted)
 			{
 				TORRENT_ASSERT_FAIL();
 				continue;
 			}
+
 			slab& owner = slab_it->second;
+			owner.used_bitmap[index] = false;
 			owner.free_blocks.push_back(block);
 			--owner.used_blocks;
 			--m_blocks_in_use;
 			m_slabs_with_free.insert(slab_it->first);
-			accepted.push_back(block);
-		}
 
-		// madvise (or decommit) adjacent accepted blocks with a single call,
-		// coalescing the ranges instead of calling once per block
-		std::size_t i = 0;
-		while (i < accepted.size())
+			if (run_start != nullptr && block == run_end && slab_it->first == run_owner)
+			{
+				run_end = block + default_block_size;
+			}
+			else
+			{
+				if (run_start != nullptr)
+				{
+					decommit_range(run_start, static_cast<std::size_t>(run_end - run_start));
+					++m_last_free_decommit_calls;
+				}
+				run_start = block;
+				run_end = block + default_block_size;
+				run_owner = slab_it->first;
+			}
+		}
+		if (run_start != nullptr)
 		{
-			std::size_t j = i + 1;
-			while (j < accepted.size()
-				&& accepted[j] == accepted[j - 1] + default_block_size)
-				++j;
-			auto const bytes = (j - i) * static_cast<std::size_t>(default_block_size);
-			decommit_range(accepted[i], bytes);
-			i = j;
+			decommit_range(run_start, static_cast<std::size_t>(run_end - run_start));
+			++m_last_free_decommit_calls;
 		}
 
 		release_empty_slabs();
