@@ -210,6 +210,7 @@ set(libtorrent_aux_include_files
 	merge_block_requests.hpp
 	merkle.hpp
 	merkle_tree.hpp
+	memory_hasher.hpp
 	memory_pool_impl.hpp
 	memory_slab.hpp
 	memory_storage.hpp
@@ -401,6 +402,7 @@ set(sources
 	posix_part_file.cpp
 	posix_storage.cpp
 	memory_disk_io.cpp
+	memory_hasher.cpp
 	memory_slab.cpp
 	memory_storage.cpp
 	memory_storage_pool.cpp

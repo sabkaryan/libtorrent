@@ -857,7 +857,7 @@ static void clear_during_flush_suite(lt::disk_io_constructor_type disk_io)
 // Exercises dispatching a deferred clear_piece from inside the cache flush.
 // Only deterministic (and only built) under simulate-slow=write; see
 // clear_during_flush_impl.
-TORRENT_TEST_DISK_IO(test_disk_io_clear_during_flush)
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io_clear_during_flush)
 {
 #ifdef TORRENT_SIMULATE_SLOW_WRITE
 	clear_during_flush_suite(disk_io);
@@ -866,7 +866,7 @@ TORRENT_TEST_DISK_IO(test_disk_io_clear_during_flush)
 #endif
 }
 
-TORRENT_TEST_DISK_IO(test_disk_io) { disk_io_test_suite(disk_io, 3); }
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io) { disk_io_test_suite(disk_io, 3); }
 
 // same as test_pread_disk_io, but raises a fence (a no-op async_clear_piece)
 // before each piece's writes, so the writes and the hash are queued behind the
@@ -874,7 +874,7 @@ TORRENT_TEST_DISK_IO(test_disk_io) { disk_io_test_suite(disk_io, 3); }
 // before it once the fence is lowered.
 TORRENT_TEST_DISK_IO(test_pread_disk_io_fence) { disk_io_test_suite(disk_io, 3, true); }
 
-TORRENT_TEST_DISK_IO(test_disk_io_hash2_before_flush) { hash2_before_flush_suite(disk_io); }
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io_hash2_before_flush) { hash2_before_flush_suite(disk_io); }
 
 // a flush pass completes the writes of each piece it flushes, not only the
 // ones of the whole pass when it ends. Each write takes 100 ms under
@@ -1048,7 +1048,7 @@ TORRENT_TEST(disk_io_partial_read_fence_pread)
 
 // disk.num_blocks_written counts the blocks written. A flush that covers a
 // piece with blocks missing (not received yet) writes only the blocks it has
-TORRENT_TEST_DISK_IO(num_blocks_written_counts_written_blocks)
+TORRENT_TEST_DISK_IO_WITH_MEMORY(num_blocks_written_counts_written_blocks)
 {
 	lt::io_context ios;
 	lt::counters cnt;
@@ -1091,7 +1091,8 @@ TORRENT_TEST_DISK_IO(num_blocks_written_counts_written_blocks)
 		}
 	}
 	TEST_EQUAL(writes_done, 2);
-	TEST_EQUAL(cnt[lt::counters::num_blocks_written], 2);
+	// in the `_memory` variant the blocks stay in memory: nothing is written
+	TEST_EQUAL(cnt[lt::counters::num_blocks_written], is_memory_disk_io(disk_io) ? 0 : 2);
 
 	disk_thread->abort(true);
 }

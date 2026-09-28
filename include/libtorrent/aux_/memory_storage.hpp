@@ -11,6 +11,7 @@ see LICENSE file.
 #define TORRENT_MEMORY_STORAGE_HPP_INCLUDED
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <vector>
@@ -28,15 +29,38 @@ see LICENSE file.
 namespace libtorrent::aux {
 
 	struct memory_slab_allocator;
+	struct memory_pool_mutex;
 
-	// the hash state of one entry, owned by the hasher of the pool
+	// the hash state of one entry held in memory. memory_hasher works on it
 	struct memory_piece_hasher
 	{
+		// SHA-1 of blocks [0, cursor) (v1 only)
 		hasher ph;
 		// the next block to feed to ph
 		int cursor = 0;
-		// v2 block hashes, one per block
+		// v2 block hashes, one per block of the v2 piece; all zeros = not
+		// computed yet. Guarded by the pool mutex
 		aux::vector<sha256_hash, int> block_hashes;
+
+		// the geometry of the piece, taken when the entry starts, so a
+		// hashing thread never reads the file_storage (the torrent owns it)
+		// the v1 piece size, pad included
+		int piece_size = 0;
+		// the v2 piece size, 0 without v2
+		int piece_size2 = 0;
+		bool v1 = false;
+		// true for a block entirely in pad files, one per block; empty if
+		// the piece has no pad
+		std::vector<bool> pad_blocks;
+
+		// scheduling, guarded by the pool mutex. A thread that set busy owns
+		// ph and cursor until it clears busy
+		bool busy = false;
+		// a background hash of the entry is queued and has not started
+		bool kick_queued = false;
+		// hash jobs that found the entry busy. They are scheduled again when
+		// busy clears
+		std::vector<std::function<void()>> parked;
 	};
 
 	// one generation of one piece. Jobs hold a shared_ptr to their own entry
@@ -69,13 +93,17 @@ namespace libtorrent::aux {
 	// pool serialises calls under its mutex.
 	struct TORRENT_EXTRA_EXPORT memory_storage
 	{
-		// fs must outlive the storage, and so must alloc
-		memory_storage(file_storage const& fs, bool v1, bool v2, memory_slab_allocator& alloc);
+		// fs must outlive every call but the destructor and unpin(), and
+		// alloc must outlive the storage. With a mutex, every allocation and
+		// free asserts that the caller holds it (the pool's)
+		memory_storage(file_storage const& fs, bool v1, bool v2, memory_slab_allocator& alloc
+			, memory_pool_mutex const* mutex = nullptr);
 		// frees the blocks of the current entries. The storage must outlive
 		// every pin on its entries: the owner (the pool) keeps it alive until
 		// the pins drop, since a job may read a pinned entry's blocks without
 		// the pool's mutex. Asserts that no entry is pinned; with asserts off
-		// a pinned entry's blocks are not freed
+		// a pinned entry's blocks are not freed. The caller holds the pool's
+		// mutex (it is not taken here)
 		~memory_storage();
 		memory_storage(memory_storage const&) = delete;
 		memory_storage& operator=(memory_storage const&) = delete;
@@ -84,7 +112,8 @@ namespace libtorrent::aux {
 		std::shared_ptr<memory_piece_entry> current(piece_index_t piece) const;
 		// starts the piece: retires the current entry (freed when unpinned)
 		// and makes a new one with generation + 1 and the given place. A
-		// piece that starts in the file leaves the one-shot persist set
+		// piece that starts in the file leaves the one-shot persist set. An
+		// entry that starts in memory gets its hasher
 		std::shared_ptr<memory_piece_entry> start(piece_index_t piece, piece_place place);
 		// retires the current entry; the piece has no entry afterwards
 		void retire(piece_index_t piece);
@@ -95,7 +124,8 @@ namespace libtorrent::aux {
 		bool is_current(memory_piece_entry const& e) const;
 
 		// copies data into block ``block`` of the current entry e, allocating
-		// the block (zero-filling the rest of a short block). A block is
+		// the block (zero-filling the rest of a short block and the ranges of
+		// the block that lie in pad files). A block is
 		// written once: a hasher may read it without the pool's mutex, so
 		// new bytes for a piece come only through start(). Returns false
 		// (and asserts) if the block is already present, leaving it
@@ -168,6 +198,11 @@ namespace libtorrent::aux {
 
 		bool valid(piece_index_t piece) const;
 		int required_blocks(piece_index_t piece) const;
+		std::unique_ptr<memory_piece_hasher> make_hasher(piece_index_t piece) const;
+		// zeroes the bytes of the block that lie in pad files
+		void zero_pad(piece_index_t piece, int block, char* data) const;
+		// the caller holds the pool's mutex (if the storage has one)
+		bool locked() const;
 		void retire_entry(std::shared_ptr<memory_piece_entry> e);
 		void free_blocks(memory_piece_entry& e);
 		bool covered_by(piece_index_t piece, memory_policy policy) const;
@@ -176,6 +211,7 @@ namespace libtorrent::aux {
 		bool const m_v1;
 		bool const m_v2;
 		memory_slab_allocator& m_alloc;
+		memory_pool_mutex const* const m_mutex;
 
 		aux::vector<piece_slot, piece_index_t> m_pieces;
 		typed_bitfield<piece_index_t> m_in_file;

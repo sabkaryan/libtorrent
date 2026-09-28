@@ -10,6 +10,7 @@ see LICENSE file.
 #include "libtorrent/config.hpp"
 #include "libtorrent/aux_/memory_storage.hpp"
 #include "libtorrent/aux_/memory_slab.hpp"
+#include "libtorrent/aux_/memory_pool_impl.hpp" // for memory_pool_mutex
 #include "libtorrent/disk_interface.hpp" // for default_block_size
 #include "libtorrent/file_storage.hpp"
 #include "libtorrent/assert.hpp"
@@ -20,11 +21,12 @@ see LICENSE file.
 namespace libtorrent::aux {
 
 	memory_storage::memory_storage(file_storage const& fs, bool const v1, bool const v2
-		, memory_slab_allocator& alloc)
+		, memory_slab_allocator& alloc, memory_pool_mutex const* const mutex)
 		: m_files(fs)
 		, m_v1(v1)
 		, m_v2(v2)
 		, m_alloc(alloc)
+		, m_mutex(mutex)
 		, m_pieces(piece_index_t{fs.num_pieces()})
 		, m_in_file(fs.num_pieces(), false)
 		, m_pad_pieces(fs.num_pieces(), false)
@@ -48,6 +50,8 @@ namespace libtorrent::aux {
 		// the pool's mutex. A retired entry leaves m_retired when its last
 		// pin goes, so a non-empty list means a pin outlived the storage
 		TORRENT_ASSERT(m_retired.empty());
+		// the blocks go back to the allocator, which is not thread safe
+		TORRENT_ASSERT(locked());
 		for (auto& slot : m_pieces)
 		{
 			if (!slot.current) continue;
@@ -56,6 +60,11 @@ namespace libtorrent::aux {
 			// with the allocator) rather than being freed under its reader
 			if (slot.current->pins == 0) free_blocks(*slot.current);
 		}
+	}
+
+	bool memory_storage::locked() const
+	{
+		return m_mutex == nullptr || m_mutex->owned_by_this_thread();
 	}
 
 	bool memory_storage::valid(piece_index_t const piece) const
@@ -110,10 +119,44 @@ namespace libtorrent::aux {
 		e->generation = slot.generation;
 		e->place = place;
 		e->missing_blocks = required_blocks(piece);
+		if (place == piece_place::memory) e->hasher = make_hasher(piece);
 		slot.current = e;
 		// the one-shot persist is spent once the piece is in the file
 		if (place == piece_place::file) m_one_shot.clear_bit(piece);
 		return e;
+	}
+
+	std::unique_ptr<memory_piece_hasher> memory_storage::make_hasher(piece_index_t const piece) const
+	{
+		auto h = std::make_unique<memory_piece_hasher>();
+		h->piece_size = m_files.piece_size(piece);
+		h->piece_size2 = m_v2 ? m_files.piece_size2(piece) : 0;
+		h->v1 = m_v1;
+		if (m_v2) h->block_hashes.resize(m_files.blocks_in_piece2(piece));
+		if (m_pad_pieces.get_bit(piece))
+		{
+			int const n = blocks_in_piece(piece);
+			h->pad_blocks.resize(static_cast<std::size_t>(n), false);
+			for (int b = 0; b < n; ++b)
+				h->pad_blocks[static_cast<std::size_t>(b)] = is_pad_block(piece, b);
+		}
+		return h;
+	}
+
+	void memory_storage::zero_pad(piece_index_t const piece, int const block, char* const data) const
+	{
+		if (!m_pad_pieces.get_bit(piece)) return;
+		int const piece_size = m_files.piece_size(piece);
+		int const offset = block * default_block_size;
+		int const len = std::min(default_block_size, piece_size - offset);
+		if (len <= 0) return;
+		int pos = 0;
+		for (file_slice const& s : m_files.map_block(piece, offset, len))
+		{
+			if (m_files.pad_file_at(s.file_index))
+				std::memset(data + pos, 0, static_cast<std::size_t>(s.size));
+			pos += static_cast<int>(s.size);
+		}
 	}
 
 	void memory_storage::retire(piece_index_t const piece)
@@ -177,6 +220,8 @@ namespace libtorrent::aux {
 
 	void memory_storage::free_blocks(memory_piece_entry& e)
 	{
+		// the allocator is not thread safe
+		TORRENT_ASSERT(locked());
 		std::vector<char*> used;
 		used.reserve(static_cast<std::size_t>(e.num_blocks));
 		for (char* const b : e.blocks)
@@ -207,12 +252,17 @@ namespace libtorrent::aux {
 			TORRENT_ASSERT_FAIL();
 			return false; // written once
 		}
+		// the allocator is not thread safe
+		TORRENT_ASSERT(locked());
 		slot = m_alloc.allocate();
 		if (slot == nullptr) return false;
 		auto const size = static_cast<std::size_t>(data.size());
 		std::memcpy(slot, data.data(), size);
 		if (size < std::size_t(default_block_size))
 			std::memset(slot + size, 0, std::size_t(default_block_size) - size);
+		// SHA-1 covers the pad of a v1 piece as zeros, whatever the peer
+		// sent there, and a read of pad returns zeros
+		zero_pad(e.piece, block, slot);
 
 		++e.num_blocks;
 		if (e.missing_blocks > 0 && !is_pad_block(e.piece, block))

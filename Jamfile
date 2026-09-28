@@ -939,6 +939,7 @@ SOURCES =
 	mmap_disk_io
 	mmap_storage
 	precomputed_block_hashes
+	memory_hasher
 	memory_slab
 	memory_storage
 	memory_storage_pool

@@ -30,6 +30,7 @@ see LICENSE file.
 #include <chrono>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <set>
 #include <string>
@@ -198,7 +199,9 @@ TORRENT_TEST(unregistered_torrent_goes_to_file)
 {
 	std::vector<char> const content = random_content();
 
+	// the pool has room: the torrent goes to the file for its policy alone
 	auto pool = std::make_shared<memory_storage_pool>();
+	pool->set_limit(std::numeric_limits<std::int64_t>::max());
 	run_result const mem = run(memory_disk_io_constructor(pool), pool.get()
 		, complete("unregistered_memory"), content);
 	run_result const ref = run(pread_disk_io_constructor, nullptr
@@ -262,9 +265,10 @@ TORRENT_TEST(two_torrents_keep_their_own_storage)
 		TEST_CHECK(wait_alert<torrent_finished_alert>(ses
 			, [&finished](torrent_finished_alert const&) { return ++finished == 2; }));
 		for (auto const& th : handles) ses.remove_torrent(th);
-		for (int i = 0; i < 2; ++i)
-			TEST_CHECK(wait_alert<torrent_removed_alert>(ses
-				, [](torrent_removed_alert const&) { return true; }));
+		// both alerts may come in one batch: count them in one wait
+		int removed = 0;
+		TEST_CHECK(wait_alert<torrent_removed_alert>(ses
+			, [&removed](torrent_removed_alert const&) { return ++removed == 2; }));
 	}
 	for (auto const& [content, path] : {std::make_pair(&content_a, &path_a)
 		, std::make_pair(&content_b, &path_b)})
@@ -275,4 +279,73 @@ TORRENT_TEST(two_torrents_keep_their_own_storage)
 		TEST_CHECK(files == *content);
 		remove_all(*path, ec);
 	}
+}
+
+// a piece kept in memory is "flushed" (in the pool) once it passed its hash
+// check, not before: piece_flushed_alert follows piece_finished_alert. The
+// bytes the pool holds are the piece's
+TORRENT_TEST(piece_flushed_after_hash)
+{
+	std::vector<char> const content = random_content();
+	std::string const save_path = complete("piece_flushed_after_hash");
+	error_code ec;
+	remove_all(save_path, ec);
+	auto pool = std::make_shared<memory_storage_pool>();
+	pool->set_default_policy(memory_policy::memory);
+	pool->set_limit(std::numeric_limits<std::int64_t>::max());
+	{
+		session_params sp(session_settings());
+		sp.disk_io_constructor = memory_disk_io_constructor(pool);
+		lt::session ses(std::move(sp));
+
+		add_torrent_params atp = make_torrent(content);
+		atp.save_path = save_path;
+		atp.flags &= ~torrent_flags::auto_managed;
+		atp.flags &= ~torrent_flags::paused;
+		torrent_handle const th = ses.add_torrent(atp);
+		for (int i = 0; i < 200 && th.status().state != torrent_status::downloading; ++i)
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		TEST_EQUAL(th.status().state, torrent_status::downloading);
+
+		piece_index_t const p{0};
+		th.add_piece(p, content.data());
+
+		// the order of the two alerts of piece 0
+		std::vector<char const*> order;
+		auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+		while (order.size() < 2 && std::chrono::steady_clock::now() < deadline)
+		{
+			ses.wait_for_alert(std::chrono::milliseconds(100));
+			std::vector<alert*> alerts;
+			ses.pop_alerts(&alerts);
+			for (alert* a : alerts)
+			{
+				if (auto const* f = alert_cast<piece_finished_alert>(a))
+					if (f->piece_index == p) order.push_back("finished");
+				if (auto const* f = alert_cast<piece_flushed_alert>(a))
+					if (f->piece_index == p) order.push_back("flushed");
+				if (auto const* f = alert_cast<hash_failed_alert>(a))
+					if (f->piece_index == p) order.push_back("hash failed");
+			}
+		}
+		TEST_EQUAL(int(order.size()), 2);
+		if (order.size() == 2)
+		{
+			TEST_EQUAL(std::string(order[0]), "finished");
+			TEST_EQUAL(std::string(order[1]), "flushed");
+		}
+
+		std::vector<char> buf(static_cast<std::size_t>(piece_size));
+		TEST_EQUAL(pool->read(th, p, 0, buf), piece_size);
+		TEST_CHECK(std::equal(buf.begin(), buf.end(), content.begin()));
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+
+		ses.remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(ses
+			, [](torrent_removed_alert const&) { return true; }));
+	}
+	// nothing reached the file
+	std::vector<char> const a = read_file(combine_path(save_path, combine_path("unregistered", "a")));
+	TEST_CHECK(std::all_of(a.begin(), a.end(), [](char const c) { return c == 0; }));
+	remove_all(save_path, ec);
 }

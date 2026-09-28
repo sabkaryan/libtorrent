@@ -12,6 +12,7 @@ see LICENSE file.
 
 #include "libtorrent/config.hpp"
 #include "libtorrent/session_params.hpp" // for disk_io_constructor_type
+#include "libtorrent/disk_interface.hpp"
 #include "libtorrent/posix_disk_io.hpp"
 #include "libtorrent/pread_disk_io.hpp"
 #include "libtorrent/memory_disk_io.hpp"
@@ -35,13 +36,31 @@ inline lt::disk_io_constructor_type memory_file_disk_io()
 	return lt::memory_disk_io_constructor(pool);
 }
 
+// the constructor of the `_memory` variant, a type of its own so
+// is_memory_disk_io() can tell it apart
+struct memory_variant_constructor
+{
+	std::unique_ptr<lt::disk_interface> operator()(lt::io_context& ios
+		, lt::settings_interface const& sett, lt::counters& cnt) const
+	{
+		return ctor(ios, sett, cnt);
+	}
+	lt::disk_io_constructor_type ctor;
+};
+
 // every piece stays in memory (explicit limit: it is 0 until set)
 inline lt::disk_io_constructor_type memory_disk_io()
 {
 	auto pool = std::make_shared<lt::memory_storage_pool>();
 	pool->set_default_policy(lt::memory_policy::memory);
 	pool->set_limit(std::numeric_limits<std::int64_t>::max());
-	return lt::memory_disk_io_constructor(pool);
+	return memory_variant_constructor{lt::memory_disk_io_constructor(pool)};
+}
+
+// true if `disk_io` is the `_memory` variant: no piece reaches a file
+inline bool is_memory_disk_io(lt::disk_io_constructor_type const& disk_io)
+{
+	return disk_io.target<memory_variant_constructor>() != nullptr;
 }
 
 // indirection layer so the BOOST_PP_CAT argument is expanded before

@@ -392,6 +392,7 @@ SOURCES = \
   posix_part_file.cpp             \
   posix_storage.cpp               \
   memory_disk_io.cpp              \
+  memory_hasher.cpp               \
   memory_slab.cpp                 \
   memory_storage.cpp              \
   memory_storage_pool.cpp         \
@@ -626,6 +627,7 @@ HEADERS = \
   aux_/merkle.hpp                   \
   aux_/merkle_tree.hpp              \
   aux_/mmap.hpp                     \
+  aux_/memory_hasher.hpp            \
   aux_/memory_pool_impl.hpp         \
   aux_/memory_slab.hpp              \
   aux_/memory_storage.hpp           \
@@ -1062,6 +1064,7 @@ TEST_SOURCES = \
   test_utils.hpp \
   disk_cache_test_utils.hpp \
   write_gate.hpp \
+  memory_gates.hpp \
   settings.hpp \
   make_torrent.hpp \
   bittorrent_peer.hpp \
