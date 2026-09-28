@@ -12,6 +12,7 @@ see LICENSE file.
 #include "libtorrent/aux_/memory_slab.hpp"
 #include "libtorrent/disk_interface.hpp" // default_block_size
 #include "libtorrent/file_storage.hpp"
+#include "libtorrent/assert.hpp" // TORRENT_USE_ASSERTS
 #include <vector>
 
 using lt::aux::memory_storage;
@@ -255,7 +256,13 @@ TORRENT_TEST(storage_one_shot_persist_leaves_on_file_place)
 	piece_index_t const once[] = {p};
 	st.add_one_shot_persist(once);
 	TEST_CHECK(st.decide(p, false) == piece_place::file);
-	// it left the one-shot set
+	// deciding alone does not spend it: the caller may not start the piece
+	TEST_CHECK(st.decide(p, false) == piece_place::file);
+	// neither does a start in memory
+	st.start(p, piece_place::memory);
+	TEST_CHECK(st.decide(p, false) == piece_place::file);
+	// a start in the file does
+	st.start(p, piece_place::file);
 	TEST_CHECK(st.decide(p, false) == piece_place::memory);
 
 	piece_index_t const always[] = {q};
@@ -267,6 +274,8 @@ TORRENT_TEST(storage_one_shot_persist_leaves_on_file_place)
 	// a piece in both sets leaves the one-shot set only
 	piece_index_t const both[] = {q};
 	st.add_one_shot_persist(both);
+	TEST_CHECK(st.decide(q, false) == piece_place::file);
+	st.start(q, piece_place::file);
 	TEST_CHECK(st.decide(q, false) == piece_place::file);
 	st.drop_owner(7);
 	TEST_CHECK(st.decide(q, false) == piece_place::memory);
@@ -330,11 +339,7 @@ TORRENT_TEST(storage_held_complete_skips_pad_blocks)
 	auto const f = st.start(piece_index_t{2}, piece_place::memory);
 	TEST_CHECK(st.write_block(*f, 1, block_of('x')));
 	TEST_EQUAL(st.held_partial(), bs);
-	// writing the same block again does not count it twice
-	TEST_CHECK(st.write_block(*f, 1, block_of('y')));
-	TEST_EQUAL(st.held_partial(), bs);
 	TEST_EQUAL(f->num_blocks, 1);
-	TEST_EQUAL(st.block_data(*f, 1)[0], 'y');
 	TEST_CHECK(st.write_block(*f, 0, block_of('x')));
 	TEST_EQUAL(st.held_partial(), 0);
 	TEST_EQUAL(st.held_complete(), 3 * bs);
@@ -347,3 +352,70 @@ TORRENT_TEST(storage_held_complete_skips_pad_blocks)
 	TEST_CHECK(st.current(piece_index_t{1}) == nullptr);
 	TEST_CHECK(st.current(piece_index_t{2}) == nullptr);
 }
+
+// rule 3 counts a spill only for a piece that would have gone to memory
+TORRENT_TEST(storage_spill_counts_only_pieces_bound_for_memory)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(bs);
+	memory_storage st(fs, true, false, alloc);
+	piece_index_t const in_f0{1};
+	piece_index_t const in_f1{4};
+
+	// torrent policy file: the piece goes to the file with or without the
+	// limit, so it is no spill
+	TEST_CHECK(st.decide(in_f0, true) == piece_place::file);
+	TEST_EQUAL(st.spilled_pieces(), 0);
+
+	// torrent policy memory: the limit sends it to the file, a spill
+	st.set_torrent_policy(memory_policy::memory);
+	TEST_CHECK(st.decide(in_f0, true) == piece_place::file);
+	TEST_EQUAL(st.spilled_pieces(), 1);
+	TEST_CHECK(st.decide(in_f0, false) == piece_place::memory);
+	TEST_EQUAL(st.spilled_pieces(), 1);
+
+	// rule 2 before rule 3: a file claim sends it to the file, no spill
+	file_index_t const only_f1[] = {file_index_t{1}};
+	st.set_claim_policy(1, memory_policy::file, only_f1);
+	TEST_CHECK(st.decide(in_f1, true) == piece_place::file);
+	TEST_EQUAL(st.spilled_pieces(), 1);
+
+	// rule 1 before rule 3: persist, no spill
+	piece_index_t const persist[] = {in_f0};
+	st.set_claim_persist(2, persist);
+	TEST_CHECK(st.decide(in_f0, true) == piece_place::file);
+	TEST_EQUAL(st.spilled_pieces(), 1);
+	st.drop_owner(2);
+
+	// torrent policy file, a memory claim: a spill
+	st.set_torrent_policy(memory_policy::file);
+	file_index_t const only_f0[] = {file_index_t{0}};
+	st.set_claim_policy(3, memory_policy::memory, only_f0);
+	TEST_CHECK(st.decide(in_f0, true) == piece_place::file);
+	TEST_EQUAL(st.spilled_pieces(), 2);
+}
+
+#if !TORRENT_USE_ASSERTS
+// a block is written once: a second write of the same block is refused and
+// leaves the first bytes (a hasher may be reading them without the lock).
+// With asserts on, the second write is an assert failure instead
+TORRENT_TEST(storage_block_written_once)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * bs);
+	memory_storage st(fs, true, false, alloc);
+
+	auto const e = st.start(piece_index_t{2}, piece_place::memory);
+	TEST_CHECK(st.write_block(*e, 1, block_of('x')));
+	TEST_CHECK(!st.write_block(*e, 1, block_of('y')));
+	TEST_EQUAL(e->num_blocks, 1);
+	TEST_EQUAL(st.held_partial(), bs);
+	TEST_EQUAL(alloc.blocks_in_use(), 1);
+	TEST_CHECK(st.block_data(*e, 1) != nullptr);
+	if (st.block_data(*e, 1) != nullptr)
+	{
+		TEST_EQUAL(st.block_data(*e, 1)[0], 'x');
+		TEST_EQUAL(st.block_data(*e, 1)[bs - 1], 'x');
+	}
+}
+#endif

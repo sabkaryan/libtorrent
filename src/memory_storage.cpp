@@ -111,6 +111,8 @@ namespace libtorrent::aux {
 		e->place = place;
 		e->missing_blocks = required_blocks(piece);
 		slot.current = e;
+		// the one-shot persist is spent once the piece is in the file
+		if (place == piece_place::file) m_one_shot.clear_bit(piece);
 		return e;
 	}
 
@@ -198,17 +200,19 @@ namespace libtorrent::aux {
 
 		if (e.blocks.empty()) e.blocks.resize(n, nullptr);
 		char*& slot = e.blocks[block];
-		bool const fresh = slot == nullptr;
-		if (fresh)
+		if (slot != nullptr)
 		{
-			slot = m_alloc.allocate();
-			if (slot == nullptr) return false;
+			// a block is written once. A hasher may be reading it without
+			// the pool's mutex; new bytes for the piece come through start()
+			TORRENT_ASSERT_FAIL();
+			return false; // written once
 		}
+		slot = m_alloc.allocate();
+		if (slot == nullptr) return false;
 		auto const size = static_cast<std::size_t>(data.size());
 		std::memcpy(slot, data.data(), size);
 		if (size < std::size_t(default_block_size))
 			std::memset(slot + size, 0, std::size_t(default_block_size) - size);
-		if (!fresh) return true;
 
 		++e.num_blocks;
 		if (e.missing_blocks > 0 && !is_pad_block(e.piece, block))
@@ -311,30 +315,29 @@ namespace libtorrent::aux {
 		TORRENT_ASSERT(valid(piece));
 		if (!valid(piece)) return piece_place::file;
 
-		// rule 1: persist, one-shot (the piece leaves that set) or of any owner
-		if (m_one_shot.get_bit(piece))
+		// rule 1: persist, one-shot (the piece leaves that set when it starts
+		// in the file) or of any owner
+		if (m_one_shot.get_bit(piece)) return piece_place::file;
+		for (auto const& oc : m_claims)
 		{
-			m_one_shot.clear_bit(piece);
-			return piece_place::file;
-		}
-		for (auto& oc : m_claims)
-		{
-			claim& c = oc.second;
+			claim const& c = oc.second;
 			if (!c.persist.empty() && c.persist.get_bit(piece))
 				return piece_place::file; // rule 1: persist of an owner
 		}
 		// rule 2: file wins over memory, whoever asked for it
 		if (covered_by(piece, memory_policy::file)) return piece_place::file; // rule 2
-		// rule 3: the pool is at its limit
+		// rules 4 and 5: where the piece goes without the limit. A memory
+		// claim covers it, otherwise the torrent policy
+		bool const bound_for_memory = covered_by(piece, memory_policy::memory) // rule 4
+			|| m_torrent_policy == memory_policy::memory; // rule 5
+		piece_place const unlimited = bound_for_memory ? piece_place::memory : piece_place::file;
+		// rule 3: the pool is at its limit. Only a piece bound for memory is
+		// a spill; one bound for the file would have gone there anyway
 		if (at_limit)
 		{
-			++m_spilled_pieces;
+			if (unlimited == piece_place::memory) ++m_spilled_pieces; // spill
 			return piece_place::file;
 		}
-		// rule 4
-		if (covered_by(piece, memory_policy::memory)) return piece_place::memory; // rule 4
-		// rule 5: the torrent policy
-		return m_torrent_policy == memory_policy::memory
-			? piece_place::memory : piece_place::file;
+		return unlimited;
 	}
 }

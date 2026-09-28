@@ -83,7 +83,8 @@ namespace libtorrent::aux {
 		// the current entry, nullptr if the piece has none (place none)
 		std::shared_ptr<memory_piece_entry> current(piece_index_t piece) const;
 		// starts the piece: retires the current entry (freed when unpinned)
-		// and makes a new one with generation + 1 and the given place
+		// and makes a new one with generation + 1 and the given place. A
+		// piece that starts in the file leaves the one-shot persist set
 		std::shared_ptr<memory_piece_entry> start(piece_index_t piece, piece_place place);
 		// retires the current entry; the piece has no entry afterwards
 		void retire(piece_index_t piece);
@@ -94,8 +95,11 @@ namespace libtorrent::aux {
 		bool is_current(memory_piece_entry const& e) const;
 
 		// copies data into block ``block`` of the current entry e, allocating
-		// the block if it is not there yet (zero-filling the rest of a short
-		// block). Returns false if e is not current, the block is out of
+		// the block (zero-filling the rest of a short block). A block is
+		// written once: a hasher may read it without the pool's mutex, so
+		// new bytes for a piece come only through start(). Returns false
+		// (and asserts) if the block is already present, leaving it
+		// unchanged, and false if e is not current, the block is out of
 		// range or allocation failed
 		bool write_block(memory_piece_entry& e, int block, span<char const> data);
 		// the block, nullptr if it was not received (or was freed)
@@ -114,11 +118,13 @@ namespace libtorrent::aux {
 		void add_one_shot_persist(span<piece_index_t const> pieces);
 		void drop_owner(memory_owner_t owner);
 		void set_torrent_policy(memory_policy policy);
-		// rules 1-5: persist (one-shot or of any owner) -> file, and the
-		// piece leaves the one-shot set; a file claim covers it -> file;
-		// at_limit (the pool holds >= its limit) -> file, and it counts in
-		// spilled_pieces(); a memory claim covers it -> memory; otherwise
-		// the torrent policy
+		// rules 1-5: persist (one-shot or of any owner) -> file; a file
+		// claim covers it -> file; at_limit (the pool holds >= its limit)
+		// -> file; a memory claim covers it -> memory; otherwise the torrent
+		// policy. It changes no claim: a one-shot persist piece stays in its
+		// set until start() starts it in the file. A piece that rule 3 sends
+		// to the file counts in spilled_pieces() only if rules 4-5 would have
+		// sent it to memory
 		piece_place decide(piece_index_t piece, bool at_limit);
 
 		// bytes of the blocks of current entries whose every non-pad block
@@ -127,7 +133,8 @@ namespace libtorrent::aux {
 		std::int64_t held_partial() const { return m_held_partial; }
 		// bytes of retired entries that are still pinned
 		std::int64_t retired_bytes() const { return m_retired_bytes; }
-		// pieces decide() sent to the file because the pool was at its limit
+		// pieces decide() sent to the file because the pool was at its
+		// limit, that would have gone to memory otherwise
 		int spilled_pieces() const { return m_spilled_pieces; }
 
 		file_storage const& files() const { return m_files; }
