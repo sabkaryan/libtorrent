@@ -127,8 +127,10 @@ namespace {
 		}
 
 		// the entries not pinned are freed now, a pinned one when its last
-		// pin goes (the job holding it keeps the storage alive). Jobs still
-		// parked on the storage answer operation_aborted when they resume
+		// pin goes (the job holding it keeps the storage alive). Jobs parked
+		// behind a fence of the storage answer operation_aborted once the
+		// fence lowers (the fence itself answers as the default backend
+		// did); if it never lowers they are destroyed unanswered
 		void remove_torrent(storage_index_t const idx) override
 		{
 			TORRENT_ASSERT(m_torrents[idx]);
@@ -157,7 +159,7 @@ namespace {
 			, disk_job_flags_t const flags) override
 		{
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
-			if (jobs_held_back(*rec))
+			if (held_back(rec->fence))
 			{
 				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), r
 					, h = std::move(handler), flags]() mutable
@@ -168,14 +170,16 @@ namespace {
 		}
 
 		// a write parked behind a fence copies the caller's buffer now: it
-		// lives only until this returns
+		// lives only until this returns. The copy is not counted in the held
+		// bytes and applies no back-pressure, like the jobs pread_disk_io
+		// parks behind a fence
 		bool async_write(storage_index_t const storage, peer_request const& r
 			, char const* buf, std::shared_ptr<disk_observer> o
 			, std::function<void(storage_error const&)> handler
 			, disk_job_flags_t const flags) override
 		{
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
-			if (jobs_held_back(*rec))
+			if (held_back(rec->fence))
 			{
 				std::vector<char> copy(buf, buf + std::max(0, r.length));
 				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), r
@@ -191,7 +195,7 @@ namespace {
 			, std::function<void(piece_index_t, sha1_hash const&, storage_error const&)> handler) override
 		{
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
-			if (jobs_held_back(*rec))
+			if (held_back(rec->fence))
 			{
 				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), piece
 					, v2, flags, h = std::move(handler)]() mutable
@@ -206,7 +210,7 @@ namespace {
 			, std::function<void(piece_index_t, sha256_hash const&, storage_error const&)> handler) override
 		{
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
-			if (jobs_held_back(*rec))
+			if (held_back(rec->fence))
 			{
 				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), piece
 					, offset, flags, h = std::move(handler)]() mutable
@@ -438,9 +442,9 @@ namespace {
 		// the fences of one storage. Used on the network thread only
 		struct fence_state
 		{
-			// the fences up on this storage: 0 or 1. A fence that comes while
-			// one is up, or while jobs are parked, is parked itself
-			int raised = 0;
+			// a fence is up on this storage. A fence that comes while one is
+			// up, or while jobs are parked, is parked itself
+			bool raised = false;
 			// the jobs of the storage that came while a fence was up, in
 			// posting order: writes (their buffers already copied), reads,
 			// hashes and fences
@@ -492,13 +496,7 @@ namespace {
 		// or the pass that lowered it has not resumed every parked job yet
 		static bool held_back(fence_state const& fs)
 		{
-			return fs.raised > 0 || !fs.parked.empty();
-		}
-
-		// a read, write or hash of the storage waits
-		static bool jobs_held_back(storage_record const& r)
-		{
-			return held_back(r.fence);
+			return fs.raised || !fs.parked.empty();
 		}
 
 		// a fence on `storage` (on one piece, or all_pieces). `start` runs
@@ -521,8 +519,8 @@ namespace {
 			, fence_start const& start)
 		{
 			fence_state& fs = rec->fence;
-			TORRENT_ASSERT(fs.raised == 0);
-			fs.raised = 1;
+			TORRENT_ASSERT(!fs.raised);
+			fs.raised = true;
 			fs.piece = piece;
 			fs.inner_pending = false;
 			fs.answer = nullptr;
@@ -534,7 +532,7 @@ namespace {
 		// of the storage there
 		storage_index_t to_inner(storage_record& r)
 		{
-			TORRENT_ASSERT(r.fence.raised > 0);
+			TORRENT_ASSERT(r.fence.raised);
 			r.fence.inner_pending = true;
 			return static_cast<storage_index_t>(r.inner);
 		}
@@ -542,7 +540,7 @@ namespace {
 		// the fence that is up does not go to the default backend
 		static void answer_now(storage_record& r, std::function<void()> answer)
 		{
-			TORRENT_ASSERT(r.fence.raised > 0);
+			TORRENT_ASSERT(r.fence.raised);
 			r.fence.answer = std::move(answer);
 		}
 
@@ -550,7 +548,7 @@ namespace {
 		void inner_answered(std::shared_ptr<storage_record> const& rec, std::function<void()> answer)
 		{
 			fence_state& fs = rec->fence;
-			TORRENT_ASSERT(fs.raised > 0 && fs.inner_pending);
+			TORRENT_ASSERT(fs.raised && fs.inner_pending);
 			fs.answer = std::move(answer);
 			fs.inner_pending = false;
 			lower_if_done(rec);
@@ -562,10 +560,10 @@ namespace {
 		void lower_if_done(std::shared_ptr<storage_record> const& rec)
 		{
 			fence_state& fs = rec->fence;
-			if (fs.raised == 0 || fs.inner_pending) return;
+			if (!fs.raised || fs.inner_pending) return;
 			int const own = fs.piece == all_pieces ? rec->own_jobs : rec->own_jobs_of_piece[fs.piece];
 			if (own > 0) return;
-			fs.raised = 0;
+			fs.raised = false;
 			TORRENT_ASSERT(fs.answer);
 			post(m_ios, std::move(fs.answer));
 			fs.answer = nullptr;
@@ -582,7 +580,7 @@ namespace {
 			if (fs.resuming) return;
 			fs.resuming = true;
 			bool ran = false;
-			while (fs.raised == 0 && !fs.parked.empty())
+			while (!fs.raised && !fs.parked.empty())
 			{
 				std::function<void()> job = std::move(fs.parked.front());
 				fs.parked.pop_front();

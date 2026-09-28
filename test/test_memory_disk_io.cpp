@@ -32,9 +32,13 @@ see LICENSE file.
 #include "libtorrent/aux_/memory_hasher.hpp"
 #include "libtorrent/aux_/memory_pool_impl.hpp" // for memory_place_for_test
 
+// interposes pwrite() for this binary: include it from this file only
+#include "write_gate.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -671,8 +675,8 @@ TORRENT_TEST(recheck_partial_in_memory)
 }
 
 // property 19a: a fence waits for our own jobs issued before it. Every block
-// is written and hashed in the background; the gate holds the tail of the
-// async_hash that follows. async_stop_torrent (a fence) answers only once the
+// is written and hashed in the background; the gate holds the async_hash
+// that follows at its tail stage. async_stop_torrent (a fence) answers only once the
 // gate is released, after the hash answered
 TORRENT_TEST(stop_waits_for_async_hash)
 {
@@ -686,6 +690,7 @@ TORRENT_TEST(stop_waits_for_async_hash)
 	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
 	mem.write(ms, p, data);
 	// the background hash let go of the entry: the gate holds the hash job
+	// at its tail stage (the tail is empty)
 	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
 		&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == blocks; }));
 
@@ -922,4 +927,251 @@ TORRENT_TEST(delete_and_remove_free_memory)
 		TEST_CHECK(mem.run_until([&] { return *hashed; }));
 		TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
 	}
+}
+
+namespace {
+
+// issues one of the eight fences of disk_interface on `st`. `done` is called
+// by its handler
+using fence_call = std::function<void(lt::disk_interface&, lt::storage_index_t
+	, std::function<void()> done)>;
+
+struct fence_case
+{
+	char const* name;
+	fence_call issue;
+	// the fence is async_clear_piece of the piece the gate holds a hash of
+	bool clears_hashed_piece;
+};
+
+std::vector<fence_case> every_fence(lt::piece_index_t const hashed)
+{
+	using done_t = std::function<void()>;
+	return {
+		{"clear_piece", [hashed](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{ d.async_clear_piece(st, hashed, [done](lt::piece_index_t) { done(); }); }, true},
+		{"move_storage", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{
+				d.async_move_storage(st, "every_fence_moved", lt::move_flags_t::always_replace_files
+					, [done](lt::status_t, std::string const&, lt::storage_error const&) { done(); });
+			}, false},
+		{"release_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{ d.async_release_files(st, [done] { done(); }); }, false},
+		{"stop_torrent", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{ d.async_stop_torrent(st, [done] { done(); }); }, false},
+		{"rename_file", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{
+				d.async_rename_file(st, lt::file_index_t{0}, "every_fence/renamed"
+					, [done](std::string const&, lt::file_index_t, lt::storage_error const&) { done(); });
+			}, false},
+		{"delete_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{
+				d.async_delete_files(st, lt::session_handle::delete_files
+					, [done](lt::storage_error const&) { done(); });
+			}, false},
+		{"set_file_priority", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{
+				lt::aux::vector<lt::download_priority_t, lt::file_index_t> prio;
+				prio.push_back(lt::default_priority);
+				d.async_set_file_priority(st, std::move(prio)
+					, [done](lt::storage_error const&, lt::aux::vector<lt::download_priority_t, lt::file_index_t>)
+					{ done(); });
+			}, false},
+		{"check_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+			{
+				d.async_check_files(st, nullptr, {}
+					, [done](lt::status_t, lt::storage_error const&) { done(); });
+			}, false},
+	};
+}
+
+} // anonymous namespace
+
+// every fence of disk_interface is a fence on the memory path. Piece 0 is
+// written and hashed in the background, and the gate holds an async_hash of
+// it (our job). Then the fence, a write of a block of a piece in memory
+// (piece 1, whose last block is missing; for async_clear_piece, piece 0
+// itself) and a read of that block. Nothing answers while the gate holds;
+// once released the handlers run hash -> fence -> write -> read, and the read
+// returns the written bytes
+TORRENT_TEST(every_fence_parks_jobs)
+{
+	int const blocks = 4;
+	lt::file_storage fs;
+	fs.set_piece_length(blocks * lt::default_block_size);
+	fs.add_file("every_fence/file", 2 * blocks * lt::default_block_size, {});
+	fs.set_num_pieces(2);
+	lt::piece_index_t const p{0};
+	lt::piece_index_t const q{1};
+
+	for (fence_case const& fc : every_fence(p))
+	{
+		std::printf("fence: %s\n", fc.name);
+		disk_env mem(lt::memory_disk_io_constructor(memory_pool()), 1);
+		mem.paths.push_back("every_fence_moved");
+		lt::storage_index_t const ms = mem.add(fs, std::string("every_fence_") + fc.name, true, false);
+		std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
+		mem.write(ms, p, piece_data(fs, p, true));
+		mem.write(ms, q, piece_data(fs, q, true), {blocks - 1});
+		TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+			&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == 2 * blocks - 1; }));
+
+		memory_hasher_gate gate(p);
+		std::vector<std::string> order;
+		mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+			, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&) { order.emplace_back("hash"); });
+		mem.disk->submit_jobs();
+		TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+
+		fc.issue(*mem.disk, ms, [&] { order.emplace_back("fence"); });
+		lt::peer_request const r = fc.clears_hashed_piece
+			? lt::peer_request{p, 0, lt::default_block_size}
+			: lt::peer_request{q, (blocks - 1) * lt::default_block_size, lt::default_block_size};
+		std::vector<char> const fresh(std::size_t(lt::default_block_size), 'N');
+		mem.disk->async_write(ms, r, fresh.data(), {}
+			, [&](lt::storage_error const& e) { TEST_CHECK(!e); order.emplace_back("write"); });
+		std::vector<char> read_back;
+		mem.disk->async_read(ms, r, [&](lt::disk_buffer_holder b, lt::storage_error const& e)
+			{
+				TEST_CHECK(!e);
+				if (!e) read_back.assign(b.data(), b.data() + lt::default_block_size);
+				order.emplace_back("read");
+			}, {});
+		mem.disk->submit_jobs();
+
+		mem.run_for(lt::milliseconds(500));
+		TEST_CHECK(order.empty());
+
+		gate.release();
+		TEST_CHECK(mem.run_until([&] { return order.size() == 4; }));
+		TEST_CHECK(order == (std::vector<std::string>{"hash", "fence", "write", "read"}));
+		TEST_CHECK(read_back == fresh);
+	}
+}
+
+// async_clear_piece waits for our jobs of its piece only: the gate holds an
+// async_hash of piece 1, and a clear of piece 0 (in memory) answers
+TORRENT_TEST(clear_piece_waits_for_its_piece_only)
+{
+	int const blocks = 4;
+	lt::file_storage fs;
+	fs.set_piece_length(blocks * lt::default_block_size);
+	fs.add_file("clear_scope/file", 2 * blocks * lt::default_block_size, {});
+	fs.set_num_pieces(2);
+	lt::piece_index_t const p{0};
+	lt::piece_index_t const q{1};
+
+	disk_env mem(lt::memory_disk_io_constructor(memory_pool()), 1);
+	lt::storage_index_t const ms = mem.add(fs, "clear_scope", true, false);
+	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
+	mem.write(ms, p, piece_data(fs, p, true));
+	mem.write(ms, q, piece_data(fs, q, true));
+	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+		&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == 2 * blocks; }));
+
+	memory_hasher_gate gate(q);
+	bool hashed = false;
+	mem.disk->async_hash(ms, q, {}, lt::disk_interface::v1_hash
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&) { hashed = true; });
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+
+	bool cleared = false;
+	mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { cleared = true; });
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([&] { return cleared; }, lt::seconds(5)));
+	TEST_CHECK(!hashed);
+	TEST_EQUAL(memory_hasher_gate::waiting(), 1);
+	gate.release();
+	TEST_CHECK(mem.run_until([&] { return hashed; }));
+}
+
+#if defined TORRENT_LINUX
+// async_clear_piece of a piece in the file goes to the default backend: that
+// clear is a fence there, so it waits for the backend's write of the piece,
+// which the write gate holds
+TORRENT_TEST(clear_piece_in_file_goes_to_default_backend)
+{
+	lt::file_storage const fs = one_piece("clear_file_piece/file", 4);
+	lt::piece_index_t const p{0};
+	// the file policy: every piece goes to the file
+	auto const pool = std::make_shared<lt::memory_storage_pool>();
+	pool->set_limit(std::numeric_limits<std::int64_t>::max());
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	lt::storage_index_t const ms = mem.add(fs, "clear_file_piece", true, false);
+
+	set_hold_writes(true);
+	mem.write(ms, p, piece_data(fs, p, true));
+	bool hashed = false;
+	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash | lt::disk_interface::flush_piece
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&) { hashed = true; });
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([] {
+		std::lock_guard<std::mutex> l(gate_mutex);
+		return writes_waiting > 0; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, ms, p) == lt::piece_place::file);
+
+	bool cleared = false;
+	mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { cleared = true; });
+	mem.disk->submit_jobs();
+	mem.run_for(lt::milliseconds(500));
+	TEST_CHECK(!cleared);
+
+	set_hold_writes(false);
+	TEST_CHECK(mem.run_until([&] { return cleared && hashed
+		&& mem.writes_done == mem.writes_issued; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, ms, p) == lt::piece_place::none);
+}
+#endif
+
+// jobs parked behind a fence of a storage that is removed answer
+// operation_aborted when the fence lowers, and reach no backend; a parked
+// fence answers too. The fence that is up (a clear of a piece in memory)
+// waits for an async_hash the gate holds
+TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
+{
+	lt::file_storage const fs = one_piece("removed_parked/file", 4);
+	lt::piece_index_t const p{0};
+
+	auto const pool = memory_pool();
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	lt::storage_index_t const ms = mem.add(fs, "removed_parked", true, false);
+	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
+	mem.write(ms, p, piece_data(fs, p, true));
+	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+		&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == 4; }));
+
+	memory_hasher_gate gate(p);
+	std::vector<std::string> order;
+	std::vector<std::string> aborted;
+	auto const record = [&](char const* name, lt::storage_error const& e)
+	{
+		order.emplace_back(name);
+		if (e.ec == boost::asio::error::operation_aborted) aborted.emplace_back(name);
+	};
+	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("hash", e); });
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+
+	mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { order.emplace_back("clear"); });
+	std::vector<char> const fresh(std::size_t(lt::default_block_size), 'N');
+	lt::peer_request const r{p, 0, lt::default_block_size};
+	mem.disk->async_write(ms, r, fresh.data(), {}
+		, [&](lt::storage_error const& e) { record("write", e); });
+	mem.disk->async_read(ms, r, [&](lt::disk_buffer_holder, lt::storage_error const& e)
+		{ record("read", e); }, {});
+	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("hash2", e); });
+	mem.disk->async_stop_torrent(ms, [&] { order.emplace_back("stop"); });
+	mem.disk->submit_jobs();
+
+	mem.storages.back().reset();
+	gate.release();
+	TEST_CHECK(mem.run_until([&] { return order.size() == 6; }));
+	// nothing answers twice
+	mem.run_for(lt::milliseconds(200));
+	TEST_CHECK(order == (std::vector<std::string>{"hash", "clear", "write", "read", "hash2", "stop"}));
+	TEST_CHECK(aborted == (std::vector<std::string>{"write", "read", "hash2"}));
+	TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
 }
