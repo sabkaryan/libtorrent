@@ -238,6 +238,7 @@ run test_web_seed_ban.cpp ;
 run test_pe_crypto.cpp ;
 run test_disk_io.cpp ;
 run test_memory_slab.cpp ;
+run test_memory_storage.cpp ;
 run test_slow_hash.cpp ;
 
 run test_rtc.cpp ;

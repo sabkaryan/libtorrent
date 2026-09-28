@@ -69,6 +69,7 @@
 #include "libtorrent/kademlia/types.hpp"
 #include "libtorrent/load_torrent.hpp"
 #include "libtorrent/magnet_uri.hpp"
+#include "libtorrent/memory_disk_io.hpp"
 #include "libtorrent/mmap_disk_io.hpp"
 #include "libtorrent/natpmp.hpp"
 #include "libtorrent/operations.hpp"

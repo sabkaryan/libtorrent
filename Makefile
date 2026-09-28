@@ -392,6 +392,7 @@ SOURCES = \
   posix_part_file.cpp             \
   posix_storage.cpp               \
   memory_slab.cpp                 \
+  memory_storage.cpp              \
   pread_disk_io.cpp               \
   pread_storage.cpp               \
   proxy_base.cpp                  \
@@ -497,6 +498,7 @@ HEADERS = \
   libtorrent.hpp               \
   load_torrent.hpp             \
   magnet_uri.hpp               \
+  memory_disk_io.hpp           \
   mmap_disk_io.hpp             \
   natpmp.hpp                   \
   operations.hpp               \
@@ -622,6 +624,7 @@ HEADERS = \
   aux_/merkle.hpp                   \
   aux_/merkle_tree.hpp              \
   aux_/mmap.hpp                     \
+  aux_/memory_storage.hpp           \
   aux_/mmap_storage.hpp             \
   aux_/precomputed_block_hashes.hpp \
   aux_/mmap_disk_job.hpp            \
