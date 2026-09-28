@@ -221,6 +221,9 @@ namespace libtorrent::aux {
 		void request_transfers(storage_ref const& r);
 		// the residue of a removed storage. The caller holds mutex
 		void add_residue(info_hash_t const& ih, memory_storage const& s);
+		// drops the residues of the torrent (its v1 or v2 info-hash
+		// matches). The caller holds mutex
+		void drop_residues(info_hash_t const& ih);
 	};
 
 	// the test hooks of a memory_storage_pool
@@ -252,9 +255,12 @@ namespace libtorrent::aux {
 	// test hooks for a storage of ``disk`` made without a torrent object
 	// (no handle reaches it): the persist set of owner 1 becomes `pieces`,
 	// and its pieces held in memory are moved to the file, as by
-	// memory_storage_pool::set_persist(); the piece is forgotten, as by
+	// memory_storage_pool::set_persist(); a one-shot persist, as by
+	// memory_storage_pool::persist(); the piece is forgotten, as by
 	// memory_storage_pool::forget_piece() when libtorrent answers 0
 	TORRENT_EXTRA_EXPORT void memory_set_persist_for_test(disk_interface& disk
+		, storage_index_t storage, span<piece_index_t const> pieces);
+	TORRENT_EXTRA_EXPORT void memory_persist_for_test(disk_interface& disk
 		, storage_index_t storage, span<piece_index_t const> pieces);
 	TORRENT_EXTRA_EXPORT void memory_forget_for_test(disk_interface& disk
 		, storage_index_t storage, piece_index_t piece);

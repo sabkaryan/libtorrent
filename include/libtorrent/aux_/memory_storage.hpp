@@ -191,6 +191,11 @@ namespace libtorrent::aux {
 		// backend and its hash returned there, the piece is "in file" and
 		// leaves the one-shot persist set; the blocks are dropped
 		void transfer_done(memory_piece_entry& e);
+		// the step of a partial transfer of the current entry e was
+		// answered: place file (its later blocks went to the file), the
+		// piece leaves the one-shot persist set, the blocks left in memory
+		// are dropped. A failed write counts in persist_failures()
+		void partial_transfer_done(memory_piece_entry& e, bool failed);
 		// the transfer of the current entry e failed: back to place memory,
 		// counted in persist_failures()
 		void transfer_failed(memory_piece_entry& e);

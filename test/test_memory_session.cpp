@@ -1714,6 +1714,59 @@ TORRENT_TEST(pool_outlives_session)
 	remove_all(path, ec);
 }
 
+// a torrent removed, added again with its filtered resume data, and
+// removed again: the pool keeps what the last lifetime left, not the
+// intersection with the first one. A piece moved to the file in the second
+// lifetime stays in the resume data filtered after the removal
+TORRENT_TEST(residues_trimmed_on_readd)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("residues_trimmed");
+	auto const pool = make_pool(memory_policy::memory);
+	piece_index_t const first{2};
+	piece_index_t const second{3};
+	add_torrent_params rd;
+	{
+		auto ses = make_session(pool);
+		torrent_handle th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const set1[] = {first};
+		pool->set_persist(th, 1, set1);
+		TEST_CHECK(add_pieces(*ses, th, content, {first}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, first); }));
+		rd = save_resume(*ses, th);
+		pool->filter_resume(th, rd);
+		TEST_CHECK(has(rd, first));
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+		TEST_EQUAL(access::residues(*pool), 1);
+
+		// the second lifetime, from the filtered resume data
+		rd.ti = make_torrent(content).ti;
+		rd.save_path = path;
+		rd.flags &= ~torrent_flags::auto_managed;
+		rd.flags &= ~torrent_flags::paused;
+		th = ses->add_torrent(rd);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_EQUAL(access::residues(*pool), 0);
+		TEST_CHECK(in_file(*ses, th, first));
+		piece_index_t const set2[] = {second};
+		pool->set_persist(th, 1, set2);
+		TEST_CHECK(add_pieces(*ses, th, content, {second}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, second); }));
+		rd = save_resume(*ses, th);
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+	}
+	TEST_EQUAL(access::residues(*pool), 1);
+	add_torrent_params filtered = rd;
+	pool->filter_resume(filtered);
+	TEST_CHECK(has(filtered, first));
+	TEST_CHECK(has(filtered, second));
+	error_code ec;
+	remove_all(path, ec);
+}
+
 namespace {
 
 int const e2e_piece_size = piece_size;
@@ -1784,8 +1837,10 @@ TORRENT_TEST(e2e_download_in_memory)
 		for (int i = 0; i < e2e_pieces; ++i)
 			TEST_CHECK(reads(*pool, t.th, t.content, piece_index_t{i}));
 		TEST_EQUAL(pool->held_bytes(), std::int64_t(e2e_pieces) * e2e_piece_size);
-		long long const blocks = disk_blocks(combine_path("tmp2" + suffix, "temporary"));
-		TEST_CHECK(blocks <= 0);
+		// the file of the torrent where the session keeps it: no block on
+		// disk, or not created at all (-1)
+		long long const blocks = disk_blocks(combine_path(t.th.status().save_path, "temporary"));
+		TEST_CHECK(blocks == 0 || blocks == -1);
 	}
 	error_code ec;
 	remove_all("tmp1" + suffix, ec);

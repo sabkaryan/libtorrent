@@ -169,12 +169,18 @@ namespace libtorrent {
 		// (set_policy() by handle, persist(), set_persist()) count them
 		// before they return, and the moves run on the network thread
 		// without waiting: 0 right after such a call means nothing is to be
-		// moved. Pieces that have not arrived are not counted
+		// moved. Pieces that have not arrived are not counted. The blocks of
+		// a partial piece count until the default backend wrote them, which
+		// for pread_disk_io may wait until the piece completes, its cache
+		// fills or the torrent is paused or stopped: to know that a paused
+		// torrent's bytes are in the file, wait for 0 after pausing it
 		std::int64_t pending_persist_bytes(torrent_handle const&) const;
 
 		// the number of moves to the file that failed (a write error, or the
 		// hash of the default backend differs from the pool's): the piece
-		// stays in memory. not_managed for a torrent without storage
+		// stays in memory. A partial piece whose write failed goes to the
+		// file anyway, without the failed block: its hash fails later and
+		// it is downloaded again. not_managed for a torrent without storage
 		int persist_failures(torrent_handle const&) const;
 
 		// forgets the piece atomically: one task on the network thread of

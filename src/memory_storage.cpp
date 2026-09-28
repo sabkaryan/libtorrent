@@ -334,6 +334,19 @@ namespace {
 		drop_blocks(e);
 	}
 
+	void memory_storage::partial_transfer_done(memory_piece_entry& e, bool const failed)
+	{
+		TORRENT_ASSERT(is_current(e));
+		if (!is_current(e)) return;
+		if (failed) ++m_persist_failures;
+		e.place = piece_place::file;
+		e.transfer_started = false;
+		e.partial_transfer = false;
+		// the one-shot persist is spent once the piece is in the file
+		m_one_shot.clear_bit(e.piece);
+		drop_blocks(e);
+	}
+
 	void memory_storage::transfer_failed(memory_piece_entry& e)
 	{
 		TORRENT_ASSERT(is_current(e));

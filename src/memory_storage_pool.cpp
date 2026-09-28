@@ -229,6 +229,15 @@ namespace {
 		residues.push_back({ih, std::move(k.in_file), std::move(k.file_place)});
 	}
 
+	void memory_pool_impl::drop_residues(info_hash_t const& ih)
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		if (!ih.has_v1() && !ih.has_v2()) return;
+		residues.erase(std::remove_if(residues.begin(), residues.end()
+			, [&ih](residue const& r) { return same_hashes(r.info_hashes, ih); })
+			, residues.end());
+	}
+
 	int memory_pool_test_access::blocks_in_use(memory_storage_pool const& pool)
 	{
 		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
@@ -560,9 +569,6 @@ namespace {
 	void memory_storage_pool::forget_record(info_hash_t const& ih)
 	{
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
-		auto& res = m_impl->residues;
-		res.erase(std::remove_if(res.begin(), res.end()
-			, [&ih](aux::memory_pool_impl::residue const& r) { return aux::same_hashes(r.info_hashes, ih); })
-			, res.end());
+		m_impl->drop_residues(ih);
 	}
 }

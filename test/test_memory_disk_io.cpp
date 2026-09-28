@@ -1308,6 +1308,15 @@ TORRENT_TEST(inner_hash_answer_after_delete_files)
 
 namespace {
 
+#if defined TORRENT_LINUX
+// the writes held at the write gate now
+int held_writes()
+{
+	std::lock_guard<std::mutex> l(gate_mutex);
+	return writes_waiting;
+}
+#endif
+
 // the answers of the jobs waiting on a tail
 struct tail_answers
 {
@@ -1389,3 +1398,89 @@ TORRENT_TEST(transfer_parked_answered_on_abort)
 		env.disk->abort(false);
 	});
 }
+
+namespace {
+
+// a v1 storage of two pieces of two blocks each
+lt::file_storage two_block_pieces(std::string const& name)
+{
+	lt::file_storage fs;
+	fs.set_piece_length(2 * lt::default_block_size);
+	fs.add_file(name + "/a", 4 * lt::default_block_size, {});
+	fs.set_num_pieces(2);
+	return fs;
+}
+
+} // anonymous namespace
+
+// a one-shot persist() is spent when a partial piece's move ends in the
+// file too: the piece forgotten and written again goes to memory.
+//
+// The move writes the blocks of the partial piece with flush_piece, which
+// trips pread_disk_io's invariant check (disk_cache.cpp, check_invariant)
+// in builds with invariant checks (open): the test runs in builds without
+#if !TORRENT_USE_INVARIANT_CHECKS
+TORRENT_TEST(partial_transfer_spends_one_shot)
+{
+	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
+	lt::file_storage const fs = two_block_pieces("partial_one_shot");
+	lt::storage_index_t const st = env.add(fs, "partial_one_shot_torrent", true, false);
+	lt::piece_index_t const p{0};
+	std::vector<char> const data = piece_data(fs, p, true);
+
+	// block 0 only: a partial piece in memory
+	env.write(st, p, data, {1});
+	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::memory);
+
+	lt::piece_index_t const set[] = {p};
+	lt::aux::memory_persist_for_test(*env.disk, st, set);
+	// the step runs on the network thread (here: this io_context)
+	env.run_for(lt::milliseconds(100));
+	// block 1 goes to the default backend; the piece completes and is
+	// flushed, which answers the move's write
+	env.write(st, p, data, {0});
+	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
+	TEST_CHECK(env.run_until([&] {
+		return lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::file; }));
+	TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*env.disk), 0);
+
+	lt::aux::memory_forget_for_test(*env.disk, st, p);
+	env.write(st, p, data);
+	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::memory);
+}
+#endif
+
+#if defined TORRENT_LINUX
+// a transfer can start after the torrent's last fence, and the storage be
+// removed while its writes are in the default backend (held here at the
+// write gate). The default backend's storage stays until the step is
+// answered, then goes: no job of the default backend outlives its storage,
+// and the transfer's entry is freed
+TORRENT_TEST(transfer_keeps_inner_after_remove)
+{
+	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
+	lt::file_storage const fs = two_block_pieces("transfer_remove");
+	lt::storage_index_t const st = env.add(fs, "transfer_remove_torrent", true, false);
+	lt::piece_index_t const p{0};
+	std::vector<char> const data = piece_data(fs, p, true);
+	env.write(st, p, data);
+	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
+
+	set_hold_writes(true);
+	lt::piece_index_t const set[] = {p};
+	lt::aux::memory_set_persist_for_test(*env.disk, st, set);
+	TEST_CHECK(env.run_until([] { return held_writes() > 0; }));
+
+	for (auto& h : env.storages)
+		if (static_cast<lt::storage_index_t>(h) == st) h.reset();
+	env.run_for(lt::milliseconds(200));
+	// the retired entry is pinned by the step
+	TEST_CHECK(lt::aux::memory_blocks_in_use_for_test(*env.disk) > 0);
+
+	set_hold_writes(false);
+	TEST_CHECK(env.run_until([&] { return lt::aux::memory_blocks_in_use_for_test(*env.disk) == 0; }));
+	env.run_for(lt::milliseconds(200));
+}
+#endif

@@ -129,6 +129,11 @@ namespace {
 			// release it here, while the default backend is still alive
 			for (auto const idx : m_torrents.range())
 				if (m_torrents[idx]) remove_torrent(idx);
+			// removed storages whose steps were never answered (the network
+			// thread is gone): their default backend storage goes now, while
+			// the default backend exists
+			for (auto const& w : m_draining)
+				if (auto const rec = w.lock()) rec->inner.reset();
 		}
 
 		memory_disk_io(memory_disk_io const&) = delete;
@@ -163,6 +168,9 @@ namespace {
 					, [this, w = std::weak_ptr<storage_record>(rec)]
 					(std::vector<std::shared_ptr<memory_piece_entry>> entries)
 					{ post_transfers(w, std::move(entries)); }});
+				// the live storage supersedes what an earlier lifetime of the
+				// torrent left: its "in file" comes from its own resume data
+				m_pool->drop_residues(ih);
 				m_pool->apply_pending(torrent, *rec->storage);
 			}
 			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
@@ -188,8 +196,12 @@ namespace {
 			// the jobs waiting on the tail of a transfer answer
 			// operation_aborted now
 			abort_tails(*rec);
-			// the default backend is never called with the pool's mutex held
-			rec->inner.reset();
+			// the default backend is never called with the pool's mutex held.
+			// A transfer may have been started after the torrent's last fence:
+			// the default backend's storage is released once its steps are
+			// answered (finish_step()), not under their jobs
+			if (rec->steps == 0) rec->inner.reset();
+			else m_draining.push_back(rec);
 			// the torrent object, released after the mutex
 			std::shared_ptr<void> torrent;
 			{
@@ -555,6 +567,18 @@ namespace {
 			}
 		}
 
+		void persist(storage_index_t const storage, span<piece_index_t const> const pieces)
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			auto const& st = m_torrents[storage]->storage;
+			for (auto const& r : m_pool->storages)
+			{
+				if (r.storage != st) continue;
+				r.storage->add_one_shot_persist(pieces);
+				m_pool->request_transfers(r);
+			}
+		}
+
 		void forget(storage_index_t const storage, piece_index_t const piece)
 		{
 			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
@@ -629,6 +653,10 @@ namespace {
 				std::deque<std::function<void(bool)>> parked;
 			};
 			std::map<piece_index_t, piece_tail> tails;
+			// steps issued whose handlers have not all answered. The default
+			// backend's storage stays (in `inner`) until they are 0, even
+			// after remove_torrent(): its jobs refer to it
+			int steps = 0;
 		};
 
 		// wakes the transfers of a storage when the default backend's queue
@@ -1024,6 +1052,7 @@ namespace {
 				}
 				e->transfer_started = true;
 				e->partial_transfer = e->missing_blocks > 0;
+				++rec->steps;
 				step->piece = piece;
 				step->partial = e->partial_transfer;
 				v1 = s.v1();
@@ -1144,14 +1173,7 @@ namespace {
 					memory_piece_entry& e = step->ref->entry();
 					memory_piece_entry* const target = s.is_current(e) ? &e : nullptr;
 					if (target != nullptr && step->partial)
-					{
-						if (step->failed) s.add_persist_failure();
-						// its later blocks went to the file
-						target->place = piece_place::file;
-						target->transfer_started = false;
-						target->partial_transfer = false;
-						s.drop_blocks(*target);
-					}
+						s.partial_transfer_done(*target, step->failed);
 					else if (target != nullptr)
 					{
 						bool const same = step->inner_hash == step->pool_hash
@@ -1181,6 +1203,16 @@ namespace {
 				}
 			}
 			own_job_done(rec, piece);
+			TORRENT_ASSERT(rec->steps > 0);
+			if (--rec->steps == 0 && rec->removed)
+			{
+				// the last step of a removed storage: its default backend
+				// storage goes now, on the network thread
+				rec->inner.reset();
+				m_draining.erase(std::remove_if(m_draining.begin(), m_draining.end()
+					, [&rec](std::weak_ptr<storage_record> const& w)
+					{ return w.expired() || w.lock() == rec; }), m_draining.end());
+			}
 			// a fence that waited for the tail
 			fence_state& fs = rec->fence;
 			if (fs.waits_tail && !fs.raised)
@@ -1373,6 +1405,9 @@ namespace {
 		// the file), and its hash was returned
 		static bool restarts(memory_piece_entry const& e)
 		{
+			// a piece in transfer does not start over (a plain
+			// torrent_handle::forget_piece() and a download again): it keeps
+			// its bytes, which are the torrent's, and its transfer goes on
 			return e.missing_blocks == 0 && e.hash_returned
 				&& (e.place == piece_place::memory || e.place == piece_place::file);
 		}
@@ -1527,6 +1562,9 @@ namespace {
 		memory_hasher m_hasher;
 		// abort() was called: no transfer starts any more
 		bool m_abort = false;
+		// removed storages that keep their default backend storage until
+		// their steps are answered
+		std::vector<std::weak_ptr<storage_record>> m_draining;
 	};
 
 namespace {
@@ -1568,6 +1606,12 @@ namespace {
 		, span<piece_index_t const> const pieces)
 	{
 		if (auto* const m = memory_disk_io_for_test(disk)) m->set_persist(storage, pieces);
+	}
+
+	void memory_persist_for_test(disk_interface& disk, storage_index_t const storage
+		, span<piece_index_t const> const pieces)
+	{
+		if (auto* const m = memory_disk_io_for_test(disk)) m->persist(storage, pieces);
 	}
 
 	void memory_forget_for_test(disk_interface& disk, storage_index_t const storage
