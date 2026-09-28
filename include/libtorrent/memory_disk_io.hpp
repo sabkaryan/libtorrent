@@ -142,7 +142,9 @@ namespace libtorrent {
 		// until this is called: every piece goes to the file. The limit is
 		// soft: it is checked when a piece starts, and a piece that starts
 		// while the pool holds at least the limit goes to the file (see
-		// spilled_pieces()). Lowering it drops nothing already held
+		// spilled_pieces()). Lowering it drops nothing already held. The
+		// bytes of retired entries still in use by disk jobs
+		// (retired_bytes()) are not counted against it
 		void set_limit(std::int64_t bytes);
 
 		// a one-shot request to store the given pieces in the file

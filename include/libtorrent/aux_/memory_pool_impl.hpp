@@ -21,6 +21,7 @@ see LICENSE file.
 #include "libtorrent/memory_disk_io.hpp"
 #include "libtorrent/info_hash.hpp"
 #include "libtorrent/storage_defs.hpp" // for storage_index_t
+#include "libtorrent/io_context.hpp"
 #include "libtorrent/aux_/memory_slab.hpp"
 
 #if TORRENT_USE_ASSERTS
@@ -94,7 +95,8 @@ namespace libtorrent::aux {
 	//   remove_torrent() releases the default backend's storage outside it
 	// * handlers of the caller are never called with the mutex held, and
 	//   neither is a torrent object released (a retired storage keeps one
-	//   alive; memory_entry_ref drops it after the mutex)
+	//   alive; memory_entry_ref drops it after the mutex, on the network
+	//   thread: see memory_entry_ref)
 	//
 	// Removed torrents. remove_torrent() retires every entry of the
 	// storage. If a job still pins one, the storage is kept in `retired`
@@ -141,6 +143,9 @@ namespace libtorrent::aux {
 			// the torrent object, the owner of the file_storage the storage
 			// refers to. Null for a storage created without one
 			std::shared_ptr<void> torrent;
+			// the network thread's io_context of the session the torrent
+			// lived in: the torrent object is released there
+			io_context* ios = nullptr;
 		};
 		std::vector<retired_storage> retired;
 		// storages removed while an entry of theirs was pinned, in all
@@ -183,9 +188,10 @@ namespace libtorrent::aux {
 		// holds mutex
 		void apply_pending(std::shared_ptr<void> const& torrent, memory_storage& s);
 		// the last pin of the removed storage s dropped: forgets its record
-		// and returns the torrent object it kept, to be released after the
-		// mutex. The caller holds mutex
-		std::shared_ptr<void> release_retired(memory_storage const& s);
+		// and returns the torrent object it kept and the io_context of its
+		// network thread, where the torrent is to be released (after the
+		// mutex). The caller holds mutex
+		std::pair<std::shared_ptr<void>, io_context*> release_retired(memory_storage const& s);
 	};
 
 	// the test hooks of a memory_storage_pool

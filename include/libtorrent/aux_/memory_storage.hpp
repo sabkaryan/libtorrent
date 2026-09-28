@@ -151,7 +151,10 @@ namespace libtorrent::aux {
 
 		// block ``block`` of the current entry e (place file) is handed to
 		// the default backend. Returns true the first time for a non-pad
-		// block: its write, once completed, is passed to inner_block_written()
+		// block: its write, once completed, is passed to inner_block_written().
+		// A block whose write fails stays handed over and a retry is not
+		// counted: the piece does not become "in file", which only costs a
+		// download again after a restart (filter_resume() drops it)
 		bool hand_to_inner(memory_piece_entry& e, int block);
 		// the default backend wrote a block of the current entry e for which
 		// hand_to_inner() returned true. Once every non-pad block of the

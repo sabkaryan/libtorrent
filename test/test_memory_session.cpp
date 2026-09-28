@@ -24,6 +24,8 @@ see LICENSE file.
 #include "libtorrent/hasher.hpp"
 #include "libtorrent/pread_disk_io.hpp"
 #include "libtorrent/memory_disk_io.hpp"
+#include "libtorrent/address.hpp"
+#include "libtorrent/peer_request.hpp"
 #include "libtorrent/aux_/path.hpp"
 #include "libtorrent/aux_/random.hpp"
 #include "libtorrent/aux_/session_impl.hpp"
@@ -915,8 +917,6 @@ TORRENT_TEST(pool_calls_on_removed_handle)
 		TEST_EQUAL(h.partial, memory_storage_pool::not_managed);
 		TEST_EQUAL(pool->in_memory(th).complete.size(), 0);
 		TEST_EQUAL(pool->held_bytes(), 0);
-		// a claim on it is dropped once the torrent object is gone
-		pool->set_policy(th, 1, memory_policy::memory);
 	}
 	TEST_EQUAL(access::blocks_in_use(*pool), 0);
 	error_code ec;
@@ -987,6 +987,75 @@ TORRENT_TEST(session_destroyed_while_hash_issued)
 	TEST_EQUAL(access::blocks_in_use(*pool), 0);
 	TEST_EQUAL(access::retired_storages(*pool), 0);
 	TEST_EQUAL(aux::memory_storages_destroyed_pinned_for_test(), destroyed0);
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a removed torrent whose storage a background hash still pins: the pool
+// keeps the torrent object until the last pin drops, which happens on the
+// hashing thread, and then releases it on the network thread. The torrent
+// has peers in its list: ~torrent frees them into the session's allocator,
+// which only the network thread may touch (run under TSan)
+TORRENT_TEST(removed_torrent_released_on_network_thread)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("removed_released");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		add_torrent_params atp = make_torrent(content);
+		// nothing listens there: they stay in the peer list
+		for (int i = 0; i < 5; ++i)
+			atp.peers.emplace_back(make_address_v4("127.0.0.1"), std::uint16_t(1 + i));
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+
+		std::shared_ptr<aux::session_impl> const s = ses->native_handle();
+		std::thread::id network;
+		{
+			std::promise<std::thread::id> id;
+			boost::asio::dispatch(s->get_context(), [&id] { id.set_value(std::this_thread::get_id()); });
+			network = id.get_future().get();
+		}
+
+		// two blocks of piece 0, written through the session's
+		// disk_interface: libtorrent does not know them and issues no hash.
+		// Their background hash holds the entry at the gate
+		piece_index_t const p{0};
+		memory_hasher_gate gate(p);
+		{
+			std::shared_ptr<aux::torrent> const t = th.native_handle();
+			std::promise<void> issued;
+			boost::asio::dispatch(s->get_context(), [&issued, &content, s, t, p]
+			{
+				for (int b = 0; b < 2; ++b)
+				{
+					peer_request const r{p, b * default_block_size, default_block_size};
+					s->disk_thread().async_write(t->storage(), r
+						, content.data() + std::size_t(b) * default_block_size, {}
+						, [](storage_error const& e) { TEST_CHECK(!e); });
+				}
+				s->disk_thread().submit_jobs();
+				issued.set_value();
+			});
+			issued.get_future().wait();
+		}
+		TEST_CHECK(wait_for([] { return memory_hasher_gate::waiting() == 1; }));
+		TEST_CHECK(th.status().list_peers > 0);
+
+		std::weak_ptr<aux::torrent> const weak = th.native_handle();
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+		TEST_EQUAL(access::retired_storages(*pool), 1);
+		// the pool keeps it: its storage refers to its file_storage
+		TEST_CHECK(!weak.expired());
+
+		gate.release();
+		TEST_CHECK(wait_for([&weak] { return weak.expired(); }));
+		TEST_CHECK(aux::memory_retired_torrent_release_thread_for_test() == network);
+		TEST_EQUAL(access::retired_storages(*pool), 0);
+		TEST_EQUAL(access::blocks_in_use(*pool), 0);
+	}
 	error_code ec;
 	remove_all(path, ec);
 }

@@ -44,7 +44,18 @@ namespace libtorrent::aux {
 			, std::shared_ptr<memory_piece_entry> e);
 		// if release() was not called (a completion that was destroyed
 		// without running), takes the pool's mutex and releases. It must
-		// not run on a thread that holds the pool's mutex
+		// not run on a thread that holds the pool's mutex.
+		//
+		// A torrent object kept by a removed storage whose last pin this was
+		// is released on its session's network thread: ~torrent frees its
+		// peers into the session's allocators, which only that thread may
+		// touch. Off that thread (a hashing thread) the release is posted
+		// there. A completion destroyed without running means its
+		// io_context is being torn down: the network thread is gone and the
+		// torrent is released in place, on the thread tearing the session
+		// down, where libtorrent releases the torrents its own pending
+		// handlers still hold. A posted release that never runs is
+		// destroyed by that io_context in the same way
 		~memory_entry_ref();
 		memory_entry_ref(memory_entry_ref const&) = delete;
 		memory_entry_ref& operator=(memory_entry_ref const&) = delete;
@@ -52,8 +63,8 @@ namespace libtorrent::aux {
 		// drops the pin, the entry and the storage (either may be the last
 		// reference). If the storage was removed and this was its last pin,
 		// the pool forgets it; the torrent object it kept alive is released
-		// with this reference, after the mutex. The caller holds the pool's
-		// mutex
+		// when this reference is destroyed, after the mutex, on the network
+		// thread (see the destructor). The caller holds the pool's mutex
 		void release();
 		bool released() const { return !m_entry; }
 
@@ -69,10 +80,11 @@ namespace libtorrent::aux {
 		std::shared_ptr<memory_pool_impl> m_pool;
 		std::shared_ptr<memory_storage> m_storage;
 		std::shared_ptr<memory_piece_entry> m_entry;
-		// the torrent object of a removed storage whose last pin this was.
-		// Declared last: released when this reference is destroyed, which
-		// is after the pool's mutex
+		// the torrent object of a removed storage whose last pin this was,
+		// and the io_context of its network thread. Released when this
+		// reference is destroyed, which is after the pool's mutex
 		std::shared_ptr<void> m_keep_alive;
+		io_context* m_keep_alive_ios = nullptr;
 	};
 
 	// hashes the pieces held in memory. A block write that may extend the
@@ -172,6 +184,10 @@ namespace libtorrent::aux {
 	TORRENT_EXTRA_EXPORT std::int64_t memory_hasher_tail_blocks_for_test();
 	// the thread that computed the answer of the most recent hash job
 	TORRENT_EXTRA_EXPORT std::thread::id memory_hasher_answer_thread_for_test();
+	// the thread that dropped the most recent torrent object a removed
+	// storage kept (a released torrent object is destroyed there, unless
+	// someone else still holds it)
+	TORRENT_EXTRA_EXPORT std::thread::id memory_retired_torrent_release_thread_for_test();
 }
 
 #endif

@@ -20,6 +20,7 @@ see LICENSE file.
 
 #include <algorithm>
 #include <atomic>
+#include <tuple>
 #include <utility>
 
 namespace libtorrent::aux {
@@ -39,6 +40,17 @@ namespace {
 	std::atomic<std::int64_t> g_tail_blocks{0};
 	std::mutex g_answer_mutex;
 	std::thread::id g_answer_thread;
+	std::thread::id g_torrent_release_thread;
+
+	// drops a torrent object a removed storage kept, and records the thread
+	void release_torrent(std::shared_ptr<void> t)
+	{
+		{
+			std::lock_guard<std::mutex> l(g_answer_mutex);
+			g_torrent_release_thread = std::this_thread::get_id();
+		}
+		t.reset();
+	}
 
 	// holds a hashing thread while `piece` is held. Never holds the network
 	// thread (an inline hash): nothing could release it
@@ -151,13 +163,26 @@ namespace {
 
 	memory_entry_ref::~memory_entry_ref()
 	{
-		if (!m_entry) return;
-		// a completion destroyed without running (the io_context went away).
-		// The pin and the references are dropped under the pool's mutex,
-		// which this thread must not hold already
-		TORRENT_ASSERT(!m_pool->mutex.owned_by_this_thread());
-		std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
-		release();
+		if (m_entry)
+		{
+			// a completion destroyed without running (the io_context went
+			// away). The pin and the references are dropped under the pool's
+			// mutex, which this thread must not hold already
+			TORRENT_ASSERT(!m_pool->mutex.owned_by_this_thread());
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			release();
+			// the network thread is gone: the torrent object goes here, on
+			// the thread tearing the session down
+			m_keep_alive_ios = nullptr;
+		}
+		if (!m_keep_alive) return;
+		if (m_keep_alive_ios != nullptr && !m_keep_alive_ios->get_executor().running_in_this_thread())
+		{
+			// ~torrent must run on the network thread
+			post(*m_keep_alive_ios, [t = std::move(m_keep_alive)]() mutable { release_torrent(std::move(t)); });
+			return;
+		}
+		release_torrent(std::move(m_keep_alive));
 	}
 
 	void memory_entry_ref::release()
@@ -166,7 +191,7 @@ namespace {
 		if (!m_entry) return;
 		m_storage->unpin(m_entry);
 		if (m_storage->removed() && !m_storage->pinned())
-			m_keep_alive = m_pool->release_retired(*m_storage);
+			std::tie(m_keep_alive, m_keep_alive_ios) = m_pool->release_retired(*m_storage);
 		// either may be the last reference: the storage frees blocks when
 		// it goes, under the mutex the caller holds
 		m_entry.reset();
@@ -621,5 +646,11 @@ namespace {
 	{
 		std::lock_guard<std::mutex> l(g_answer_mutex);
 		return g_answer_thread;
+	}
+
+	std::thread::id memory_retired_torrent_release_thread_for_test()
+	{
+		std::lock_guard<std::mutex> l(g_answer_mutex);
+		return g_torrent_release_thread;
 	}
 }

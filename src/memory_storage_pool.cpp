@@ -34,14 +34,17 @@ namespace {
 
 	// two references to the same torrent object: compared by owner, never
 	// by address
-	bool same_torrent(std::weak_ptr<void> const& a, std::shared_ptr<void> const& b)
+	template <typename Ref>
+	bool same_torrent(std::weak_ptr<void> const& a, Ref const& b)
 	{
 		return !a.owner_before(b) && !b.owner_before(a);
 	}
 
-	bool same_torrent(std::weak_ptr<void> const& a, std::weak_ptr<void> const& b)
+	// drops the claims queued for torrent objects that are gone
+	void drop_expired(std::vector<memory_pool_impl::pending_claims>& pending)
 	{
-		return !a.owner_before(b) && !b.owner_before(a);
+		pending.erase(std::remove_if(pending.begin(), pending.end()
+			, [](memory_pool_impl::pending_claims const& p) { return p.torrent.expired(); }), pending.end());
 	}
 }
 
@@ -95,8 +98,7 @@ namespace {
 		, std::function<void(memory_storage&)> op)
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
-		pending.erase(std::remove_if(pending.begin(), pending.end()
-			, [](pending_claims const& p) { return p.torrent.expired(); }), pending.end());
+		drop_expired(pending);
 		auto const it = std::find_if(pending.begin(), pending.end()
 			, [&torrent](pending_claims const& p) { return same_torrent(p.torrent, torrent); });
 		if (it != pending.end())
@@ -111,8 +113,7 @@ namespace {
 	void memory_pool_impl::apply_pending(std::shared_ptr<void> const& torrent, memory_storage& s)
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
-		pending.erase(std::remove_if(pending.begin(), pending.end()
-			, [](pending_claims const& p) { return p.torrent.expired(); }), pending.end());
+		drop_expired(pending);
 		if (!torrent) return;
 		auto const it = std::find_if(pending.begin(), pending.end()
 			, [&torrent](pending_claims const& p) { return same_torrent(p.torrent, torrent); });
@@ -121,13 +122,13 @@ namespace {
 		pending.erase(it);
 	}
 
-	std::shared_ptr<void> memory_pool_impl::release_retired(memory_storage const& s)
+	std::pair<std::shared_ptr<void>, io_context*> memory_pool_impl::release_retired(memory_storage const& s)
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
 		auto const it = std::find_if(retired.begin(), retired.end()
 			, [&s](retired_storage const& r) { return r.storage.get() == &s; });
 		if (it == retired.end()) return {};
-		std::shared_ptr<void> ret = std::move(it->torrent);
+		std::pair<std::shared_ptr<void>, io_context*> ret(std::move(it->torrent), it->ios);
 		retired.erase(it);
 		return ret;
 	}

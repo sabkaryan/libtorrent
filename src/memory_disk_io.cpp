@@ -123,6 +123,8 @@ namespace {
 			info_hash_t const ih = torrent
 				? static_cast<aux::torrent const*>(torrent.get())->info_hash()
 				: info_hash_t{};
+			// a foreign object would not have the torrent's info-hash
+			TORRENT_ASSERT(!torrent || ih.get_best() == params.info_hash);
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				rec->storage = std::make_shared<memory_storage>(params.files
@@ -175,7 +177,7 @@ namespace {
 				m_pool->spilled_of_removed += s.spilled_pieces();
 				if (s.pinned())
 				{
-					m_pool->retired.push_back({rec->storage, torrent});
+					m_pool->retired.push_back({rec->storage, torrent, &m_ios});
 					++m_pool->storages_retired_pinned;
 				}
 				rec->storage.reset();
@@ -790,7 +792,9 @@ namespace {
 				memory_storage const& s = *rec->storage;
 				std::shared_ptr<memory_piece_entry> const e = s.current(piece);
 				had_entry = bool(e);
-				if (e && e->place == piece_place::file) file_entry = e;
+				// a hash of a partial piece (a recheck) returns no hash of it,
+				// even if the missing blocks arrive before the answer
+				if (e && e->place == piece_place::file && e->missing_blocks == 0) file_entry = e;
 				retire_count = s.retire_count(piece);
 			}
 			m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags
