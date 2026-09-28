@@ -121,7 +121,10 @@ namespace {
 			// hashing_threads threads of its own, in addition to the ones
 			// the default backend starts for the same setting
 			, m_hasher(ioc, sett.get_int(settings_pack::hashing_threads))
-		{}
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			m_backend = m_pool->next_backend++;
+		}
 
 		~memory_disk_io() override
 		{
@@ -169,8 +172,10 @@ namespace {
 					(std::vector<std::shared_ptr<memory_piece_entry>> entries)
 					{ post_transfers(w, std::move(entries)); }});
 				// the live storage supersedes what an earlier lifetime of the
-				// torrent left: its "in file" comes from its own resume data
-				m_pool->drop_residues(ih);
+				// torrent in this backend left: its "in file" comes from its
+				// own resume data. What another session left still describes
+				// that session's files, and stays
+				m_pool->drop_own_residues(ih, m_backend);
 				m_pool->apply_pending(torrent, *rec->storage);
 			}
 			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
@@ -219,7 +224,7 @@ namespace {
 					torrent = it->torrent.lock();
 					// the "in file" flags outlive the storage, for
 					// filter_resume()
-					m_pool->add_residue(it->info_hashes, s);
+					m_pool->add_residue(it->info_hashes, s, m_backend);
 					storages.erase(it);
 				}
 				// the transfers not started are dropped
@@ -1562,6 +1567,8 @@ namespace {
 		memory_hasher m_hasher;
 		// abort() was called: no transfer starts any more
 		bool m_abort = false;
+		// this backend's id in the pool, for the residues it leaves
+		std::uint64_t m_backend = 0;
 		// removed storages that keep their default backend storage until
 		// their steps are answered
 		std::vector<std::weak_ptr<storage_record>> m_draining;

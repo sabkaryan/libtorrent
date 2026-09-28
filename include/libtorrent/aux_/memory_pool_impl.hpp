@@ -173,15 +173,22 @@ namespace libtorrent::aux {
 		std::vector<pending_claims> pending;
 
 		// what the pool keeps of a removed storage, for filter_resume(): its
-		// info-hashes, its "in file" pieces and the pieces whose entry had
-		// place file. Dropped by forget_record() or with the pool
+		// info-hashes, its "in file" pieces, the pieces whose entry had place
+		// file, and the backend (memory_disk_io) it belonged to. Dropped by
+		// forget_record(), by a new storage of the torrent in the same
+		// backend (it supersedes it), or with the pool
 		struct residue
 		{
 			info_hash_t info_hashes;
 			typed_bitfield<piece_index_t> in_file;
 			typed_bitfield<piece_index_t> file_place;
+			std::uint64_t backend = 0;
 		};
 		std::vector<residue> residues;
+
+		// the id the next memory_disk_io of the pool gets. Each backend (one
+		// per session) has its own
+		std::uint64_t next_backend = 1;
 
 		std::int64_t hash_missing_blocks = 0;
 
@@ -219,11 +226,16 @@ namespace libtorrent::aux {
 		// in pending_persist_bytes() from now on), and is posted to the
 		// network thread to be moved. The caller holds mutex
 		void request_transfers(storage_ref const& r);
-		// the residue of a removed storage. The caller holds mutex
-		void add_residue(info_hash_t const& ih, memory_storage const& s);
+		// the residue of a removed storage of the backend. The caller holds
+		// mutex
+		void add_residue(info_hash_t const& ih, memory_storage const& s, std::uint64_t backend);
 		// drops the residues of the torrent (its v1 or v2 info-hash
-		// matches). The caller holds mutex
+		// matches), of every backend. The caller holds mutex
 		void drop_residues(info_hash_t const& ih);
+		// drops the residues of the torrent left by this backend only: the
+		// ones of another session may still describe its files. The caller
+		// holds mutex
+		void drop_own_residues(info_hash_t const& ih, std::uint64_t backend);
 	};
 
 	// the test hooks of a memory_storage_pool

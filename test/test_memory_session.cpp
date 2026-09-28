@@ -1767,6 +1767,60 @@ TORRENT_TEST(residues_trimmed_on_readd)
 	remove_all(path, ec);
 }
 
+// one pool, two sessions. Session 1 saves its resume data, then removes
+// the torrent; session 2 adds the same torrent and moves a piece to its own
+// files. Session 1's resume data, filtered after its removal, must still
+// be checked against what session 1 left: a piece only session 2 has in
+// its files is not in session 1's files
+TORRENT_TEST(residues_of_another_session_kept)
+{
+	std::vector<char> const content = random_content();
+	std::string const path1 = complete("residues_other_1");
+	std::string const path2 = complete("residues_other_2");
+	auto const pool = make_pool(memory_policy::memory);
+	piece_index_t const in_file1{2};
+	piece_index_t const in_file2{3};
+	piece_index_t const in_memory{0};
+	{
+		auto ses1 = make_session(pool);
+		auto ses2 = make_session(pool);
+		torrent_handle const th1 = add(*ses1, make_torrent(content), path1);
+		TEST_CHECK(wait_state(th1, torrent_status::downloading));
+		piece_index_t const set1[] = {in_file1};
+		pool->set_persist(th1, 1, set1);
+		TEST_CHECK(add_pieces(*ses1, th1, content, {in_file1, in_file2, in_memory}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses1, th1, in_file1); }));
+		add_torrent_params const rd = save_resume(*ses1, th1);
+		TEST_CHECK(has(rd, in_file1));
+		TEST_CHECK(has(rd, in_file2));
+		TEST_CHECK(has(rd, in_memory));
+		ses1->remove_torrent(th1);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses1, [](torrent_removed_alert const&) { return true; }));
+		TEST_EQUAL(access::residues(*pool), 1);
+
+		torrent_handle const th2 = add(*ses2, make_torrent(content), path2);
+		TEST_CHECK(wait_state(th2, torrent_status::downloading));
+		// session 1's residue stays
+		TEST_EQUAL(access::residues(*pool), 1);
+		piece_index_t const set2[] = {in_file2};
+		pool->set_persist(th2, 1, set2);
+		TEST_CHECK(add_pieces(*ses2, th2, content, {in_file2, in_memory}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses2, th2, in_file2); }));
+
+		add_torrent_params filtered = rd;
+		pool->filter_resume(filtered);
+		// only in session 2's files, or in no files at all
+		TEST_CHECK(!has(filtered, in_file2));
+		TEST_CHECK(!has(filtered, in_memory));
+		// in session 1's files but not in session 2's: every storage of the
+		// torrent must have it
+		TEST_CHECK(!has(filtered, in_file1));
+	}
+	error_code ec;
+	remove_all(path1, ec);
+	remove_all(path2, ec);
+}
+
 namespace {
 
 int const e2e_piece_size = piece_size;

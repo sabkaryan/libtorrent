@@ -221,12 +221,23 @@ namespace {
 		if (!moved.empty() && r.transfer) r.transfer(std::move(moved));
 	}
 
-	void memory_pool_impl::add_residue(info_hash_t const& ih, memory_storage const& s)
+	void memory_pool_impl::add_residue(info_hash_t const& ih, memory_storage const& s
+		, std::uint64_t const backend)
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
 		if (!ih.has_v1() && !ih.has_v2()) return;
 		known_pieces k = known_of(s);
-		residues.push_back({ih, std::move(k.in_file), std::move(k.file_place)});
+		residues.push_back({ih, std::move(k.in_file), std::move(k.file_place), backend});
+	}
+
+	void memory_pool_impl::drop_own_residues(info_hash_t const& ih, std::uint64_t const backend)
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		if (!ih.has_v1() && !ih.has_v2()) return;
+		residues.erase(std::remove_if(residues.begin(), residues.end()
+			, [&ih, backend](residue const& r)
+			{ return r.backend == backend && same_hashes(r.info_hashes, ih); })
+			, residues.end());
 	}
 
 	void memory_pool_impl::drop_residues(info_hash_t const& ih)
