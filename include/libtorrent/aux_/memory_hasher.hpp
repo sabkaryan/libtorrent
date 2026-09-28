@@ -50,12 +50,10 @@ namespace libtorrent::aux {
 		// is released on its session's network thread: ~torrent frees its
 		// peers into the session's allocators, which only that thread may
 		// touch. Off that thread (a hashing thread) the release is posted
-		// there. A completion destroyed without running means its
-		// io_context is being torn down: the network thread is gone and the
-		// torrent is released in place, on the thread tearing the session
-		// down, where libtorrent releases the torrents its own pending
-		// handlers still hold. A posted release that never runs is
-		// destroyed by that io_context in the same way
+		// there; the hashing threads keep that io_context running until
+		// they exit, so it runs while the session exists. Only an
+		// io_context destroyed without being run destroys a completion (or
+		// a posted release) unrun; the torrent is then released in place
 		~memory_entry_ref();
 		memory_entry_ref(memory_entry_ref const&) = delete;
 		memory_entry_ref& operator=(memory_entry_ref const&) = delete;
@@ -148,7 +146,7 @@ namespace libtorrent::aux {
 
 		void schedule(job j);
 		void run(job& j, bool inline_call);
-		void thread_fun(std::shared_ptr<bool> done);
+		void thread_fun(std::shared_ptr<bool> done, executor_work_guard<io_context::executor_type> work);
 		void answer_aborted(job& j);
 		void join_threads();
 
@@ -188,6 +186,8 @@ namespace libtorrent::aux {
 	// storage kept (a released torrent object is destroyed there, unless
 	// someone else still holds it)
 	TORRENT_EXTRA_EXPORT std::thread::id memory_retired_torrent_release_thread_for_test();
+	// forgets the recorded thread
+	TORRENT_EXTRA_EXPORT void memory_retired_torrent_release_reset_for_test();
 }
 
 #endif

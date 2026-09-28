@@ -171,8 +171,8 @@ namespace {
 			TORRENT_ASSERT(!m_pool->mutex.owned_by_this_thread());
 			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 			release();
-			// the network thread is gone: the torrent object goes here, on
-			// the thread tearing the session down
+			// the io_context is destroyed without being run: the torrent
+			// object goes here
 			m_keep_alive_ios = nullptr;
 		}
 		if (!m_keep_alive) return;
@@ -242,7 +242,12 @@ namespace {
 			while (m_running < m_max_threads)
 			{
 				auto done = std::make_shared<bool>(false);
-				m_threads.push_back({std::thread([this, done] { thread_fun(done); }), done});
+				// the thread keeps the network thread's io_context running
+				// (like the threads of disk_io_thread_pool): what it posts,
+				// answers and the release of a removed torrent, runs there,
+				// while the session still exists
+				m_threads.push_back({std::thread([this, done, work = make_work_guard(m_ios)]() mutable
+					{ thread_fun(done, std::move(work)); }), done});
 				++m_running;
 			}
 			// the queue has no thread left to run it
@@ -253,7 +258,8 @@ namespace {
 		for (auto& j : to_inline) schedule(std::move(j));
 	}
 
-	void memory_hasher::thread_fun(std::shared_ptr<bool> const done)
+	void memory_hasher::thread_fun(std::shared_ptr<bool> const done
+		, executor_work_guard<io_context::executor_type> work)
 	{
 		for (;;)
 		{
@@ -265,6 +271,10 @@ namespace {
 				{
 					--m_running;
 					*done = true;
+					l.unlock();
+					// everything this thread posted is queued: the network
+					// thread may stop once it ran it
+					work.reset();
 					return;
 				}
 				j = std::move(m_queue.front());
@@ -652,5 +662,11 @@ namespace {
 	{
 		std::lock_guard<std::mutex> l(g_answer_mutex);
 		return g_torrent_release_thread;
+	}
+
+	void memory_retired_torrent_release_reset_for_test()
+	{
+		std::lock_guard<std::mutex> l(g_answer_mutex);
+		g_torrent_release_thread = std::thread::id{};
 	}
 }

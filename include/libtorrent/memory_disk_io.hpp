@@ -170,8 +170,10 @@ namespace libtorrent {
 		//
 		// This call waits for the network thread, like the synchronous calls
 		// of torrent_handle. It must not be called from the network thread
-		// (an alert handler or an extension running there): it would wait
-		// for itself.
+		// (an alert handler or an extension running there): like the
+		// synchronous calls of torrent_handle, it would run
+		// torrent::forget_piece() inline, in the middle of what that thread
+		// is doing.
 		//
 		// With place == piece_place::file the caller may release the bytes
 		// in the file, with the limitation of torrent_handle::forget_piece():
@@ -223,7 +225,9 @@ namespace libtorrent {
 
 	// returns a disk_io_constructor_type for session_params that creates
 	// the in-memory disk backend on top of the default disk backend, with
-	// ``pool`` as its shared state
+	// ``pool`` as its shared state. The backend reads the torrent object the
+	// session passes to new_torrent() (the session's own torrent); a direct
+	// user of disk_interface passes an empty one
 	TORRENT_EXPORT disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool>);
 }
 
