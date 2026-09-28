@@ -11,10 +11,21 @@ see LICENSE file.
 #define TORRENT_MEMORY_DISK_IO_HPP_INCLUDED
 
 #include <cstdint>
+#include <memory>
 
 #include "libtorrent/config.hpp"
+#include "libtorrent/fwd.hpp"
+#include "libtorrent/units.hpp"
+#include "libtorrent/span.hpp"
+#include "libtorrent/bitfield.hpp"
+#include "libtorrent/session_params.hpp" // for disk_io_constructor_type
 
 namespace libtorrent {
+
+	namespace aux {
+		struct memory_disk_io;
+		struct memory_pool_impl;
+	}
 
 	// where the pieces of a torrent (or of the files a claim names) are meant
 	// to be stored by the in-memory disk backend
@@ -44,6 +55,137 @@ namespace libtorrent {
 	// identifies the owner of a claim. The value is picked by the client;
 	// each owner only changes its own claims.
 	using memory_owner_t = std::uint32_t;
+
+	// the result of memory_storage_pool::forget_piece()
+	struct memory_forget_result
+	{
+		// the return code of torrent_handle::forget_piece(), or
+		// memory_storage_pool::not_managed
+		int code;
+		// where the bytes of the piece were before it was forgotten
+		piece_place place;
+	};
+
+	// bytes of piece data held in memory by one torrent
+	struct memory_held
+	{
+		// in pieces whose every block is present
+		std::int64_t complete = 0;
+		// in pieces with missing blocks
+		std::int64_t partial = 0;
+	};
+
+	// the pieces of one torrent held in memory
+	struct memory_pieces
+	{
+		// pieces whose every block is present
+		typed_bitfield<piece_index_t> complete;
+		// pieces with missing blocks
+		typed_bitfield<piece_index_t> partial;
+	};
+
+	// the shared state of the in-memory disk backend and the calls of the
+	// client. The pool is created by the client and handed to
+	// memory_disk_io_constructor(); one pool may serve several sessions. All
+	// calls are safe from any thread. A call naming a torrent_handle whose
+	// torrent has no storage in the pool answers not_managed (or an empty
+	// result).
+	struct TORRENT_EXPORT memory_storage_pool
+	{
+		// the construction parameters of the pool
+		struct params
+		{
+			// the size of one slab of memory the pool maps at a time. A
+			// multiple of 16 kiB
+			int slab_bytes = 1024 * 1024;
+		};
+
+		// returned by read() when the requested bytes are not in memory
+		static constexpr int not_in_memory = -1;
+		// returned by calls naming a torrent that has no storage in the pool
+		static constexpr int not_managed = -2;
+
+		// constructs an empty pool. Its limit is 0 (every piece goes to the
+		// file) until set_limit() is called
+		memory_storage_pool();
+		explicit memory_storage_pool(params const& p);
+
+		// hidden
+		~memory_storage_pool();
+
+		// the policy of torrents that are not registered with set_policy().
+		// Initially memory_policy::file
+		void set_default_policy(memory_policy);
+
+		// registers the policy of a torrent before it is added. It matches by
+		// the v1 info-hash or by the truncated v2 info-hash
+		void set_policy(info_hash_t const&, memory_policy);
+
+		// the claim of one owner on a torrent, or on the given files of it
+		// (all files if empty). It replaces the owner's previous claim
+		void set_policy(torrent_handle const&, memory_owner_t, memory_policy, span<file_index_t const> files = {});
+
+		// the number of bytes the pool may hold, for all sessions. It is 0
+		// until this is called: every piece goes to the file
+		void set_limit(std::int64_t bytes);
+
+		// a one-shot request to store the given pieces in the file
+		void persist(torrent_handle const&, span<piece_index_t const>);
+
+		// replaces the set of pieces this owner wants stored in the file
+		void set_persist(torrent_handle const&, memory_owner_t, span<piece_index_t const>);
+
+		// drops every claim of the owner on the torrent
+		void drop_owner(torrent_handle const&, memory_owner_t);
+
+		// bytes in memory that wait to be moved to the file
+		std::int64_t pending_persist_bytes(torrent_handle const&) const;
+
+		// the number of moves to the file that failed
+		int persist_failures(torrent_handle const&) const;
+
+		// calls torrent_handle::forget_piece() and, if it succeeds, drops the
+		// bytes the pool holds for the piece
+		memory_forget_result forget_piece(torrent_handle const&, piece_index_t);
+
+		// copies bytes of a piece held in memory into the buffer. Returns the
+		// number of bytes copied, not_in_memory or not_managed
+		int read(torrent_handle const&, piece_index_t, int offset, span<char>) const;
+
+		// the pieces of the torrent held in memory
+		memory_pieces in_memory(torrent_handle const&) const;
+
+		// the bytes held in memory by one torrent, and by the whole pool
+		memory_held held_bytes(torrent_handle const&) const;
+		std::int64_t held_bytes() const;
+
+		// bytes of forgotten pieces that are still in use by disk jobs
+		std::int64_t retired_bytes() const;
+
+		// pieces that were bound for memory and went to the file because the
+		// pool was at its limit
+		std::int64_t spilled_pieces() const;
+
+		// blocks that were missing when a piece held in memory was hashed
+		std::int64_t hash_missing_blocks() const;
+
+		// removes from the resume data the pieces that are not stored in
+		// the file
+		void filter_resume(torrent_handle const&, add_torrent_params&) const;
+		void filter_resume(add_torrent_params&) const;
+
+		// drops what the pool keeps of a removed torrent
+		void forget_record(info_hash_t const&);
+
+	private:
+		friend struct aux::memory_disk_io;
+		std::shared_ptr<aux::memory_pool_impl> m_impl;
+	};
+
+	// returns a disk_io_constructor_type for session_params that creates
+	// the in-memory disk backend on top of the default disk backend, with
+	// ``pool`` as its shared state
+	TORRENT_EXPORT disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool>);
 }
 
 #endif

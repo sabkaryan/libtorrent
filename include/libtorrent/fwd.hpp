@@ -216,6 +216,9 @@ namespace dht {
 struct dht_storage_interface;
 }
 
+// include/libtorrent/memory_disk_io.hpp
+struct memory_storage_pool;
+
 // include/libtorrent/peer_class.hpp
 struct peer_class_info;
 

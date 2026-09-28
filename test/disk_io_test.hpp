@@ -14,6 +14,7 @@ see LICENSE file.
 #include "libtorrent/session_params.hpp" // for disk_io_constructor_type
 #include "libtorrent/posix_disk_io.hpp"
 #include "libtorrent/pread_disk_io.hpp"
+#include "libtorrent/memory_disk_io.hpp"
 
 #if TORRENT_HAVE_MMAP || TORRENT_HAVE_MAP_VIEW_OF_FILE
 #include "libtorrent/mmap_disk_io.hpp"
@@ -22,6 +23,26 @@ see LICENSE file.
 #include "test.hpp"
 
 #include <boost/preprocessor/cat.hpp>
+
+#include <cstdint>
+#include <limits>
+#include <memory>
+
+// every piece goes to the file: must behave exactly like the default back end
+inline lt::disk_io_constructor_type memory_file_disk_io()
+{
+	auto pool = std::make_shared<lt::memory_storage_pool>();
+	return lt::memory_disk_io_constructor(pool);
+}
+
+// every piece stays in memory (explicit limit: it is 0 until set)
+inline lt::disk_io_constructor_type memory_disk_io()
+{
+	auto pool = std::make_shared<lt::memory_storage_pool>();
+	pool->set_default_policy(lt::memory_policy::memory);
+	pool->set_limit(std::numeric_limits<std::int64_t>::max());
+	return lt::memory_disk_io_constructor(pool);
+}
 
 // indirection layer so the BOOST_PP_CAT argument is expanded before
 // TORRENT_TEST stringifies the test name (otherwise the registered test
@@ -39,7 +60,8 @@ see LICENSE file.
 #endif
 
 // Registers one test per disk I/O backend (mmap_disk_io_constructor where
-// available, posix_disk_io_constructor, and pread_disk_io_constructor). The
+// available, posix_disk_io_constructor, pread_disk_io_constructor, and
+// memory_disk_io with every piece routed to the file). The
 // body sees `disk_io` as a `lt::disk_io_constructor_type`, which can be passed
 // to session_params (`sp.disk_io_constructor = disk_io;`) or any helper that
 // creates a session.
@@ -51,8 +73,8 @@ see LICENSE file.
 //       test_checking(v2, disk_io);
 //   }
 //
-// expands to `checking_v2_mmap`, `checking_v2_posix`, and `checking_v2_pread`
-// test cases. Each is registered and reported individually so a
+// expands to `checking_v2_mmap`, `checking_v2_posix`, `checking_v2_pread` and
+// `checking_v2_memory_file` test cases. Each is registered and reported individually so a
 // backend-specific failure is obvious from the name.
 #define TORRENT_TEST_DISK_IO(test_name) \
 	static void BOOST_PP_CAT(disk_io_test_, test_name)(lt::disk_io_constructor_type disk_io); \
@@ -65,7 +87,22 @@ see LICENSE file.
 	{ \
 		BOOST_PP_CAT(disk_io_test_, test_name)(lt::pread_disk_io_constructor); \
 	} \
+	TORRENT_TEST_DISK_IO_REGISTER_(BOOST_PP_CAT(test_name, _memory_file)) \
+	{ \
+		BOOST_PP_CAT(disk_io_test_, test_name)(memory_file_disk_io()); \
+	} \
 	static void BOOST_PP_CAT(disk_io_test_, test_name)(lt::disk_io_constructor_type disk_io)
+
+// TORRENT_TEST_DISK_IO plus a `_memory` variant, where memory_disk_io keeps
+// every piece in memory. Only for tests that do not look at the files on
+// disk: in the `_memory` variant no piece reaches a file.
+#define TORRENT_TEST_DISK_IO_WITH_MEMORY(test_name) \
+	static void BOOST_PP_CAT(disk_io_test_, test_name)(lt::disk_io_constructor_type disk_io); \
+	TORRENT_TEST_DISK_IO_REGISTER_(BOOST_PP_CAT(test_name, _memory)) \
+	{ \
+		BOOST_PP_CAT(disk_io_test_, test_name)(memory_disk_io()); \
+	} \
+	TORRENT_TEST_DISK_IO(test_name)
 
 // true if `disk_io` constructs a single-threaded backend (posix_disk_io).
 // Lets a test skip thread-count sweeps that would only re-run the same code

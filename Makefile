@@ -391,8 +391,10 @@ SOURCES = \
   posix_disk_io.cpp               \
   posix_part_file.cpp             \
   posix_storage.cpp               \
+  memory_disk_io.cpp              \
   memory_slab.cpp                 \
   memory_storage.cpp              \
+  memory_storage_pool.cpp         \
   pread_disk_io.cpp               \
   pread_storage.cpp               \
   proxy_base.cpp                  \
@@ -624,6 +626,7 @@ HEADERS = \
   aux_/merkle.hpp                   \
   aux_/merkle_tree.hpp              \
   aux_/mmap.hpp                     \
+  aux_/memory_pool_impl.hpp         \
   aux_/memory_slab.hpp              \
   aux_/memory_storage.hpp           \
   aux_/mmap_storage.hpp             \
@@ -933,6 +936,7 @@ TEST_SOURCES = \
   test_disk_cache.cpp \
   test_disk_io.cpp \
   test_forget_piece.cpp \
+  test_memory_session.cpp \
   test_piece_flushed_alert.cpp \
   test_slow_hash.cpp \
   test_dos_blocker.cpp \

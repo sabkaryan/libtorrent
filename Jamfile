@@ -941,6 +941,8 @@ SOURCES =
 	precomputed_block_hashes
 	memory_slab
 	memory_storage
+	memory_storage_pool
+	memory_disk_io
 	pread_disk_io
 	pread_storage
 	posix_disk_io
