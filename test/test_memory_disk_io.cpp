@@ -1305,3 +1305,87 @@ TORRENT_TEST(inner_hash_answer_after_delete_files)
 	TEST_CHECK(!lt::aux::memory_in_file_for_test(*mem.disk, ms, p0));
 }
 #endif
+
+namespace {
+
+// the answers of the jobs waiting on a tail
+struct tail_answers
+{
+	int answered = 0;
+	int aborted = 0;
+	void operator()(lt::storage_error const& e)
+	{
+		if (e.ec == boost::asio::error::operation_aborted) ++aborted;
+		++answered;
+	}
+};
+
+// a piece held in memory is moved to the file (persist set of owner 1).
+// The hasher gate holds the pool's hash of the move, so its step does not
+// end, while the default backend writes and hashes the piece (it must not
+// be flushing it when its storage is removed: libtorrent removes a storage
+// only after a fence). The piece is forgotten, and a write, a read, a hash
+// and a block hash of it go to the default backend: they wait on the tail
+// of the transfer. Then `end` runs (it removes the storage or aborts the
+// disk_interface): every one of them answers operation_aborted
+void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)> const& end)
+{
+	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
+	lt::file_storage fs;
+	fs.set_piece_length(2 * lt::default_block_size);
+	fs.add_file("tail/a", 4 * lt::default_block_size, {});
+	fs.set_num_pieces(2);
+	lt::storage_index_t const st = env.add(fs, "tail_torrent", true, false);
+	lt::piece_index_t const p{0};
+	std::vector<char> const data = piece_data(fs, p, true);
+	env.write(st, p, data);
+	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::memory);
+	// the background hash of the blocks is done
+	env.run_for(lt::milliseconds(200));
+
+	memory_hasher_gate gate(p);
+	lt::piece_index_t const set[] = {p};
+	lt::aux::memory_set_persist_for_test(*env.disk, st, set);
+	TEST_CHECK(env.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::transfer);
+	lt::aux::memory_forget_for_test(*env.disk, st, p);
+
+	tail_answers a;
+	lt::peer_request const r{p, 0, lt::default_block_size};
+	env.disk->async_write(st, r, data.data(), {}, [&a](lt::storage_error const& e) { a(e); });
+	env.disk->async_read(st, r, [&a](lt::disk_buffer_holder, lt::storage_error const& e) { a(e); });
+	env.disk->async_hash(st, p, {}, lt::disk_interface::v1_hash
+		, [&a](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { a(e); });
+	env.disk->async_hash2(st, p, 0, {}
+		, [&a](lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const& e) { a(e); });
+	env.disk->submit_jobs();
+	// the default backend answers the move's writes and hash meanwhile
+	env.run_for(lt::milliseconds(300));
+	TEST_EQUAL(a.answered, 0);
+
+	end(env, st);
+	TEST_CHECK(env.run_until([&] { return a.answered == 4; }));
+	TEST_EQUAL(a.aborted, 4);
+	gate.release();
+	env.run_for(lt::milliseconds(200));
+}
+
+} // anonymous namespace
+
+TORRENT_TEST(transfer_parked_answered_on_remove)
+{
+	parked_on_tail_answered([](disk_env& env, lt::storage_index_t const st)
+	{
+		for (auto& h : env.storages)
+			if (static_cast<lt::storage_index_t>(h) == st) h.reset();
+	});
+}
+
+TORRENT_TEST(transfer_parked_answered_on_abort)
+{
+	parked_on_tail_answered([](disk_env& env, lt::storage_index_t)
+	{
+		env.disk->abort(false);
+	});
+}

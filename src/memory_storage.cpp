@@ -229,7 +229,13 @@ namespace {
 		if (!e) return;
 		TORRENT_ASSERT(e->pins > 0);
 		if (e->pins > 0) --e->pins;
-		if (e->pins > 0 || is_current(*e)) return;
+		if (e->pins > 0) return;
+		if (is_current(*e))
+		{
+			// blocks dropped while the entry was pinned
+			free_dropped(*e);
+			return;
+		}
 		auto const it = std::find(m_retired.begin(), m_retired.end(), e);
 		if (it == m_retired.end()) return;
 		memory_piece_entry& retired = **it;
@@ -258,6 +264,83 @@ namespace {
 		e.blocks.clear();
 		e.blocks.shrink_to_fit();
 		e.num_blocks = 0;
+		free_dropped(e);
+	}
+
+	void memory_storage::free_dropped(memory_piece_entry& e)
+	{
+		if (e.dropped.empty()) return;
+		// the allocator is not thread safe
+		TORRENT_ASSERT(locked());
+		m_alloc.free(e.dropped);
+		m_retired_bytes -= std::int64_t(e.dropped.size()) * default_block_size;
+		TORRENT_ASSERT(m_retired_bytes >= 0);
+		e.dropped.clear();
+		e.dropped.shrink_to_fit();
+	}
+
+	void memory_storage::account(memory_piece_entry const& e, int const sign)
+	{
+		std::int64_t const bytes = std::int64_t(sign) * e.num_blocks * default_block_size;
+		if (e.missing_blocks == 0) m_held_complete += bytes;
+		else m_held_partial += bytes;
+		TORRENT_ASSERT(m_held_complete >= 0);
+		TORRENT_ASSERT(m_held_partial >= 0);
+	}
+
+	void memory_storage::drop_block(memory_piece_entry& e, int const block)
+	{
+		TORRENT_ASSERT(locked());
+		TORRENT_ASSERT(is_current(e));
+		if (!is_current(e) || block < 0 || block >= e.blocks.end_index()) return;
+		char* const b = e.blocks[block];
+		if (b == nullptr) return;
+		account(e, -1);
+		e.blocks[block] = nullptr;
+		--e.num_blocks;
+		account(e, 1);
+		if (e.pins == 0)
+		{
+			m_alloc.free(b);
+			return;
+		}
+		// a hashing thread may read it without the mutex until it lets go
+		e.dropped.push_back(b);
+		m_retired_bytes += default_block_size;
+	}
+
+	void memory_storage::drop_blocks(memory_piece_entry& e)
+	{
+		for (int b = 0; b < e.blocks.end_index(); ++b) drop_block(e, b);
+	}
+
+	void memory_storage::transfer_done(memory_piece_entry& e)
+	{
+		TORRENT_ASSERT(is_current(e));
+		TORRENT_ASSERT(e.missing_blocks == 0);
+		if (!is_current(e)) return;
+		int const n = blocks_in_piece(e.piece);
+		e.place = piece_place::file;
+		e.transfer_started = false;
+		e.inner_blocks.assign(static_cast<std::size_t>(n), false);
+		for (int b = 0; b < n; ++b)
+			if (!is_pad_block(e.piece, b)) e.inner_blocks[static_cast<std::size_t>(b)] = true;
+		e.inner_written = required_blocks(e.piece);
+		// the default backend answered the hash of the piece
+		e.hash_returned = true;
+		m_in_file.set_bit(e.piece);
+		// the one-shot persist is spent once the piece is in the file
+		m_one_shot.clear_bit(e.piece);
+		drop_blocks(e);
+	}
+
+	void memory_storage::transfer_failed(memory_piece_entry& e)
+	{
+		TORRENT_ASSERT(is_current(e));
+		if (!is_current(e)) return;
+		e.place = piece_place::memory;
+		e.transfer_started = false;
+		++m_persist_failures;
 	}
 
 	bool memory_storage::write_block(memory_piece_entry& e, int const block
@@ -319,15 +402,41 @@ namespace {
 	bool memory_storage::hand_to_inner(memory_piece_entry& e, int const block)
 	{
 		TORRENT_ASSERT(is_current(e));
-		TORRENT_ASSERT(e.place == piece_place::file);
+		TORRENT_ASSERT(e.place == piece_place::file
+			|| (e.place == piece_place::transfer && e.partial_transfer));
 		int const n = blocks_in_piece(e.piece);
 		if (!is_current(e) || block < 0 || block >= n) return false;
 		if (e.inner_blocks.empty()) e.inner_blocks.resize(static_cast<std::size_t>(n), false);
 		auto&& handed = e.inner_blocks[static_cast<std::size_t>(block)];
 		if (handed || is_pad_block(e.piece, block)) return false;
 		handed = true;
+		// a partial transfer may still hold blocks in memory: they move from
+		// the partial to the complete bytes when the last block comes
+		account(e, -1);
 		if (e.missing_blocks > 0) --e.missing_blocks;
+		account(e, 1);
 		return true;
+	}
+
+	bool memory_storage::hand_held_to_inner(memory_piece_entry& e, int const block)
+	{
+		TORRENT_ASSERT(is_current(e));
+		TORRENT_ASSERT(e.place == piece_place::transfer);
+		int const n = blocks_in_piece(e.piece);
+		if (!is_current(e) || block < 0 || block >= n) return false;
+		if (block_data(e, block) == nullptr || is_pad_block(e.piece, block)) return false;
+		if (e.inner_blocks.empty()) e.inner_blocks.resize(static_cast<std::size_t>(n), false);
+		auto&& handed = e.inner_blocks[static_cast<std::size_t>(block)];
+		if (handed) return false;
+		// it was counted as received when it was written to memory
+		handed = true;
+		return true;
+	}
+
+	bool memory_storage::handed_to_inner(memory_piece_entry const& e, int const block)
+	{
+		return block >= 0 && std::size_t(block) < e.inner_blocks.size()
+			&& e.inner_blocks[static_cast<std::size_t>(block)];
 	}
 
 	void memory_storage::inner_block_written(memory_piece_entry& e)
@@ -415,6 +524,22 @@ namespace {
 		TORRENT_ASSERT(valid(piece));
 		if (!valid(piece)) return piece_place::file;
 
+		piece_place const unlimited = wanted_place(piece);
+		// rule 3: the pool is at its limit. Only a piece bound for memory is
+		// a spill; one bound for the file would have gone there anyway
+		if (at_limit)
+		{
+			if (unlimited == piece_place::memory) ++m_spilled_pieces; // spill
+			return piece_place::file;
+		}
+		return unlimited;
+	}
+
+	piece_place memory_storage::wanted_place(piece_index_t const piece) const
+	{
+		TORRENT_ASSERT(valid(piece));
+		if (!valid(piece)) return piece_place::file;
+
 		// rule 1: persist, one-shot (the piece leaves that set when it starts
 		// in the file) or of any owner
 		if (m_one_shot.get_bit(piece)) return piece_place::file;
@@ -430,14 +555,6 @@ namespace {
 		// claim covers it, otherwise the torrent policy
 		bool const bound_for_memory = covered_by(piece, memory_policy::memory) // rule 4
 			|| m_torrent_policy == memory_policy::memory; // rule 5
-		piece_place const unlimited = bound_for_memory ? piece_place::memory : piece_place::file;
-		// rule 3: the pool is at its limit. Only a piece bound for memory is
-		// a spill; one bound for the file would have gone there anyway
-		if (at_limit)
-		{
-			if (unlimited == piece_place::memory) ++m_spilled_pieces; // spill
-			return piece_place::file;
-		}
-		return unlimited;
+		return bound_for_memory ? piece_place::memory : piece_place::file;
 	}
 }

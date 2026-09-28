@@ -16,6 +16,7 @@ see LICENSE file.
 #include "libtorrent/aux_/session_call.hpp" // for torrent_wait
 #include "libtorrent/torrent_handle.hpp"
 #include "libtorrent/add_torrent_params.hpp"
+#include "libtorrent/torrent_info.hpp"
 #include "libtorrent/disk_interface.hpp" // for default_block_size
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
@@ -38,6 +39,65 @@ namespace {
 	bool same_torrent(std::weak_ptr<void> const& a, Ref const& b)
 	{
 		return !a.owner_before(b) && !b.owner_before(a);
+	}
+
+	// two sets of info-hashes of the same torrent: the v1 or the v2 match
+	bool same_hashes(info_hash_t const& a, info_hash_t const& b)
+	{
+		if (a.has_v1() && b.has_v1() && a.v1 == b.v1) return true;
+		return a.has_v2() && b.has_v2() && a.v2 == b.v2;
+	}
+
+	// what filter_resume() knows of one storage (or residue): its "in file"
+	// pieces and the pieces whose current entry has place file
+	struct known_pieces
+	{
+		typed_bitfield<piece_index_t> in_file;
+		typed_bitfield<piece_index_t> file_place;
+	};
+
+	known_pieces known_of(memory_storage const& s)
+	{
+		known_pieces ret;
+		int const n = s.files().num_pieces();
+		ret.in_file.resize(n, false);
+		ret.file_place.resize(n, false);
+		for (auto const p : s.files().piece_range())
+		{
+			if (s.in_file(p)) ret.in_file.set_bit(p);
+			auto const e = s.current(p);
+			if (e && e->place == piece_place::file) ret.file_place.set_bit(p);
+		}
+		return ret;
+	}
+
+	bool bit(typed_bitfield<piece_index_t> const& b, piece_index_t const p)
+	{
+		return p >= piece_index_t{0} && p < b.end_index() && b.get_bit(p);
+	}
+
+	// a piece stays in the resume data only if every storage the torrent
+	// had in the pool has it "in file" (in have_pieces), or its current
+	// entry in the file (in unfinished_pieces). Unchanged without any
+	void filter_by(add_torrent_params& atp, std::vector<known_pieces> const& known)
+	{
+		if (known.empty()) return;
+		auto& have = atp.have_pieces;
+		for (piece_index_t p{0}; p < have.end_index(); ++p)
+		{
+			if (!have.get_bit(p)) continue;
+			bool const keep = std::all_of(known.begin(), known.end()
+				, [p](known_pieces const& k) { return bit(k.in_file, p); });
+			if (!keep) have.clear_bit(p);
+		}
+		for (auto it = atp.unfinished_pieces.begin(); it != atp.unfinished_pieces.end();)
+		{
+			piece_index_t const p = it->first;
+			bool const keep = std::all_of(known.begin(), known.end()
+				, [p](known_pieces const& k) { return bit(k.file_place, p); });
+			if (keep) ++it;
+			else it = atp.unfinished_pieces.erase(it);
+		}
 	}
 
 	// drops the claims queued for torrent objects that are gone
@@ -133,6 +193,42 @@ namespace {
 		return ret;
 	}
 
+	memory_pool_impl::storage_ref const* memory_pool_impl::ref_of(std::shared_ptr<void> const& torrent) const
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		if (!torrent) return nullptr;
+		auto const it = std::find_if(storages.begin(), storages.end()
+			, [&torrent](storage_ref const& r) { return same_torrent(r.torrent, torrent); });
+		return it == storages.end() ? nullptr : &*it;
+	}
+
+	void memory_pool_impl::request_transfers(storage_ref const& r)
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		memory_storage& s = *r.storage;
+		std::vector<std::shared_ptr<memory_piece_entry>> moved;
+		for (auto const p : s.files().piece_range())
+		{
+			std::shared_ptr<memory_piece_entry> e = s.current(p);
+			// a piece in the file, or already in transfer, is left alone; a
+			// piece without an entry starts where the claims send it
+			if (!e || e->place != piece_place::memory) continue;
+			if (s.wanted_place(p) != piece_place::file) continue;
+			// from now on it counts in pending_persist_bytes()
+			e->place = piece_place::transfer;
+			moved.push_back(std::move(e));
+		}
+		if (!moved.empty() && r.transfer) r.transfer(std::move(moved));
+	}
+
+	void memory_pool_impl::add_residue(info_hash_t const& ih, memory_storage const& s)
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		if (!ih.has_v1() && !ih.has_v2()) return;
+		known_pieces k = known_of(s);
+		residues.push_back({ih, std::move(k.in_file), std::move(k.file_place)});
+	}
+
 	int memory_pool_test_access::blocks_in_use(memory_storage_pool const& pool)
 	{
 		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
@@ -156,21 +252,34 @@ namespace {
 		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
 		return int(pool.m_impl->pending.size());
 	}
+
+	int memory_pool_test_access::residues(memory_storage_pool const& pool)
+	{
+		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
+		return int(pool.m_impl->residues.size());
+	}
 }
 
 namespace {
 
+	// whether a claim may send pieces held in memory to the file
+	enum class moves : bool { no, yes };
+
 	// the claim is applied to the torrent's storage now, or queued for it
-	// if it has none yet (no metadata). Nothing for an invalid handle
+	// if it has none yet (no metadata). Nothing for an invalid handle. A
+	// claim that may move pieces starts the transfers of the pieces in
+	// memory that it sends to the file, under the mutex: their bytes count
+	// in pending_persist_bytes() when this returns
 	void claim(aux::memory_pool_impl& impl, torrent_handle const& th
-		, std::function<void(aux::memory_storage&)> op)
+		, std::function<void(aux::memory_storage&)> op, moves const m)
 	{
 		std::shared_ptr<aux::torrent> const t = th.native_handle();
 		if (!t) return;
 		std::lock_guard<aux::memory_pool_mutex> l(impl.mutex);
-		if (auto const s = impl.storage_of(t))
+		if (auto const* r = impl.ref_of(t))
 		{
-			op(*s);
+			op(*r->storage);
+			if (m == moves::yes) impl.request_transfers(*r);
 			return;
 		}
 		impl.add_pending(std::weak_ptr<void>(t), std::move(op));
@@ -207,7 +316,7 @@ namespace {
 		, memory_policy const policy, span<file_index_t const> const files)
 	{
 		claim(*m_impl, th, [owner, policy, f = std::vector<file_index_t>(files.begin(), files.end())]
-			(aux::memory_storage& s) { s.set_claim_policy(owner, policy, f); });
+			(aux::memory_storage& s) { s.set_claim_policy(owner, policy, f); }, moves::yes);
 	}
 
 	void memory_storage_pool::set_limit(std::int64_t const bytes)
@@ -219,31 +328,49 @@ namespace {
 	void memory_storage_pool::persist(torrent_handle const& th, span<piece_index_t const> const pieces)
 	{
 		claim(*m_impl, th, [p = std::vector<piece_index_t>(pieces.begin(), pieces.end())]
-			(aux::memory_storage& s) { s.add_one_shot_persist(p); });
+			(aux::memory_storage& s) { s.add_one_shot_persist(p); }, moves::yes);
 	}
 
 	void memory_storage_pool::set_persist(torrent_handle const& th, memory_owner_t const owner
 		, span<piece_index_t const> const pieces)
 	{
 		claim(*m_impl, th, [owner, p = std::vector<piece_index_t>(pieces.begin(), pieces.end())]
-			(aux::memory_storage& s) { s.set_claim_persist(owner, p); });
+			(aux::memory_storage& s) { s.set_claim_persist(owner, p); }, moves::yes);
 	}
 
 	void memory_storage_pool::drop_owner(torrent_handle const& th, memory_owner_t const owner)
 	{
-		claim(*m_impl, th, [owner](aux::memory_storage& s) { s.drop_owner(owner); });
+		// the bytes stay where they are
+		claim(*m_impl, th, [owner](aux::memory_storage& s) { s.drop_owner(owner); }, moves::no);
 	}
 
-	// the moves to the file come with the transfers: nothing is moved yet
-
-	std::int64_t memory_storage_pool::pending_persist_bytes(torrent_handle const&) const
+	// the blocks of the entries in transfer that are still in memory. A
+	// piece that has not arrived has no entry, and is not counted
+	std::int64_t memory_storage_pool::pending_persist_bytes(torrent_handle const& th) const
 	{
-		return not_managed;
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+		std::shared_ptr<aux::memory_storage> const st = m_impl->storage_of(t);
+		if (!st) return not_managed;
+		aux::memory_storage const& s = *st;
+		std::int64_t ret = 0;
+		for (auto const p : s.files().piece_range())
+		{
+			auto const e = s.current(p);
+			if (!e) continue;
+			if (e->place == piece_place::transfer)
+				ret += std::int64_t(e->num_blocks) * default_block_size;
+		}
+		return ret;
 	}
 
-	int memory_storage_pool::persist_failures(torrent_handle const&) const
+	int memory_storage_pool::persist_failures(torrent_handle const& th) const
 	{
-		return not_managed;
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+		std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t);
+		if (!s) return not_managed;
+		return s->persist_failures();
 	}
 
 	memory_forget_result memory_storage_pool::forget_piece(torrent_handle const& th
@@ -317,7 +444,9 @@ namespace {
 		aux::memory_storage const& s = *st;
 		if (piece < piece_index_t{0} || piece >= s.files().end_piece()) return not_in_memory;
 		auto const e = s.current(piece);
-		if (!e || e->place != piece_place::memory) return not_in_memory;
+		// a piece in transfer is read from memory until its blocks are freed
+		if (!e || (e->place != piece_place::memory && e->place != piece_place::transfer))
+			return not_in_memory;
 		int const piece_size = e->hasher->piece_size;
 		if (offset < 0 || offset >= piece_size) return not_in_memory;
 		int const len = static_cast<int>(std::min(buf.size(), std::ptrdiff_t(piece_size - offset)));
@@ -352,7 +481,8 @@ namespace {
 		for (auto const p : s->files().piece_range())
 		{
 			auto const e = s->current(p);
-			if (!e || e->place != piece_place::memory) continue;
+			if (!e || (e->place != piece_place::memory && e->place != piece_place::transfer)) continue;
+			if (e->num_blocks == 0) continue;
 			if (e->missing_blocks == 0) ret.complete.set_bit(p);
 			else ret.partial.set_bit(p);
 		}
@@ -395,12 +525,44 @@ namespace {
 		return m_impl->hash_missing_blocks;
 	}
 
-	void memory_storage_pool::filter_resume(torrent_handle const&, add_torrent_params&) const
-	{}
+	void memory_storage_pool::filter_resume(torrent_handle const& th, add_torrent_params& atp) const
+	{
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		{
+			std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+			if (std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t))
+			{
+				aux::filter_by(atp, {aux::known_of(*s)});
+				return;
+			}
+		}
+		// the handle has no storage in the pool (any more): by info-hash,
+		// over the live storages and the residues
+		filter_resume(atp);
+	}
 
-	void memory_storage_pool::filter_resume(add_torrent_params&) const
-	{}
+	void memory_storage_pool::filter_resume(add_torrent_params& atp) const
+	{
+		info_hash_t ih = atp.info_hashes;
+		if (!ih.has_v1() && !ih.has_v2() && atp.ti) ih = atp.ti->info_hashes();
+		if (!ih.has_v1() && !ih.has_v2()) return;
+		std::vector<aux::known_pieces> known;
+		{
+			std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+			for (auto const& r : m_impl->storages)
+				if (aux::same_hashes(r.info_hashes, ih)) known.push_back(aux::known_of(*r.storage));
+			for (auto const& r : m_impl->residues)
+				if (aux::same_hashes(r.info_hashes, ih)) known.push_back({r.in_file, r.file_place});
+		}
+		aux::filter_by(atp, known);
+	}
 
-	void memory_storage_pool::forget_record(info_hash_t const&)
-	{}
+	void memory_storage_pool::forget_record(info_hash_t const& ih)
+	{
+		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+		auto& res = m_impl->residues;
+		res.erase(std::remove_if(res.begin(), res.end()
+			, [&ih](aux::memory_pool_impl::residue const& r) { return aux::same_hashes(r.info_hashes, ih); })
+			, res.end());
+	}
 }

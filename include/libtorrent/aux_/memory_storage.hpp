@@ -93,6 +93,19 @@ namespace libtorrent::aux {
 		// block was handed over (missing_blocks counts them down)
 		std::vector<bool> inner_blocks;
 		int inner_written = 0;
+		// place transfer: the step that hands the entry's blocks to the
+		// default backend was issued (until then the entry waits for its
+		// turn and takes writes like an entry in memory)
+		bool transfer_started = false;
+		// place transfer: the entry had missing blocks when its step was
+		// issued. Its blocks go to the default backend with flush_piece and
+		// are freed by their write handlers; later blocks go to the default
+		// backend, and so does its hash
+		bool partial_transfer = false;
+		// blocks taken out of the entry while a job pinned it (a hashing
+		// thread may still read them). They are freed with its last pin and
+		// counted in the retired bytes until then
+		std::vector<char*> dropped;
 	};
 
 	// the state of one torrent in the in-memory disk backend: the current
@@ -149,9 +162,10 @@ namespace libtorrent::aux {
 		// the block, nullptr if it was not received (or was freed)
 		char const* block_data(memory_piece_entry const& e, int block) const;
 
-		// block ``block`` of the current entry e (place file) is handed to
-		// the default backend. Returns true the first time for a non-pad
-		// block: its write, once completed, is passed to inner_block_written().
+		// block ``block`` of the current entry e (place file, or a partial
+		// transfer) is handed to the default backend. Returns true the first
+		// time for a non-pad block: its write, once completed, is passed to
+		// inner_block_written().
 		// A block whose write fails stays handed over and a retry is not
 		// counted: the piece does not become "in file", which only costs a
 		// download again after a restart (filter_resume() drops it)
@@ -160,6 +174,29 @@ namespace libtorrent::aux {
 		// hand_to_inner() returned true. Once every non-pad block of the
 		// piece is written, the piece is "in file"
 		void inner_block_written(memory_piece_entry& e);
+		// the step of a partial transfer hands block ``block``, held in
+		// memory, to the default backend. Returns true for a non-pad block,
+		// whose completed write is passed to inner_block_written()
+		bool hand_held_to_inner(memory_piece_entry& e, int block);
+		// whether block ``block`` of e was handed to the default backend
+		static bool handed_to_inner(memory_piece_entry const& e, int block);
+
+		// takes a block (every block) out of the current entry e: it is not
+		// held any more, and is freed now, or with e's last pin if a job
+		// pins e. The caller holds the pool's mutex
+		void drop_block(memory_piece_entry& e, int block);
+		void drop_blocks(memory_piece_entry& e);
+		// the transfer of the complete current entry e to the file ended
+		// well: place file, every non-pad block written by the default
+		// backend and its hash returned there, the piece is "in file" and
+		// leaves the one-shot persist set; the blocks are dropped
+		void transfer_done(memory_piece_entry& e);
+		// the transfer of the current entry e failed: back to place memory,
+		// counted in persist_failures()
+		void transfer_failed(memory_piece_entry& e);
+		// a write of a transfer to the default backend failed
+		void add_persist_failure() { ++m_persist_failures; }
+		int persist_failures() const { return m_persist_failures; }
 
 		// the "in file" flag, per piece (not per entry)
 		bool in_file(piece_index_t piece) const;
@@ -183,6 +220,9 @@ namespace libtorrent::aux {
 		// to the file counts in spilled_pieces() only if rules 4-5 would have
 		// sent it to memory
 		piece_place decide(piece_index_t piece, bool at_limit);
+		// the place rules 1, 2, 4 and 5 give the piece, the limit aside. A
+		// piece held in memory whose wanted place is the file is moved there
+		piece_place wanted_place(piece_index_t piece) const;
 
 		// bytes of the blocks of current entries whose every non-pad block
 		// is present, and of the other current entries
@@ -239,6 +279,11 @@ namespace libtorrent::aux {
 		bool locked() const;
 		void retire_entry(std::shared_ptr<memory_piece_entry> e);
 		void free_blocks(memory_piece_entry& e);
+		// frees the blocks dropped from e while it was pinned
+		void free_dropped(memory_piece_entry& e);
+		// adds (sign 1) or removes (sign -1) the bytes of the current entry e
+		// to the held bytes, complete or partial by its missing blocks
+		void account(memory_piece_entry const& e, int sign);
 		bool covered_by(piece_index_t piece, memory_policy policy) const;
 
 		file_storage const& m_files;
@@ -262,6 +307,7 @@ namespace libtorrent::aux {
 		std::int64_t m_held_partial = 0;
 		std::int64_t m_retired_bytes = 0;
 		int m_spilled_pieces = 0;
+		int m_persist_failures = 0;
 		aux::vector<std::uint32_t, piece_index_t> m_retire_count;
 		bool m_removed = false;
 	};

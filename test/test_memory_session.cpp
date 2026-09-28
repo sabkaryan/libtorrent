@@ -32,13 +32,18 @@ see LICENSE file.
 #include "libtorrent/aux_/torrent.hpp"
 #include "libtorrent/aux_/memory_pool_impl.hpp"
 #include "libtorrent/aux_/memory_storage.hpp" // for memory_storages_destroyed_pinned_for_test
+#include "libtorrent/torrent_info.hpp"
+#include "libtorrent/socket.hpp"
 
 // interposes pwrite() for this binary: include it from this file only
 #include "write_gate.hpp"
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
 #include "libtorrent/aux_/disable_warnings_pop.hpp"
+
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +56,7 @@ see LICENSE file.
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace lt;
@@ -1131,4 +1137,734 @@ TORRENT_TEST(removed_torrent_released_at_session_teardown)
 	TEST_EQUAL(access::blocks_in_use(*pool), 0);
 	error_code ec;
 	remove_all(path, ec);
+}
+
+namespace {
+
+// a session on the pool, with one hashing thread and the given settings
+std::unique_ptr<lt::session> make_session(std::shared_ptr<memory_storage_pool> const& pool
+	, settings_pack sett)
+{
+	sett.set_int(settings_pack::hashing_threads, 1);
+	session_params sp(sett);
+	sp.disk_io_constructor = memory_disk_io_constructor(pool);
+	return std::make_unique<lt::session>(std::move(sp));
+}
+
+// waits for pred for up to `ms` milliseconds
+template <typename Pred>
+bool wait_for_ms(int const ms, Pred pred)
+{
+	auto const end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+	while (std::chrono::steady_clock::now() < end)
+	{
+		if (pred()) return true;
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+	}
+	return pred();
+}
+
+// the resume data of the torrent
+add_torrent_params save_resume(lt::session& ses, torrent_handle const& th)
+{
+	add_torrent_params ret;
+	th.save_resume_data(torrent_handle::flush_disk_cache);
+	bool const saved = wait_alert<save_resume_data_alert>(ses, [&ret](save_resume_data_alert const& a)
+		{
+			ret = a.params;
+			return true;
+		});
+	TEST_CHECK(saved);
+	return ret;
+}
+
+bool has(add_torrent_params const& atp, piece_index_t const p)
+{
+	return p < atp.have_pieces.end_index() && atp.have_pieces.get_bit(p);
+}
+
+// runs f on the network thread of the session and waits for it
+template <typename F>
+void on_network(lt::session& ses, F f)
+{
+	std::shared_ptr<aux::session_impl> const s = ses.native_handle();
+	std::promise<void> done;
+	boost::asio::dispatch(s->get_context(), [&done, &f, s]
+	{
+		f(*s);
+		done.set_value();
+	});
+	done.get_future().wait();
+}
+
+#if defined TORRENT_LINUX
+// the writes held at the write gate now
+int held_writes()
+{
+	std::lock_guard<std::mutex> l(gate_mutex);
+	return writes_waiting;
+}
+#endif
+
+// the answers of disk jobs a test issued itself
+struct answers
+{
+	std::atomic<int> answered{0};
+	std::atomic<int> aborted{0};
+	void operator()(storage_error const& e)
+	{
+		if (e.ec == boost::asio::error::operation_aborted) ++aborted;
+		++answered;
+	}
+};
+
+} // anonymous namespace
+
+#if defined TORRENT_LINUX
+// property 6: generations of a transfer. The write gate holds the transfer
+// of a piece (the claim of owner 1 sends it to the file). Under it the
+// piece is forgotten (code 0), the claim dropped and the piece written
+// again, into memory. Released, the old transfer changes nothing of the new
+// generation: the piece stays in memory and is not "in file", so the resume
+// data loses it
+TORRENT_TEST(transfer_generation_check)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("transfer_generation");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		set_hold_writes(true);
+		file_index_t const f0[] = {file_index_t{0}};
+		pool->set_policy(th, 1, memory_policy::file, f0);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+
+		memory_forget_result const r = pool->forget_piece(th, p);
+		TEST_EQUAL(r.code, 0);
+		TEST_CHECK(r.place == piece_place::transfer);
+		pool->drop_owner(th, 1);
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		TEST_CHECK(reads(*pool, th, content, p));
+		TEST_EQUAL(pool->retired_bytes(), piece_size);
+
+		set_hold_writes(false);
+		// the old transfer let go of its entry
+		TEST_CHECK(wait_for([&] { return pool->retired_bytes() == 0; }));
+		TEST_CHECK(reads(*pool, th, content, p));
+		TEST_CHECK(pool->in_memory(th).complete.get_bit(p));
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+		TEST_CHECK(!in_file(*ses, th, p));
+		add_torrent_params rd = save_resume(*ses, th);
+		TEST_CHECK(has(rd, p));
+		pool->filter_resume(th, rd);
+		TEST_CHECK(!has(rd, p));
+		TEST_EQUAL(pool->persist_failures(th), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// property 6a: the tail of a transfer. The write gate holds the transfer
+// of a piece in a persist set. Under it the piece is forgotten (code 0) and
+// written again with a corrupt block: the set sends it to the file, and
+// libtorrent asks for its hash as soon as the writes are issued. Neither
+// the writes nor the hash may reach the default backend's cache entry of
+// the transfer: a write there would be refused, and the hash would answer
+// the transfer's (right) hash. They wait for the transfer and the piece
+// fails its hash
+TORRENT_TEST(transfer_tail_parks_piece_jobs)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("transfer_tail");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		set_hold_writes(true);
+		piece_index_t const set[] = {p};
+		pool->set_persist(th, 1, set);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+
+		memory_forget_result const r = pool->forget_piece(th, p);
+		TEST_EQUAL(r.code, 0);
+		std::vector<char> const bad = corrupt_piece(content, p, 1);
+		th.add_piece(p, bad.data());
+		// libtorrent issues the hash with the writes
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		TEST_CHECK(!th.have_piece(p));
+
+		set_hold_writes(false);
+		TEST_CHECK(hash_failed(*ses, p));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// property 7: a piece is read from memory for the whole transfer; its
+// memory is freed only once the default backend answered, and then it is
+// "in file" and stays in the filtered resume data
+TORRENT_TEST(transfer_reads_without_gap)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("transfer_reads");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{2};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		set_hold_writes(true);
+		pool->set_policy(th, 1, memory_policy::file);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+		for (int i = 0; i < 5; ++i)
+		{
+			TEST_CHECK(reads(*pool, th, content, p));
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+		TEST_EQUAL(pool->pending_persist_bytes(th), piece_size);
+		TEST_CHECK(pool->in_memory(th).complete.get_bit(p));
+
+		set_hold_writes(false);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_EQUAL(read_code(*pool, th, p), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(pool->held_bytes(), 0);
+		TEST_CHECK(wait_for([&] { return access::blocks_in_use(*pool) == 0; }));
+		TEST_CHECK(in_file(*ses, th, p));
+		add_torrent_params rd = save_resume(*ses, th);
+		pool->filter_resume(th, rd);
+		TEST_CHECK(has(rd, p));
+		TEST_EQUAL(pool->persist_failures(th), 0);
+	}
+	std::vector<char> const b = read_file(combine_path(path, combine_path("unregistered", "b")));
+	std::size_t const at = std::size_t(2 * piece_size - file_a);
+	TEST_CHECK(b.size() >= at + std::size_t(piece_size));
+	if (b.size() >= at + std::size_t(piece_size))
+		TEST_CHECK(std::equal(b.begin() + std::ptrdiff_t(at), b.begin() + std::ptrdiff_t(at + piece_size)
+			, piece_ptr(content, piece_index_t{2})));
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
+
+// property 8: a transfer leaves no cache entry of the default backend
+// without its hash returned. A v2-only torrent: pread_disk_io flushes the
+// blocks of a v2-only piece only after its async_hash (or under pressure),
+// so a transfer that skipped the hash would never end (with v1 hashes the
+// blocks are flushed once pread's hasher reaches the end, and the skip
+// would only show in the next generation). The transfer ends within 5
+// seconds; the piece, forgotten and written again into the file with a
+// corrupt block, fails its hash (an entry left without its hash returned
+// would take the new blocks and answer the old hash)
+TORRENT_TEST(transfer_leaves_no_pread_entry)
+{
+	std::vector<char> const content = four_pieces();
+	std::string const path = complete("transfer_no_entry");
+	add_torrent_params const atp = torrent_from_file(content, complete("transfer_no_entry_src")
+		, create_torrent::v2_only);
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{1};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		piece_index_t const set[] = {p};
+		pool->persist(th, set);
+		TEST_CHECK(wait_for_ms(5000, [&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, p));
+		TEST_EQUAL(read_code(*pool, th, p), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(pool->persist_failures(th), 0);
+
+		memory_forget_result const r = pool->forget_piece(th, p);
+		TEST_EQUAL(r.code, 0);
+		TEST_CHECK(r.place == piece_place::file);
+		pool->persist(th, set);
+		std::vector<char> const bad = corrupt_piece(content, p, 1);
+		th.add_piece(p, bad.data());
+		TEST_CHECK(hash_failed(*ses, p));
+		TEST_EQUAL(read_code(*pool, th, p), memory_storage_pool::not_in_memory);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a one-shot persist() is spent once its piece is moved to the file:
+// forgotten and written again, the piece goes to memory
+TORRENT_TEST(persist_spent_by_transfer)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("persist_spent");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{2};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		piece_index_t const set[] = {p};
+		pool->persist(th, set);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, p));
+
+		TEST_EQUAL(pool->forget_piece(th, p).code, 0);
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		TEST_CHECK(reads(*pool, th, content, p));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+#if defined TORRENT_LINUX
+// property 9: back-pressure between pieces. The default backend's queue
+// holds two blocks and the write gate holds its writes: the first piece's
+// step hands over all its blocks and its hash, the second one waits for
+// the queue. Between them the first piece is forgotten (code 0) and the
+// storage is stopped: the stop answers only after the step's writes. The
+// piece, written again into the file with a corrupt block, fails its hash;
+// the second piece is moved after the stop
+TORRENT_TEST(transfer_backpressure_between_pieces)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("transfer_backpressure");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		settings_pack sett = session_settings();
+		sett.set_int(settings_pack::max_queued_disk_bytes, 2 * default_block_size);
+		auto ses = make_session(pool, sett);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p0{0};
+		piece_index_t const p1{2};
+		TEST_CHECK(add_pieces(*ses, th, content, {p0, p1}));
+
+		set_hold_writes(true);
+		piece_index_t const set[] = {p0, p1};
+		pool->set_persist(th, 1, set);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		TEST_EQUAL(pool->pending_persist_bytes(th), 2 * piece_size);
+
+		memory_forget_result const r = pool->forget_piece(th, p0);
+		TEST_EQUAL(r.code, 0);
+		std::atomic<bool> stopped{false};
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		on_network(*ses, [&stopped, t](aux::session_impl& s)
+		{
+			s.disk_thread().async_stop_torrent(t->storage(), [&stopped] { stopped = true; });
+			s.disk_thread().submit_jobs();
+		});
+		std::vector<char> const bad = corrupt_piece(content, p0, 1);
+		th.add_piece(p0, bad.data());
+		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		// the step's writes are held
+		TEST_CHECK(!stopped);
+
+		set_hold_writes(false);
+		TEST_CHECK(wait_for([&stopped] { return stopped.load(); }));
+		TEST_CHECK(hash_failed(*ses, p0));
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, p1));
+		TEST_EQUAL(pool->persist_failures(th), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
+
+// property 10: filter_resume() drops a piece that is not in the file. The
+// race: resume data saved while the piece was in memory, then the piece is
+// forgotten. And the path file -> forgotten -> in memory again: the resume
+// data saved last names the piece, which is in memory only
+TORRENT_TEST(filter_resume_race)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("filter_resume_race");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		add_torrent_params rd = save_resume(*ses, th);
+		TEST_CHECK(has(rd, p));
+		TEST_EQUAL(pool->forget_piece(th, p).code, 0);
+		pool->filter_resume(th, rd);
+		TEST_CHECK(!has(rd, p));
+
+		// piece 3 goes to the file, is forgotten, and comes back in memory
+		piece_index_t const q{3};
+		pool->set_policy(th, 1, memory_policy::file);
+		TEST_CHECK(add_pieces(*ses, th, content, {q}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, q); }));
+		add_torrent_params in_the_file = save_resume(*ses, th);
+		pool->filter_resume(th, in_the_file);
+		TEST_CHECK(has(in_the_file, q));
+
+		pool->set_policy(th, 1, memory_policy::memory);
+		memory_forget_result const fq = pool->forget_piece(th, q);
+		TEST_EQUAL(fq.code, 0);
+		TEST_CHECK(fq.place == piece_place::file);
+		TEST_CHECK(add_pieces(*ses, th, content, {q}));
+		TEST_CHECK(reads(*pool, th, content, q));
+		add_torrent_params again = save_resume(*ses, th);
+		TEST_CHECK(has(again, q));
+		pool->filter_resume(th, again);
+		TEST_CHECK(!has(again, q));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// property 11: a claim for the file moves a partial piece: its blocks in
+// memory are written to the file (and leave memory), and its later blocks
+// go to the file too. Once all are there the piece is "in file".
+//
+// The move writes the blocks of the partial piece with flush_piece.
+// pread_disk_io's invariant check (disk_cache.cpp, check_invariant, in
+// builds with invariant checks) wants every block of a piece flagged for
+// flushing to be written, flushed or hashed, which a partial piece is not
+// (open): the test runs in builds without invariant checks
+#if !TORRENT_USE_INVARIANT_CHECKS
+TORRENT_TEST(policy_file_migrates_partial)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("policy_file_partial");
+	auto const pool = make_pool(memory_policy::memory);
+	piece_index_t const p{3};
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+
+		// blocks [first, last) of the piece, through the session's
+		// disk_interface (libtorrent does not know them)
+		auto const write_blocks = [&](int const first, int const last, disk_job_flags_t const flags)
+		{
+			auto done = std::make_shared<answers>();
+			on_network(*ses, [&](aux::session_impl& s)
+			{
+				for (int b = first; b < last; ++b)
+				{
+					peer_request const r{p, b * default_block_size, default_block_size};
+					s.disk_thread().async_write(t->storage(), r
+						, piece_ptr(content, p) + std::size_t(b) * default_block_size, {}
+						, [done](storage_error const& e) { TEST_CHECK(!e); (*done)(e); }, flags);
+				}
+				s.disk_thread().submit_jobs();
+			});
+			TEST_CHECK(wait_for([&] { return done->answered == last - first; }));
+		};
+
+		write_blocks(0, 2, {});
+		TEST_CHECK(pool->in_memory(th).partial.get_bit(p));
+		TEST_EQUAL(pool->held_bytes(th).partial, 2 * default_block_size);
+
+		pool->set_policy(th, 1, memory_policy::file);
+		TEST_EQUAL(pool->pending_persist_bytes(th), 2 * default_block_size);
+		// the rest of the piece, after the move's step (the network thread
+		// runs the move first). pread_disk_io flushes the blocks of a
+		// partial piece when a thread of its wakes up (the piece completes,
+		// the cache is full, a fence), not when they come, flush_piece or
+		// not: the move's writes are answered then
+		write_blocks(2, 4, {});
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_EQUAL(read_code(*pool, th, p), memory_storage_pool::not_in_memory);
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, p); }));
+		TEST_EQUAL(pool->held_bytes(), 0);
+		TEST_CHECK(wait_for([&] { return access::blocks_in_use(*pool) == 0; }));
+
+		std::vector<char> const b = read_file(combine_path(path, combine_path("unregistered", "b")));
+		std::size_t const at = std::size_t(3 * piece_size - file_a);
+		TEST_CHECK(b.size() >= at + std::size_t(piece_size));
+		if (b.size() >= at + std::size_t(piece_size))
+			TEST_CHECK(std::equal(b.begin() + std::ptrdiff_t(at), b.begin() + std::ptrdiff_t(at + piece_size)
+				, piece_ptr(content, p)));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
+
+// property 12: pending_persist_bytes() counts the bytes in memory only. A
+// paused torrent with a persist set of four pieces, two of them held:
+// once those two are moved it is 0, though the other two never arrive
+TORRENT_TEST(pending_zero_when_paused)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("pending_paused");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}, piece_index_t{2}}));
+		th.pause();
+		TEST_CHECK(wait_for([&] { return bool(th.flags() & torrent_flags::paused); }));
+
+		piece_index_t const set[] = {piece_index_t{0}, piece_index_t{2}, piece_index_t{3}, piece_index_t{4}};
+		pool->set_persist(th, 1, set);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, piece_index_t{0}));
+		TEST_CHECK(in_file(*ses, th, piece_index_t{2}));
+		TEST_EQUAL(pool->held_bytes(), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// pending_persist_bytes() grows in the call that asks for the move, before
+// the network thread runs it: here the network thread is busy
+TORRENT_TEST(pending_counted_in_the_call)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("pending_in_call");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{2};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		std::shared_ptr<aux::session_impl> const s = ses->native_handle();
+		std::promise<void> go;
+		std::shared_future<void> const busy = go.get_future().share();
+		std::promise<void> entered;
+		boost::asio::post(s->get_context(), [&entered, busy]
+		{
+			entered.set_value();
+			busy.wait();
+		});
+		entered.get_future().wait();
+
+		piece_index_t const set[] = {p};
+		pool->set_persist(th, 1, set);
+		TEST_EQUAL(pool->pending_persist_bytes(th), piece_size);
+		go.set_value();
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, p));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// the pool outlives the session: resume data saved before, filtered after,
+// by the info-hashes against what the pool keeps of the removed storage.
+// Calls by handle answer not_managed. forget_record() drops the record
+TORRENT_TEST(pool_outlives_session)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("pool_outlives");
+	auto const pool = make_pool(memory_policy::memory);
+	add_torrent_params rd;
+	torrent_handle th;
+	piece_index_t const mem{0};
+	piece_index_t const file{2};
+	{
+		auto ses = make_session(pool);
+		th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const set[] = {file};
+		pool->set_persist(th, 1, set);
+		TEST_CHECK(add_pieces(*ses, th, content, {mem, file}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, file); }));
+		rd = save_resume(*ses, th);
+		TEST_CHECK(has(rd, mem));
+		TEST_CHECK(has(rd, file));
+	}
+	TEST_EQUAL(access::residues(*pool), 1);
+
+	add_torrent_params by_hash = rd;
+	pool->filter_resume(by_hash);
+	TEST_CHECK(!has(by_hash, mem));
+	TEST_CHECK(has(by_hash, file));
+	add_torrent_params by_handle = rd;
+	pool->filter_resume(th, by_handle);
+	TEST_CHECK(by_handle.have_pieces == by_hash.have_pieces);
+
+	TEST_EQUAL(read_code(*pool, th, mem), memory_storage_pool::not_managed);
+	TEST_EQUAL(pool->pending_persist_bytes(th), memory_storage_pool::not_managed);
+	TEST_EQUAL(pool->persist_failures(th), memory_storage_pool::not_managed);
+	TEST_EQUAL(pool->held_bytes(th).complete, memory_storage_pool::not_managed);
+	TEST_EQUAL(pool->forget_piece(th, mem).code, memory_storage_pool::not_managed);
+
+	pool->forget_record(rd.info_hashes);
+	TEST_EQUAL(access::residues(*pool), 0);
+	add_torrent_params unknown = rd;
+	pool->filter_resume(unknown);
+	TEST_CHECK(unknown.have_pieces == rd.have_pieces);
+	TEST_EQUAL(access::blocks_in_use(*pool), 0);
+	error_code ec;
+	remove_all(path, ec);
+}
+
+namespace {
+
+int const e2e_piece_size = piece_size;
+int const e2e_pieces = 9; // setup_transfer's torrent
+
+// a seeder session and one on the pool, the torrent of setup_transfer() in
+// both (the files of the seeder in "tmp1<suffix>", of the other one in
+// "tmp2<suffix>"). Before the peers connect, `before` runs with the
+// handle of the downloader
+struct e2e
+{
+	lt::session seeder;
+	std::unique_ptr<lt::session> ses;
+	torrent_handle th;
+	std::vector<char> content;
+
+	e2e(std::shared_ptr<memory_storage_pool> const& pool, std::string const& suffix
+		, std::function<void(torrent_handle const&)> const& before)
+		: seeder(session_settings())
+		, ses(make_session(pool))
+	{
+		error_code ec;
+		remove_all("tmp1" + suffix, ec);
+		remove_all("tmp2" + suffix, ec);
+		torrent_handle seed;
+		std::tie(seed, th, std::ignore) = setup_transfer(&seeder, ses.get(), nullptr
+			, true, false, false, suffix, e2e_piece_size);
+		content = read_file(combine_path("tmp1" + suffix, "temporary"));
+		TEST_EQUAL(int(content.size()), e2e_pieces * e2e_piece_size);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		if (before) before(th);
+		seed.connect_peer(tcp::endpoint(make_address("127.0.0.1"), std::uint16_t(ses->listen_port())));
+	}
+
+	// sanitizer builds are slow
+	bool finished() const
+	{
+		bool const ret = wait_for_ms(90000, [this] { return th.status().is_finished; });
+		if (!ret)
+		{
+			torrent_status const st = th.status();
+			std::printf("not finished: pieces %d peers %d state %d rate %d\n"
+				, st.num_pieces, st.num_peers, int(st.state), st.download_rate);
+		}
+		return ret;
+	}
+};
+
+// the blocks the file takes on disk, -1 if it does not exist
+long long disk_blocks(std::string const& file)
+{
+	struct stat st{};
+	if (::stat(file.c_str(), &st) != 0) return -1;
+	return static_cast<long long>(st.st_blocks);
+}
+
+} // anonymous namespace
+
+// end to end: a torrent in memory is downloaded from a local peer. The
+// pool reads it back, and its file takes no block on disk
+TORRENT_TEST(e2e_download_in_memory)
+{
+	std::string const suffix = "_e2e_memory";
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		e2e t(pool, suffix, {});
+		TEST_CHECK(t.finished());
+		for (int i = 0; i < e2e_pieces; ++i)
+			TEST_CHECK(reads(*pool, t.th, t.content, piece_index_t{i}));
+		TEST_EQUAL(pool->held_bytes(), std::int64_t(e2e_pieces) * e2e_piece_size);
+		long long const blocks = disk_blocks(combine_path("tmp2" + suffix, "temporary"));
+		TEST_CHECK(blocks <= 0);
+	}
+	error_code ec;
+	remove_all("tmp1" + suffix, ec);
+	remove_all("tmp2" + suffix, ec);
+}
+
+namespace {
+std::vector<piece_index_t> const e2e_set{piece_index_t{1}, piece_index_t{4}, piece_index_t{8}};
+
+bool in_set(piece_index_t const p)
+{
+	return std::find(e2e_set.begin(), e2e_set.end(), p) != e2e_set.end();
+}
+}
+
+// end to end: the persist set is in the file, the rest only in memory
+TORRENT_TEST(e2e_persist_set_on_disk)
+{
+	std::string const suffix = "_e2e_persist";
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		e2e t(pool, suffix, [&pool](torrent_handle const& th) { pool->set_persist(th, 1, e2e_set); });
+		TEST_CHECK(t.finished());
+		for (auto const p : e2e_set) TEST_CHECK(wait_for([&] { return in_file(*t.ses, t.th, p); }));
+		std::vector<char> const f = read_file(combine_path("tmp2" + suffix, "temporary"));
+		for (int i = 0; i < e2e_pieces; ++i)
+		{
+			piece_index_t const p{i};
+			std::size_t const at = std::size_t(i) * e2e_piece_size;
+			bool const on_disk = f.size() >= at + std::size_t(e2e_piece_size)
+				&& std::equal(f.begin() + std::ptrdiff_t(at), f.begin() + std::ptrdiff_t(at + e2e_piece_size)
+					, t.content.begin() + std::ptrdiff_t(at));
+			TEST_EQUAL(on_disk, in_set(p));
+			if (in_set(p)) TEST_EQUAL(read_code(*pool, t.th, p), memory_storage_pool::not_in_memory);
+			else TEST_CHECK(reads(*pool, t.th, t.content, p));
+		}
+	}
+	error_code ec;
+	remove_all("tmp1" + suffix, ec);
+	remove_all("tmp2" + suffix, ec);
+}
+
+// end to end: the filtered resume data of a torrent with a persist set,
+// added to a new session: the torrent has exactly the pieces in the file.
+// The check of that resume data makes them "in file" in the new pool
+TORRENT_TEST(e2e_restart_with_filtered_resume)
+{
+	std::string const suffix = "_e2e_restart";
+	auto const pool = make_pool(memory_policy::memory);
+	add_torrent_params rd;
+	std::vector<char> content;
+	{
+		e2e t(pool, suffix, [&pool](torrent_handle const& th) { pool->set_persist(th, 1, e2e_set); });
+		TEST_CHECK(t.finished());
+		for (auto const p : e2e_set) TEST_CHECK(wait_for([&] { return in_file(*t.ses, t.th, p); }));
+		rd = save_resume(*t.ses, t.th);
+		TEST_EQUAL(rd.have_pieces.count(), e2e_pieces);
+		pool->filter_resume(t.th, rd);
+		rd.ti = std::make_shared<torrent_info>(*t.th.torrent_file());
+		content = t.content;
+	}
+	TEST_EQUAL(rd.have_pieces.count(), int(e2e_set.size()));
+
+	auto const pool2 = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool2);
+		rd.save_path = "tmp2" + suffix;
+		rd.flags &= ~torrent_flags::auto_managed;
+		rd.flags &= ~torrent_flags::paused;
+		torrent_handle const th = ses->add_torrent(rd);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		for (int i = 0; i < e2e_pieces; ++i)
+			TEST_EQUAL(th.have_piece(piece_index_t{i}), in_set(piece_index_t{i}));
+		add_torrent_params again = save_resume(*ses, th);
+		pool2->filter_resume(th, again);
+		TEST_EQUAL(again.have_pieces.count(), int(e2e_set.size()));
+		for (auto const p : e2e_set) TEST_CHECK(has(again, p));
+	}
+	error_code ec;
+	remove_all("tmp1" + suffix, ec);
+	remove_all("tmp2" + suffix, ec);
 }

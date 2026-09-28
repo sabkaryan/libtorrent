@@ -10,6 +10,8 @@ see LICENSE file.
 #include "libtorrent/config.hpp"
 #include "libtorrent/memory_disk_io.hpp"
 #include "libtorrent/disk_interface.hpp"
+#include "libtorrent/disk_observer.hpp"
+#include "libtorrent/add_torrent_params.hpp"
 #include "libtorrent/session.hpp" // for default_disk_io_constructor
 #include "libtorrent/peer_request.hpp"
 #include "libtorrent/storage_defs.hpp"
@@ -35,6 +37,8 @@ see LICENSE file.
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -82,6 +86,30 @@ namespace {
 	// its handler is posted and the parked jobs run in posting order, on the
 	// network thread, in one pass that no new call can enter; a parked fence
 	// is raised again and ends the pass.
+	//
+	// Transfers. A pool call whose claims send a piece held in memory to the
+	// file gives it place transfer and posts it here. On the network thread
+	// each piece is one step that cannot be split: a complete piece hands
+	// every non-pad block to the default backend's async_write and at once
+	// asks its async_hash, as the torrent does, so the default backend's
+	// cache entry of the piece gets its hash returned; the pool hashes the
+	// entry too. The piece goes to the file (and its memory is freed) once
+	// every handler answered, the two hashes are equal and its entry is
+	// still current; otherwise it stays in memory, a failure. A partial
+	// piece hands its blocks with flush_piece; its later blocks go to the
+	// default backend and its memory is freed by the write handlers. A step
+	// is one of our jobs a fence waits for; a step whose write returned
+	// true (the default backend's queue is full) makes the next piece wait
+	// for its disk_observer. Transfers asked for while a fence is up start
+	// in the pass that lowers it, after the parked jobs.
+	//
+	// The tail of a transfer. Until every handler of a complete piece's
+	// step answered (among them the default backend's async_hash, which
+	// marks its cache entry hashed), every job of the piece bound for the
+	// default backend, of any generation, waits parked in posting order on
+	// the piece: a write there would land in the transfer's cache entry,
+	// and a hash would answer its hash. A fence that comes while jobs wait
+	// there waits behind them.
 	struct memory_disk_io final : disk_interface
 	{
 		memory_disk_io(io_context& ioc, settings_interface const& sett, counters& cnt
@@ -115,6 +143,7 @@ namespace {
 			auto rec = std::make_shared<storage_record>();
 			rec->inner = m_inner->new_torrent(params, torrent);
 			rec->own_jobs_of_piece.resize(params.files.num_pieces(), 0);
+			rec->observer = std::make_shared<transfer_observer>(*this, rec);
 			// every info-hash of the torrent: storage_params::info_hash is
 			// only the best one (the truncated v2 of a hybrid torrent), while
 			// a registration may name its v1. The torrent object is the
@@ -130,7 +159,10 @@ namespace {
 				rec->storage = std::make_shared<memory_storage>(params.files
 					, params.v1, params.v2, m_pool->alloc, &m_pool->mutex);
 				rec->storage->set_torrent_policy(m_pool->policy_for(ih, params.info_hash));
-				m_pool->storages.push_back({torrent, ih, rec->storage});
+				m_pool->storages.push_back({torrent, ih, rec->storage
+					, [this, w = std::weak_ptr<storage_record>(rec)]
+					(std::vector<std::shared_ptr<memory_piece_entry>> entries)
+					{ post_transfers(w, std::move(entries)); }});
 				m_pool->apply_pending(torrent, *rec->storage);
 			}
 			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
@@ -153,6 +185,9 @@ namespace {
 			TORRENT_ASSERT(m_torrents[idx]);
 			std::shared_ptr<storage_record> const rec = std::move(m_torrents[idx]);
 			rec->removed = true;
+			// the jobs waiting on the tail of a transfer answer
+			// operation_aborted now
+			abort_tails(*rec);
 			// the default backend is never called with the pool's mutex held
 			rec->inner.reset();
 			// the torrent object, released after the mutex
@@ -166,12 +201,18 @@ namespace {
 				auto& storages = m_pool->storages;
 				auto const it = std::find_if(storages.begin(), storages.end()
 					, [&rec](memory_pool_impl::storage_ref const& r) { return r.storage == rec->storage; });
+				memory_storage& s = *rec->storage;
 				if (it != storages.end())
 				{
 					torrent = it->torrent.lock();
+					// the "in file" flags outlive the storage, for
+					// filter_resume()
+					m_pool->add_residue(it->info_hashes, s);
 					storages.erase(it);
 				}
-				memory_storage& s = *rec->storage;
+				// the transfers not started are dropped
+				rec->transfers.clear();
+				rec->fence.deferred_transfers.clear();
 				s.retire_all();
 				s.mark_removed();
 				m_pool->spilled_of_removed += s.spilled_pieces();
@@ -183,6 +224,13 @@ namespace {
 				rec->storage.reset();
 			}
 			m_free_slots.add(idx);
+			// a fence that waited for the tail is raised now (the storage is
+			// removed: the jobs behind it answer operation_aborted)
+			if (rec->fence.waits_tail)
+			{
+				rec->fence.waits_tail = false;
+				resume(rec);
+			}
 		}
 
 		void async_read(storage_index_t const storage, peer_request const& r
@@ -298,9 +346,17 @@ namespace {
 					answer_now(*rec, [h] { h(disk_status::fatal_disk_error, aborted()); });
 					return;
 				}
+				// the pieces the resume data names: "in file" once the check
+				// accepted it
+				typed_bitfield<piece_index_t> have;
+				if (resume_data != nullptr) have = resume_data->have_pieces;
 				m_inner->async_check_files(to_inner(*rec), resume_data, links
-					, [this, rec, h](status_t const st, storage_error const& e)
-					{ inner_answered(rec, [h, st, e] { h(st, e); }); });
+					, [this, rec, h, have = std::move(have)](status_t const st, storage_error const& e)
+					{
+						if (!e && !(st & (disk_status::fatal_disk_error | disk_status::need_full_check)))
+							checked(*rec, have);
+						inner_answered(rec, [h, st, e] { h(st, e); });
+					});
 			});
 		}
 
@@ -424,9 +480,28 @@ namespace {
 			return m_inner->get_status(inner_index(storage));
 		}
 
-		// the hash jobs not started answer operation_aborted first
+		// the jobs waiting on the tail of a transfer and the hash jobs not
+		// started answer operation_aborted first. No transfer starts any
+		// more
 		void abort(bool const wait) override
 		{
+			m_abort = true;
+			for (auto const idx : m_torrents.range())
+			{
+				std::shared_ptr<storage_record> const& rec = m_torrents[idx];
+				if (!rec) continue;
+				abort_tails(*rec);
+				{
+					std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+					rec->transfers.clear();
+					rec->fence.deferred_transfers.clear();
+				}
+				if (rec->fence.waits_tail)
+				{
+					rec->fence.waits_tail = false;
+					resume(rec);
+				}
+			}
 			m_hasher.abort(wait);
 			m_inner->abort(wait);
 		}
@@ -468,6 +543,26 @@ namespace {
 			return m_pool->alloc.blocks_in_use();
 		}
 
+		void set_persist(storage_index_t const storage, span<piece_index_t const> const pieces)
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			auto const& st = m_torrents[storage]->storage;
+			for (auto const& r : m_pool->storages)
+			{
+				if (r.storage != st) continue;
+				r.storage->set_claim_persist(1, pieces);
+				m_pool->request_transfers(r);
+			}
+		}
+
+		void forget(storage_index_t const storage, piece_index_t const piece)
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			memory_storage& s = *m_torrents[storage]->storage;
+			s.retire(piece);
+			s.set_in_file(piece, false);
+		}
+
 	private:
 
 		// the fences of one storage. Used on the network thread only
@@ -482,8 +577,12 @@ namespace {
 			std::deque<std::function<void()>> parked;
 			// transfers to the file asked for while a fence was up. They
 			// start in the pass that lowers the fence, after the parked jobs.
-			// Nothing defers one yet
+			// Dropped under the pool's mutex
 			std::vector<std::shared_ptr<memory_piece_entry>> deferred_transfers;
+			// the fence at the front of `parked` waits for jobs parked on the
+			// tail of a transfer (they came before it) to be handed to the
+			// default backend
+			bool waits_tail = false;
 
 			// the fence that is up: the piece of an async_clear_piece
 			// (all_pieces for the other fences), whether the default backend
@@ -511,6 +610,58 @@ namespace {
 			aux::vector<int, piece_index_t> own_jobs_of_piece;
 			// remove_torrent() was called: inner and storage are reset
 			bool removed = false;
+
+			// entries in transfer waiting for their step, in order. Dropped
+			// under the pool's mutex
+			std::deque<std::shared_ptr<memory_piece_entry>> transfers;
+			// a write of the last step returned true: the next step waits for
+			// the observer
+			bool transfer_waits = false;
+			// the disk_observer the steps pass to the default backend
+			std::shared_ptr<disk_observer> observer;
+			// the tails of the transfers of complete pieces: the steps whose
+			// handlers have not all answered, and the jobs of the piece bound
+			// for the default backend that wait for them, in posting order.
+			// A parked job is called with true to answer operation_aborted
+			struct piece_tail
+			{
+				int steps = 0;
+				std::deque<std::function<void(bool)>> parked;
+			};
+			std::map<piece_index_t, piece_tail> tails;
+		};
+
+		// wakes the transfers of a storage when the default backend's queue
+		// has room again. Called on the network thread
+		struct transfer_observer final : disk_observer
+		{
+			transfer_observer(memory_disk_io& io, std::weak_ptr<storage_record> rec)
+				: m_io(io), m_rec(std::move(rec))
+			{}
+			void on_disk() override
+			{
+				if (auto const rec = m_rec.lock()) m_io.observer_notified(rec);
+			}
+		private:
+			memory_disk_io& m_io;
+			std::weak_ptr<storage_record> const m_rec;
+		};
+
+		// one step of a transfer, until every handler answered
+		struct transfer_step
+		{
+			// the entry moved, pinned
+			std::shared_ptr<memory_entry_ref> ref;
+			piece_index_t piece{0};
+			bool partial = false;
+			// handlers not answered yet
+			int outstanding = 0;
+			bool failed = false;
+			// the hashes of the default backend and of the pool
+			sha1_hash inner_hash;
+			sha1_hash pool_hash;
+			std::vector<sha256_hash> inner_v2;
+			std::vector<sha256_hash> pool_v2;
 		};
 
 		// the scope of a fence on the whole storage
@@ -539,11 +690,44 @@ namespace {
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
 			if (held_back(rec->fence))
 			{
-				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), piece
-					, start = std::move(start)] { raise_fence(w.lock(), piece, start); });
+				rec->fence.parked.emplace_back(parked_fence(rec, piece, std::move(start)));
+				return;
+			}
+			if (tail_blocks(*rec, piece))
+			{
+				rec->fence.parked.emplace_back(parked_fence(rec, piece, std::move(start)));
+				rec->fence.waits_tail = true;
 				return;
 			}
 			raise_fence(rec, piece, start);
+		}
+
+		// a fence parked on the storage. When its turn comes it is raised,
+		// unless jobs that came before it still wait on the tail of a
+		// transfer of its scope: it then waits for them at the front
+		std::function<void()> parked_fence(std::shared_ptr<storage_record> const& rec
+			, piece_index_t const piece, fence_start start)
+		{
+			return [this, w = std::weak_ptr<storage_record>(rec), piece, start = std::move(start)]
+			{
+				std::shared_ptr<storage_record> const r = w.lock();
+				if (!r->removed && tail_blocks(*r, piece))
+				{
+					r->fence.parked.push_front(parked_fence(r, piece, start));
+					r->fence.waits_tail = true;
+					return;
+				}
+				raise_fence(r, piece, start);
+			};
+		}
+
+		// jobs of the fence's scope (one piece or all_pieces) wait on the
+		// tail of a transfer
+		static bool tail_blocks(storage_record const& rec, piece_index_t const piece)
+		{
+			for (auto const& t : rec.tails)
+				if ((piece == all_pieces || t.first == piece) && !t.second.parked.empty()) return true;
+			return false;
 		}
 
 		void raise_fence(std::shared_ptr<storage_record> const& rec, piece_index_t const piece
@@ -611,15 +795,24 @@ namespace {
 			if (fs.resuming) return;
 			fs.resuming = true;
 			bool ran = false;
-			while (!fs.raised && !fs.parked.empty())
+			while (!fs.raised && !fs.waits_tail && !fs.parked.empty())
 			{
 				std::function<void()> job = std::move(fs.parked.front());
 				fs.parked.pop_front();
 				job();
 				ran = true;
 			}
+			// the transfers asked for while the fence was up start now, in
+			// this pass, after the parked jobs
+			if (!held_back(fs) && !fs.deferred_transfers.empty())
+			{
+				rec->transfers.insert(rec->transfers.begin()
+					, std::make_move_iterator(fs.deferred_transfers.begin())
+					, std::make_move_iterator(fs.deferred_transfers.end()));
+				fs.deferred_transfers.clear();
+				pump(rec);
+			}
 			fs.resuming = false;
-			TORRENT_ASSERT(fs.deferred_transfers.empty());
 			// the jobs the pass handed to the default backend
 			if (ran) m_inner->submit_jobs();
 		}
@@ -636,6 +829,366 @@ namespace {
 			--rec->own_jobs;
 			--rec->own_jobs_of_piece[piece];
 			lower_if_done(rec);
+		}
+
+		// the tail of a transfer of the piece, nullptr if it has none
+		static storage_record::piece_tail* tail_of(storage_record& rec, piece_index_t const piece)
+		{
+			auto const it = rec.tails.find(piece);
+			return it == rec.tails.end() ? nullptr : &it->second;
+		}
+
+		// the jobs waiting on the tails of transfers answer operation_aborted
+		void abort_tails(storage_record& rec)
+		{
+			auto tails = std::move(rec.tails);
+			rec.tails.clear();
+			for (auto& t : tails)
+				for (auto& job : t.second.parked) job(true);
+		}
+
+		// the jobs bound for the default backend. A job of a piece whose
+		// transfer has a tail waits on it (a write with a copy of its buffer)
+		void inner_read(std::shared_ptr<storage_record> const& rec, peer_request const& r
+			, std::function<void(disk_buffer_holder, storage_error const&)> handler
+			, disk_job_flags_t const flags)
+		{
+			if (auto* const t = tail_of(*rec, r.piece))
+			{
+				t->parked.emplace_back([this, rec, r, h = std::move(handler), flags](bool const abort)
+				{
+					if (abort || rec->removed)
+						post(m_ios, [h] { h(disk_buffer_holder(), aborted()); });
+					else
+						m_inner->async_read(static_cast<storage_index_t>(rec->inner), r, h, flags);
+				});
+				return;
+			}
+			m_inner->async_read(static_cast<storage_index_t>(rec->inner), r, std::move(handler), flags);
+		}
+
+		bool inner_write(std::shared_ptr<storage_record> const& rec, peer_request const& r
+			, char const* buf, std::shared_ptr<disk_observer> o
+			, std::function<void(storage_error const&)> handler
+			, disk_job_flags_t const flags)
+		{
+			if (auto* const t = tail_of(*rec, r.piece))
+			{
+				auto copy = std::make_shared<std::vector<char>>(buf, buf + std::max(0, r.length));
+				t->parked.emplace_back([this, rec, r, copy, o, h = std::move(handler), flags](bool const abort)
+				{
+					if (abort || rec->removed)
+						post(m_ios, [h] { h(aborted()); });
+					else
+						m_inner->async_write(static_cast<storage_index_t>(rec->inner), r, copy->data(), o, h, flags);
+				});
+				return false;
+			}
+			return m_inner->async_write(static_cast<storage_index_t>(rec->inner), r, buf
+				, std::move(o), std::move(handler), flags);
+		}
+
+		void inner_hash(std::shared_ptr<storage_record> const& rec, piece_index_t const piece
+			, span<sha256_hash> const v2, disk_job_flags_t const flags
+			, std::function<void(piece_index_t, sha1_hash const&, storage_error const&)> handler)
+		{
+			if (auto* const t = tail_of(*rec, piece))
+			{
+				t->parked.emplace_back([this, rec, piece, v2, flags, h = std::move(handler)](bool const abort)
+				{
+					if (abort || rec->removed)
+						post(m_ios, [h, piece] { h(piece, sha1_hash(), aborted()); });
+					else
+						m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags, h);
+				});
+				return;
+			}
+			m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags, std::move(handler));
+		}
+
+		void inner_hash2(std::shared_ptr<storage_record> const& rec, piece_index_t const piece
+			, int const offset, disk_job_flags_t const flags
+			, std::function<void(piece_index_t, sha256_hash const&, storage_error const&)> handler)
+		{
+			if (auto* const t = tail_of(*rec, piece))
+			{
+				t->parked.emplace_back([this, rec, piece, offset, flags, h = std::move(handler)](bool const abort)
+				{
+					if (abort || rec->removed)
+						post(m_ios, [h, piece] { h(piece, sha256_hash(), aborted()); });
+					else
+						m_inner->async_hash2(static_cast<storage_index_t>(rec->inner), piece, offset, flags, h);
+				});
+				return;
+			}
+			m_inner->async_hash2(static_cast<storage_index_t>(rec->inner), piece, offset, flags, std::move(handler));
+		}
+
+		// async_check_files accepted the resume data: the pieces it names
+		// that have no entry, or one in the file, are "in file"
+		void checked(storage_record const& rec, typed_bitfield<piece_index_t> const& have)
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			if (rec.removed) return;
+			memory_storage& s = *rec.storage;
+			for (auto const p : s.files().piece_range())
+			{
+				if (p >= have.end_index() || !have.get_bit(p)) continue;
+				auto const e = s.current(p);
+				if (!e || e->place == piece_place::file) s.set_in_file(p, true);
+			}
+		}
+
+		// called by a pool call, under the pool's mutex, on any thread: the
+		// entries go to the network thread, where they are queued for their
+		// steps. The storage is in the pool: this object and its io_context
+		// exist
+		void post_transfers(std::weak_ptr<storage_record> w
+			, std::vector<std::shared_ptr<memory_piece_entry>> entries)
+		{
+			std::vector<std::weak_ptr<memory_piece_entry>> weak(entries.begin(), entries.end());
+			post(m_ios, [this, w = std::move(w), weak = std::move(weak)]
+			{
+				std::shared_ptr<storage_record> const rec = w.lock();
+				if (!rec || rec->removed || m_abort) return;
+				{
+					std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+					for (auto const& we : weak)
+						if (auto e = we.lock()) rec->transfers.push_back(std::move(e));
+				}
+				pump(rec);
+			});
+		}
+
+		void observer_notified(std::shared_ptr<storage_record> const& rec)
+		{
+			if (!rec->transfer_waits) return;
+			rec->transfer_waits = false;
+			pump(rec);
+		}
+
+		// starts the steps of the queued transfers, until one has to wait
+		// for the default backend's queue. While the storage's jobs are held
+		// back by a fence they are deferred to the pass that lowers it
+		void pump(std::shared_ptr<storage_record> const& rec)
+		{
+			if (rec->removed || m_abort) return;
+			fence_state& fs = rec->fence;
+			if (held_back(fs))
+			{
+				for (auto& e : rec->transfers) fs.deferred_transfers.push_back(std::move(e));
+				rec->transfers.clear();
+				return;
+			}
+			bool issued = false;
+			while (!rec->transfer_waits && !rec->transfers.empty())
+				issued = start_step(rec) || issued;
+			if (issued) m_inner->submit_jobs();
+		}
+
+		// the step of the transfer at the front of the queue, in one pass of
+		// the network thread. Returns true if it handed jobs to the default
+		// backend
+		bool start_step(std::shared_ptr<storage_record> const& rec)
+		{
+			auto step = std::make_shared<transfer_step>();
+			std::shared_ptr<memory_entry_ref> pool_ref;
+			// the non-pad blocks held in memory: index and data
+			std::vector<std::pair<int, char const*>> blocks;
+			int piece_size = 0;
+			int blocks2 = 0;
+			bool v1 = false;
+			{
+				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+				// dropped under the mutex, at the end of this scope
+				std::shared_ptr<memory_piece_entry> e = std::move(rec->transfers.front());
+				rec->transfers.pop_front();
+				memory_storage& s = *rec->storage;
+				// forgotten, cleared or already moved since it was asked for
+				if (!s.is_current(*e) || e->place != piece_place::transfer || e->transfer_started)
+					return false;
+				piece_index_t const piece = e->piece;
+				if (auto* const t = tail_of(*rec, piece))
+				{
+					// the transfer of an earlier generation of the piece has a
+					// tail: this one's writes wait for it too
+					t->parked.emplace_back([this, rec, w = std::weak_ptr<memory_piece_entry>(e)](bool const abort)
+					{
+						if (abort || rec->removed) return;
+						{
+							std::lock_guard<memory_pool_mutex> ll(m_pool->mutex);
+							if (auto en = w.lock()) rec->transfers.push_front(std::move(en));
+						}
+					});
+					return false;
+				}
+				e->transfer_started = true;
+				e->partial_transfer = e->missing_blocks > 0;
+				step->piece = piece;
+				step->partial = e->partial_transfer;
+				v1 = s.v1();
+				piece_size = v1 ? s.files().piece_size(piece) : s.files().piece_size2(piece);
+				blocks2 = s.v2() ? s.files().blocks_in_piece2(piece) : 0;
+				int const n = s.blocks_in_piece(piece);
+				for (int b = 0; b < n; ++b)
+				{
+					if (s.is_pad_block(piece, b) || b * default_block_size >= piece_size) continue;
+					char const* const d = s.block_data(*e, b);
+					if (d == nullptr) continue;
+					if (step->partial && !s.hand_held_to_inner(*e, b)) continue;
+					blocks.emplace_back(b, d);
+				}
+				step->ref = std::make_shared<memory_entry_ref>(m_pool, rec->storage, e);
+				if (!step->partial) pool_ref = step->ref->another();
+			}
+
+			piece_index_t const piece = step->piece;
+			storage_index_t const inner = static_cast<storage_index_t>(rec->inner);
+			step->outstanding = int(blocks.size()) + (step->partial ? 0 : 2);
+			own_job_started(*rec, piece);
+			if (!step->partial) ++rec->tails[piece].steps;
+			if (step->outstanding == 0)
+			{
+				finish_step(rec, step);
+				return false;
+			}
+
+			// the default backend copies the block inside the call. A partial
+			// piece has no hash to wait for: its blocks are flushed at once
+			disk_job_flags_t const wflags = step->partial ? disk_interface::flush_piece : disk_job_flags_t{};
+			bool exceeded = false;
+			// "true" inside the piece does not stop the step: the default
+			// backend takes the block anyway, it is only a signal
+			for (auto const& [b, d] : blocks)
+			{
+				int const block = b;
+				peer_request const r{piece, block * default_block_size
+					, std::min(default_block_size, piece_size - block * default_block_size)};
+				exceeded = m_inner->async_write(inner, r, d, rec->observer
+					, [this, rec, step, block](storage_error const& err) { transfer_written(rec, step, block, err); }
+					, wflags) || exceeded;
+			}
+			if (!step->partial)
+			{
+				// the hash of a complete piece, as the torrent asks for it:
+				// the default backend's cache entry of the piece gets its hash
+				// returned. The pool hashes its entry to compare. flush_piece:
+				// the move is for the file, now. pread_disk_io wakes a thread
+				// to flush a piece hashed by a job (a v2 piece whose block
+				// hashes it has to compute) only for a job with that flag;
+				// without it the blocks wait for an unrelated flush
+				disk_job_flags_t const hflags = v1 ? disk_interface::v1_hash : disk_job_flags_t{};
+				step->inner_v2.resize(std::size_t(blocks2));
+				step->pool_v2.resize(std::size_t(blocks2));
+				m_inner->async_hash(inner, piece, step->inner_v2, hflags | disk_interface::flush_piece
+					, [this, rec, step](piece_index_t, sha1_hash const& h, storage_error const& err)
+					{
+						step->inner_hash = h;
+						step_answered(rec, step, err);
+					});
+				m_hasher.hash(std::move(pool_ref), step->pool_v2, hflags
+					, [this, rec, step](piece_index_t, sha1_hash const& h, storage_error const& err)
+					{
+						step->pool_hash = h;
+						step_answered(rec, step, err);
+					});
+			}
+			// the next piece waits until the default backend has room
+			if (exceeded) rec->transfer_waits = true;
+			return true;
+		}
+
+		// the default backend wrote a block of a step. A partial piece's
+		// block leaves memory now
+		void transfer_written(std::shared_ptr<storage_record> const& rec
+			, std::shared_ptr<transfer_step> const& step, int const block, storage_error const& err)
+		{
+			if (step->partial)
+			{
+				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+				if (!rec->removed)
+				{
+					memory_storage& s = *rec->storage;
+					memory_piece_entry& e = step->ref->entry();
+					if (s.is_current(e))
+					{
+						if (!err) s.inner_block_written(e);
+						s.drop_block(e, block);
+					}
+				}
+			}
+			step_answered(rec, step, err);
+		}
+
+		void step_answered(std::shared_ptr<storage_record> const& rec
+			, std::shared_ptr<transfer_step> const& step, storage_error const& err)
+		{
+			if (err) step->failed = true;
+			TORRENT_ASSERT(step->outstanding > 0);
+			if (--step->outstanding > 0) return;
+			finish_step(rec, step);
+		}
+
+		// every handler of the step answered. The result applies only to the
+		// step's own entry, and only while it is current. Then the jobs
+		// waiting on the tail go to the default backend, in order
+		void finish_step(std::shared_ptr<storage_record> const& rec
+			, std::shared_ptr<transfer_step> const& step)
+		{
+			piece_index_t const piece = step->piece;
+			{
+				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+				if (!rec->removed)
+				{
+					memory_storage& s = *rec->storage;
+					memory_piece_entry& e = step->ref->entry();
+					memory_piece_entry* const target = s.is_current(e) ? &e : nullptr;
+					if (target != nullptr && step->partial)
+					{
+						if (step->failed) s.add_persist_failure();
+						// its later blocks went to the file
+						target->place = piece_place::file;
+						target->transfer_started = false;
+						target->partial_transfer = false;
+						s.drop_blocks(*target);
+					}
+					else if (target != nullptr)
+					{
+						bool const same = step->inner_hash == step->pool_hash
+							&& step->inner_v2 == step->pool_v2;
+						if (!step->failed && same) s.transfer_done(*target);
+						else s.transfer_failed(*target);
+					}
+				}
+				// the pin goes under the mutex; a removed storage's torrent
+				// object, if this was its last pin, is released when the
+				// reference is destroyed, after the mutex
+				step->ref->release();
+			}
+			step->ref.reset();
+
+			if (!step->partial)
+			{
+				if (auto* const t = tail_of(*rec, piece))
+				{
+					if (--t->steps == 0)
+					{
+						auto parked = std::move(t->parked);
+						rec->tails.erase(piece);
+						for (auto& job : parked) job(false);
+						if (!parked.empty()) m_inner->submit_jobs();
+					}
+				}
+			}
+			own_job_done(rec, piece);
+			// a fence that waited for the tail
+			fence_state& fs = rec->fence;
+			if (fs.waits_tail && !fs.raised)
+			{
+				fs.waits_tail = false;
+				resume(rec);
+			}
+			pump(rec);
 		}
 
 		// a piece in memory is copied into a buffer of our own, on the
@@ -656,12 +1209,15 @@ namespace {
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage const& s = *rec->storage;
 				std::shared_ptr<memory_piece_entry> const e = s.current(r.piece);
-				in_memory = e && e->place == piece_place::memory;
+				// a piece in transfer is read from memory while its blocks are
+				// there; a partial one's later blocks are in the file
+				in_memory = e && (e->place == piece_place::memory
+					|| (e->place == piece_place::transfer && holds(s, *e, r)));
 				if (in_memory) buffer = read_block(s, *e, r, error);
 			}
 			if (!in_memory)
 			{
-				m_inner->async_read(static_cast<storage_index_t>(rec->inner), r, std::move(handler), flags);
+				inner_read(rec, r, std::move(handler), flags);
 				return;
 			}
 			post(m_ios, [h = std::move(handler), b = std::move(buffer), error]() mutable
@@ -712,15 +1268,22 @@ namespace {
 					e = s.start(r.piece, s.decide(r.piece, at_limit));
 					if (e->place == piece_place::memory) s.set_in_file(r.piece, false);
 				}
-				in_memory = e->place == piece_place::memory;
-				if (e->place == piece_place::file && s.hand_to_inner(*e, block))
+				// a piece in transfer takes writes into memory until its step
+				// is issued; after the step of a partial one, they go to the
+				// default backend, and a block the step handed over is there
+				bool const to_inner = e->place == piece_place::file
+					|| (e->place == piece_place::transfer && e->partial_transfer);
+				bool const handed = e->place == piece_place::transfer && e->partial_transfer
+					&& memory_storage::handed_to_inner(*e, block);
+				in_memory = !to_inner || handed;
+				if (to_inner && !handed && s.hand_to_inner(*e, block))
 				{
 					counted = e;
 					count_write = true;
 				}
-				if (in_memory && s.block_data(*e, block) != nullptr)
+				if (handed || (in_memory && s.block_data(*e, block) != nullptr))
 				{
-					// already held: keep the stored bytes
+					// already held, or handed over: keep the stored bytes
 				}
 				else if (in_memory)
 				{
@@ -750,9 +1313,7 @@ namespace {
 						h(err);
 					};
 				}
-				return m_inner->async_write(static_cast<storage_index_t>(rec->inner), r, buf
-					, std::move(o)
-					, std::move(handler), flags);
+				return inner_write(rec, r, buf, std::move(o), std::move(handler), flags);
 			}
 			if (kick) m_hasher.kick(std::move(kick));
 			post(m_ios, [h = std::move(handler), error] { h(error); });
@@ -794,10 +1355,11 @@ namespace {
 				had_entry = bool(e);
 				// a hash of a partial piece (a recheck) returns no hash of it,
 				// even if the missing blocks arrive before the answer
-				if (e && e->place == piece_place::file && e->missing_blocks == 0) file_entry = e;
+				if (e && (e->place == piece_place::file || e->place == piece_place::transfer)
+					&& e->missing_blocks == 0) file_entry = e;
 				retire_count = s.retire_count(piece);
 			}
-			m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags
+			inner_hash(rec, piece, v2, flags
 				, [pool = m_pool, rec, file_entry, had_entry, retire_count, h = std::move(handler)]
 				(piece_index_t const p, sha1_hash const& hash, storage_error const& err)
 				{
@@ -872,7 +1434,7 @@ namespace {
 					});
 				return;
 			}
-			m_inner->async_hash2(static_cast<storage_index_t>(rec->inner), piece, offset, flags, std::move(handler));
+			inner_hash2(rec, piece, offset, flags, std::move(handler));
 		}
 
 		// the index of the torrent's storage in the default backend
@@ -889,8 +1451,25 @@ namespace {
 		{
 			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 			std::shared_ptr<memory_piece_entry> e = rec.storage->current(piece);
-			if (!e || e->place != piece_place::memory) return {};
+			if (!e) return {};
+			// a piece in transfer is hashed in memory, unless it is a partial
+			// one whose step was issued: its blocks go to the file
+			bool const in_memory = e->place == piece_place::memory
+				|| (e->place == piece_place::transfer && !e->partial_transfer);
+			if (!in_memory) return {};
 			return std::make_shared<memory_entry_ref>(m_pool, rec.storage, std::move(e));
+		}
+
+		// every block r covers is held in memory (or lies in pad files). The
+		// caller holds the pool's mutex
+		static bool holds(memory_storage const& s, memory_piece_entry const& e, peer_request const& r)
+		{
+			if (r.length <= 0 || r.start < 0) return false;
+			int const first = r.start / default_block_size;
+			int const last = (r.start + r.length - 1) / default_block_size;
+			for (int b = first; b <= last; ++b)
+				if (s.block_data(e, b) == nullptr && !s.is_pad_block(e.piece, b)) return false;
+			return true;
 		}
 
 		// copies the bytes of r from the entry. A missing block that is not
@@ -946,6 +1525,8 @@ namespace {
 		storage_free_list m_free_slots;
 		read_buffer_allocator m_read_buffers;
 		memory_hasher m_hasher;
+		// abort() was called: no transfer starts any more
+		bool m_abort = false;
 	};
 
 namespace {
@@ -981,6 +1562,18 @@ namespace {
 	{
 		auto* const m = memory_disk_io_for_test(disk);
 		return m ? m->blocks_in_use() : 0;
+	}
+
+	void memory_set_persist_for_test(disk_interface& disk, storage_index_t const storage
+		, span<piece_index_t const> const pieces)
+	{
+		if (auto* const m = memory_disk_io_for_test(disk)) m->set_persist(storage, pieces);
+	}
+
+	void memory_forget_for_test(disk_interface& disk, storage_index_t const storage
+		, piece_index_t const piece)
+	{
+		if (auto* const m = memory_disk_io_for_test(disk)) m->forget(storage, piece);
 	}
 }
 

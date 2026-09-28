@@ -135,7 +135,9 @@ namespace libtorrent {
 
 		// the claim of one owner on a torrent, or on the given files of it
 		// (all files if empty). It replaces the owner's previous claim. It
-		// decides the place of pieces that start from now on
+		// decides the place of pieces that start from now on, and the pieces
+		// held in memory that it sends to the file, complete or partial, are
+		// moved there (see pending_persist_bytes())
 		void set_policy(torrent_handle const&, memory_owner_t, memory_policy, span<file_index_t const> files = {});
 
 		// the number of bytes the pool may hold, for all sessions. It is 0
@@ -147,19 +149,32 @@ namespace libtorrent {
 		// (retired_bytes()) are not counted against it
 		void set_limit(std::int64_t bytes);
 
-		// a one-shot request to store the given pieces in the file
+		// a one-shot request to store the given pieces in the file: a piece
+		// held in memory is moved there, a piece that has not started starts
+		// there. A piece leaves the request once it is in the file
 		void persist(torrent_handle const&, span<piece_index_t const>);
 
-		// replaces the set of pieces this owner wants stored in the file
+		// replaces the set of pieces this owner wants stored in the file. The
+		// set stays until the owner changes or drops it: a piece of it that is
+		// forgotten and downloaded again goes to the file again. Its pieces
+		// held in memory are moved to the file; pieces in the file or being
+		// moved are left alone
 		void set_persist(torrent_handle const&, memory_owner_t, span<piece_index_t const>);
 
 		// drops every claim of the owner on the torrent
 		void drop_owner(torrent_handle const&, memory_owner_t);
 
-		// bytes in memory that wait to be moved to the file
+		// bytes in memory that wait to be moved to the file (not_managed for
+		// a torrent without storage). The calls that move pieces
+		// (set_policy() by handle, persist(), set_persist()) count them
+		// before they return, and the moves run on the network thread
+		// without waiting: 0 right after such a call means nothing is to be
+		// moved. Pieces that have not arrived are not counted
 		std::int64_t pending_persist_bytes(torrent_handle const&) const;
 
-		// the number of moves to the file that failed
+		// the number of moves to the file that failed (a write error, or the
+		// hash of the default backend differs from the pool's): the piece
+		// stays in memory. not_managed for a torrent without storage
 		int persist_failures(torrent_handle const&) const;
 
 		// forgets the piece atomically: one task on the network thread of
@@ -209,12 +224,26 @@ namespace libtorrent {
 		// blocks that were missing when a piece held in memory was hashed
 		std::int64_t hash_missing_blocks() const;
 
-		// removes from the resume data the pieces that are not stored in
-		// the file
+		// removes from resume data the pieces that are not stored in the
+		// file. Apply it to the result of save_resume_data() before the
+		// resume data is written: after a restart the pool is empty, and
+		// resume data saved without it names pieces that were only in
+		// memory. A piece stays in have_pieces only if it is "in file" (all
+		// its blocks were written to the file by the default backend in this
+		// process, or the resume data it was added with named it), and in
+		// unfinished_pieces only if its current bytes go to the file.
+		//
+		// The first form uses the storage of the handle's torrent (by
+		// info-hash, as the second form, if it has none). The second one,
+		// for a torrent already removed, finds its storages by the
+		// info-hashes of the resume data, among the live ones and those the
+		// pool keeps of removed torrents: a piece stays only if every one of
+		// them has it. A torrent the pool does not know is left unchanged
 		void filter_resume(torrent_handle const&, add_torrent_params&) const;
 		void filter_resume(add_torrent_params&) const;
 
-		// drops what the pool keeps of a removed torrent
+		// drops what the pool keeps of removed torrents with these
+		// info-hashes (the v1 or the v2 one matches) for filter_resume()
 		void forget_record(info_hash_t const&);
 
 	private:

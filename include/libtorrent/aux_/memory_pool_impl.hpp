@@ -22,6 +22,7 @@ see LICENSE file.
 #include "libtorrent/info_hash.hpp"
 #include "libtorrent/storage_defs.hpp" // for storage_index_t
 #include "libtorrent/io_context.hpp"
+#include "libtorrent/bitfield.hpp"
 #include "libtorrent/aux_/memory_slab.hpp"
 
 #if TORRENT_USE_ASSERTS
@@ -32,6 +33,7 @@ see LICENSE file.
 namespace libtorrent::aux {
 
 	struct memory_storage;
+	struct memory_piece_entry;
 
 	// the mutex of a pool. A std::mutex that, in builds with asserts, also
 	// knows which thread holds it, so the code that frees blocks can assert
@@ -130,6 +132,12 @@ namespace libtorrent::aux {
 			// the info-hashes of the torrent when the storage was created
 			info_hash_t info_hashes;
 			std::shared_ptr<memory_storage> storage;
+			// moves the given entries (place transfer) to the file: posts
+			// them to the network thread of the memory_disk_io the storage
+			// belongs to, without waiting. Called with the mutex held: while
+			// the storage is in `storages`, that memory_disk_io and its
+			// io_context exist
+			std::function<void(std::vector<std::shared_ptr<memory_piece_entry>>)> transfer;
 		};
 
 		// the storages of every memory_disk_io of the pool. A storage is
@@ -164,6 +172,17 @@ namespace libtorrent::aux {
 		};
 		std::vector<pending_claims> pending;
 
+		// what the pool keeps of a removed storage, for filter_resume(): its
+		// info-hashes, its "in file" pieces and the pieces whose entry had
+		// place file. Dropped by forget_record() or with the pool
+		struct residue
+		{
+			info_hash_t info_hashes;
+			typed_bitfield<piece_index_t> in_file;
+			typed_bitfield<piece_index_t> file_place;
+		};
+		std::vector<residue> residues;
+
 		std::int64_t hash_missing_blocks = 0;
 
 		// the bytes held by the current entries of every storage. The
@@ -192,6 +211,16 @@ namespace libtorrent::aux {
 		// network thread, where the torrent is to be released (after the
 		// mutex). The caller holds mutex
 		std::pair<std::shared_ptr<void>, io_context*> release_retired(memory_storage const& s);
+		// the record of the storage created for the torrent object, nullptr
+		// if it has none. The caller holds mutex
+		storage_ref const* ref_of(std::shared_ptr<void> const& torrent) const;
+		// the claims of the storage changed: every piece held in memory
+		// whose wanted place is now the file gets place transfer (and counts
+		// in pending_persist_bytes() from now on), and is posted to the
+		// network thread to be moved. The caller holds mutex
+		void request_transfers(storage_ref const& r);
+		// the residue of a removed storage. The caller holds mutex
+		void add_residue(info_hash_t const& ih, memory_storage const& s);
 	};
 
 	// the test hooks of a memory_storage_pool
@@ -204,6 +233,8 @@ namespace libtorrent::aux {
 		static std::int64_t storages_retired_pinned(memory_storage_pool const& pool);
 		// torrents with claims waiting for their storage
 		static int pending_claims(memory_storage_pool const& pool);
+		// removed storages the pool keeps for filter_resume()
+		static int residues(memory_storage_pool const& pool);
 	};
 
 	// test hook: the place of the current entry of a piece of a storage of
@@ -218,6 +249,15 @@ namespace libtorrent::aux {
 	// test hook: the blocks the pool of ``disk`` has allocated, of every
 	// storage, current or retired
 	TORRENT_EXTRA_EXPORT int memory_blocks_in_use_for_test(disk_interface& disk);
+	// test hooks for a storage of ``disk`` made without a torrent object
+	// (no handle reaches it): the persist set of owner 1 becomes `pieces`,
+	// and its pieces held in memory are moved to the file, as by
+	// memory_storage_pool::set_persist(); the piece is forgotten, as by
+	// memory_storage_pool::forget_piece() when libtorrent answers 0
+	TORRENT_EXTRA_EXPORT void memory_set_persist_for_test(disk_interface& disk
+		, storage_index_t storage, span<piece_index_t const> pieces);
+	TORRENT_EXTRA_EXPORT void memory_forget_for_test(disk_interface& disk
+		, storage_index_t storage, piece_index_t piece);
 }
 
 #endif
