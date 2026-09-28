@@ -534,7 +534,10 @@ namespace {
 				memory_piece_entry& entry = ref->entry();
 				if (ref->storage().is_current(entry))
 				{
-					entry.hash_returned = true;
+					// the hash of the piece is returned only if no block was
+					// missing: a recheck of a partial piece does not make a
+					// later write start the piece over
+					if (missing_count == 0) entry.hash_returned = true;
 					ref->pool().hash_missing_blocks += missing_count;
 				}
 				ref->release();

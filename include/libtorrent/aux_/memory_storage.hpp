@@ -79,7 +79,9 @@ namespace libtorrent::aux {
 		int num_blocks = 0;
 		// non-pad blocks not received yet. 0 means the piece is complete
 		int missing_blocks = 0;
-		// an async_hash answered for this entry
+		// an async_hash answered for this entry with every block it hashed
+		// present (a hash with missing blocks, as in a recheck of a partial
+		// piece, does not set it)
 		bool hash_returned = false;
 		// jobs and client reads holding the entry. A retired entry is freed
 		// when this drops to 0

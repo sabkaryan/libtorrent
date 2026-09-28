@@ -189,8 +189,11 @@ struct disk_env
 			int const block = off / lt::default_block_size;
 			if (std::find(skip.begin(), skip.end(), block) != skip.end()) continue;
 			lt::peer_request const r{piece, off, std::min(lt::default_block_size, len - off)};
-			// as the tests of test_disk_io.cpp do: pread_disk_io flushes the
-			// piece once it is hashed
+			// flush_piece is set because pread_disk_io, on a v1+v2 torrent
+			// whose block ends in a pad file and with hashing_threads > 0,
+			// keeps that block cached without it, and a later hash2 of the
+			// block then reads it with the v2 length (open upstream issue).
+			// The memory path ignores the flag
 			bool const last = off + lt::default_block_size >= len;
 			disk->async_write(st, r, data.data() + off, {}
 				, [this](lt::storage_error const& e) { TEST_CHECK(!e); ++writes_done; }
@@ -213,6 +216,7 @@ struct disk_env
 		auto v2 = std::make_shared<std::vector<lt::sha256_hash>>(std::size_t(v2_blocks));
 		hash_result ret;
 		bool done = false;
+		// flush_piece: see write()
 		disk->async_hash(st, piece, *v2
 			, (v1 ? lt::disk_interface::v1_hash : lt::disk_job_flags_t{}) | lt::disk_interface::flush_piece
 			, [&ret, &done, v2](lt::piece_index_t, lt::sha1_hash const& h, lt::storage_error const& e)
@@ -580,7 +584,9 @@ TORRENT_TEST(missing_block_hashes_as_zero)
 // what force_recheck does to a piece that is half in memory: the check of
 // the files, then a hash of the piece. The hash answers without an error
 // (an error would pause the torrent) and does not match; the piece stays in
-// memory, and its next block is written there
+// memory, and its next block is written there. Then every block comes again,
+// out of order, some of them already held: the entry fills up (a block it
+// holds is kept, it does not start the piece over), and the hash is right
 TORRENT_TEST(recheck_partial_in_memory)
 {
 	lt::file_storage fs;
@@ -622,4 +628,36 @@ TORRENT_TEST(recheck_partial_in_memory)
 		, lt::peer_request{p, 2 * lt::default_block_size, lt::default_block_size}, error);
 	TEST_CHECK(!error);
 	TEST_CHECK(b == block2);
+
+	auto const write_block = [&](int const block)
+	{
+		std::vector<char> const bytes(data.begin() + block * lt::default_block_size
+			, data.begin() + (block + 1) * lt::default_block_size);
+		bool done = false;
+		mem.disk->async_write(ms, lt::peer_request{p, block * lt::default_block_size, lt::default_block_size}
+			, bytes.data(), {}, [&done](lt::storage_error const& e) { TEST_CHECK(!e); done = true; });
+		mem.disk->submit_jobs();
+		TEST_CHECK(mem.run_until([&] { return done; }));
+	};
+	// the peers send the blocks again, out of order: 0 (held), 1 (held),
+	// 3 (missing). A held block is kept, it does not start the piece over
+	for (int const block : {0, 1, 3}) write_block(block);
+	TEST_EQUAL(pool->held_bytes(), 4 * lt::default_block_size);
+	// the entry is complete now, but the hash answered for it (the recheck)
+	// had blocks missing: another copy of a held block is kept too
+	write_block(2);
+	TEST_EQUAL(pool->held_bytes(), 4 * lt::default_block_size);
+	// the hash is pread's, and nothing is missing
+	std::int64_t const missing_before = pool->hash_missing_blocks();
+	auto const full = mem.hash(ms, p, true, 0);
+
+	disk_env ref(lt::pread_disk_io_constructor, 1);
+	lt::storage_index_t const rs = ref.add(fs, "recheck_partial_pread", true, false);
+	ref.write(rs, p, data);
+	auto const rh = ref.hash(rs, p, true, 0);
+
+	TEST_CHECK(!full.error);
+	TEST_CHECK(full.v1 == rh.v1);
+	TEST_CHECK(full.v1 == sha1(data));
+	TEST_EQUAL(pool->hash_missing_blocks(), missing_before);
 }

@@ -74,6 +74,8 @@ namespace {
 			, m_settings(sett)
 			, m_pool(pool->m_impl)
 			, m_inner(default_disk_io_constructor(ioc, sett, cnt))
+			// hashing_threads threads of its own, in addition to the ones
+			// the default backend starts for the same setting
 			, m_hasher(ioc, sett.get_int(settings_pack::hashing_threads))
 		{}
 
@@ -155,9 +157,14 @@ namespace {
 		}
 
 		// a piece starts (its place is decided) at its first write, and
-		// again at a write of a block it already holds: a block is written
-		// once, so new bytes for a piece (it was forgotten and is downloaded
-		// again, or add_piece() overwrites it) go to a new entry
+		// again at a write into a complete entry whose hash was returned:
+		// the piece was forgotten and is downloaded again (or add_piece()
+		// overwrites it). A block is written once. A write of a block that
+		// any other entry held in memory already has keeps the stored
+		// bytes and succeeds: the torrent fixes a block's bytes, a wrong
+		// block fails the piece's hash, and async_clear_piece() starts the
+		// piece over. So blocks that arrive again after a recheck, in any
+		// order, fill the entry instead of dropping it
 		bool async_write(storage_index_t const storage, peer_request const& r
 			, char const* buf, std::shared_ptr<disk_observer> o
 			, std::function<void(storage_error const&)> handler
@@ -174,13 +181,17 @@ namespace {
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage& s = *rec.storage;
 				std::shared_ptr<memory_piece_entry> e = s.current(r.piece);
-				if (!e || (e->place == piece_place::memory && s.block_data(*e, block) != nullptr))
+				if (!e || (e->place == piece_place::memory && e->missing_blocks == 0 && e->hash_returned))
 				{
 					bool const at_limit = m_pool->held_bytes() >= m_pool->limit;
 					e = s.start(r.piece, s.decide(r.piece, at_limit));
 				}
 				in_memory = e->place == piece_place::memory;
-				if (in_memory)
+				if (in_memory && s.block_data(*e, block) != nullptr)
+				{
+					// already held: keep the stored bytes
+				}
+				else if (in_memory)
 				{
 					if (!s.write_block(*e, block, {buf, r.length}))
 					{
