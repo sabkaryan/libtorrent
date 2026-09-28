@@ -47,6 +47,7 @@ endforeach()
 target_link_libraries(test_forget_piece ${CMAKE_DL_LIBS})
 target_link_libraries(test_piece_flushed_alert ${CMAKE_DL_LIBS})
 target_link_libraries(test_memory_disk_io ${CMAKE_DL_LIBS})
+target_link_libraries(test_memory_session ${CMAKE_DL_LIBS})
 
 if (webtorrent AND TARGET test_rtc)
 	# torrent-rasterbar links datachannel-static privately when building

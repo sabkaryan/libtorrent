@@ -165,6 +165,8 @@ namespace {
 		TORRENT_ASSERT(m_pool->mutex.owned_by_this_thread());
 		if (!m_entry) return;
 		m_storage->unpin(m_entry);
+		if (m_storage->removed() && !m_storage->pinned())
+			m_keep_alive = m_pool->release_retired(*m_storage);
 		// either may be the last reference: the storage frees blocks when
 		// it goes, under the mutex the caller holds
 		m_entry.reset();
@@ -373,16 +375,20 @@ namespace {
 		if (j.kind == job_kind::hash2)
 		{
 			// a block hash needs no hold on the entry: the block is written
-			// once, and only the thread holding the entry writes the hashes
+			// once, and a block hash is stored only under the pool's mutex,
+			// only where there is none yet
 			int const block = j.offset / default_block_size;
 			sha256_hash result;
 			if (block < h.block_hashes.end_index()) result = h.block_hashes[block];
-			char const* data = result.is_all_zeros() ? s.block_data(e, block) : nullptr;
+			bool const known = !result.is_all_zeros();
+			char const* data = known ? nullptr : s.block_data(e, block);
+			bool const present = data != nullptr;
 			l.unlock();
+			// the test gate holds every async_hash2, computed or not
+			gate(piece, inline_call);
 			int missing = 0;
-			if (result.is_all_zeros())
+			if (!known)
 			{
-				gate(piece, inline_call);
 				int const size = h.piece_size2 > 0 ? h.piece_size2 : h.piece_size;
 				if (data == nullptr)
 				{
@@ -393,6 +399,21 @@ namespace {
 				g_tail_blocks.fetch_add(1, std::memory_order_relaxed);
 			}
 			record_answer_thread();
+			if (known || present)
+			{
+				// keep the hash of a present block, as a background hash
+				// would. Only in this job's entry, and only while it is
+				// current: an old generation never writes into a new one
+				l.lock();
+				memory_piece_entry* const target = s.is_current(e) ? &e : nullptr;
+				if (target != nullptr && target->hasher
+					&& block < target->hasher->block_hashes.end_index()
+					&& target->hasher->block_hashes[block].is_all_zeros())
+				{
+					target->hasher->block_hashes[block] = result;
+				}
+				l.unlock();
+			}
 			post(m_ios, [ref = std::move(j.ref), handler = std::move(j.handler2), piece, result, missing]
 			{
 				{

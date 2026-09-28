@@ -16,9 +16,19 @@ see LICENSE file.
 #include "libtorrent/assert.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace libtorrent::aux {
+
+namespace {
+	std::atomic<int> g_destroyed_pinned{0};
+}
+
+	int memory_storages_destroyed_pinned_for_test()
+	{
+		return g_destroyed_pinned.load(std::memory_order_relaxed);
+	}
 
 	memory_storage::memory_storage(file_storage const& fs, bool const v1, bool const v2
 		, memory_slab_allocator& alloc, memory_pool_mutex const* const mutex)
@@ -31,6 +41,7 @@ namespace libtorrent::aux {
 		, m_in_file(fs.num_pieces(), false)
 		, m_pad_pieces(fs.num_pieces(), false)
 		, m_one_shot(fs.num_pieces(), false)
+		, m_retire_count(piece_index_t{fs.num_pieces()}, 0)
 	{
 		for (auto const f : fs.file_range())
 		{
@@ -48,7 +59,9 @@ namespace libtorrent::aux {
 		// the owner keeps the storage alive until every pin on its entries
 		// is released: a job may read the blocks of a pinned entry without
 		// the pool's mutex. A retired entry leaves m_retired when its last
-		// pin goes, so a non-empty list means a pin outlived the storage
+		// pin goes, so a non-empty list means a pin outlived the storage.
+		// Counted too: with asserts off the breach would only leak
+		if (pinned()) g_destroyed_pinned.fetch_add(1, std::memory_order_relaxed);
 		TORRENT_ASSERT(m_retired.empty());
 		// the blocks go back to the allocator, which is not thread safe
 		TORRENT_ASSERT(locked());
@@ -60,6 +73,13 @@ namespace libtorrent::aux {
 			// with the allocator) rather than being freed under its reader
 			if (slot.current->pins == 0) free_blocks(*slot.current);
 		}
+	}
+
+	bool memory_storage::pinned() const
+	{
+		if (!m_retired.empty()) return true;
+		return std::any_of(m_pieces.begin(), m_pieces.end()
+			, [](piece_slot const& slot) { return slot.current && slot.current->pins > 0; });
 	}
 
 	bool memory_storage::locked() const
@@ -166,6 +186,7 @@ namespace libtorrent::aux {
 		piece_slot& slot = m_pieces[piece];
 		if (slot.current) retire_entry(std::move(slot.current));
 		slot.current.reset();
+		++m_retire_count[piece];
 	}
 
 	void memory_storage::retire_all()
@@ -175,6 +196,13 @@ namespace libtorrent::aux {
 			if (slot.current) retire_entry(std::move(slot.current));
 			slot.current.reset();
 		}
+		for (auto& c : m_retire_count) ++c;
+	}
+
+	std::uint32_t memory_storage::retire_count(piece_index_t const piece) const
+	{
+		TORRENT_ASSERT(valid(piece));
+		return valid(piece) ? m_retire_count[piece] : 0;
 	}
 
 	// e is no longer current. It moves out of the held bytes, and is freed now
@@ -286,6 +314,28 @@ namespace libtorrent::aux {
 	{
 		if (block < 0 || block >= e.blocks.end_index()) return nullptr;
 		return e.blocks[block];
+	}
+
+	bool memory_storage::hand_to_inner(memory_piece_entry& e, int const block)
+	{
+		TORRENT_ASSERT(is_current(e));
+		TORRENT_ASSERT(e.place == piece_place::file);
+		int const n = blocks_in_piece(e.piece);
+		if (!is_current(e) || block < 0 || block >= n) return false;
+		if (e.inner_blocks.empty()) e.inner_blocks.resize(static_cast<std::size_t>(n), false);
+		auto&& handed = e.inner_blocks[static_cast<std::size_t>(block)];
+		if (handed || is_pad_block(e.piece, block)) return false;
+		handed = true;
+		if (e.missing_blocks > 0) --e.missing_blocks;
+		return true;
+	}
+
+	void memory_storage::inner_block_written(memory_piece_entry& e)
+	{
+		TORRENT_ASSERT(is_current(e));
+		if (!is_current(e)) return;
+		++e.inner_written;
+		if (e.inner_written == required_blocks(e.piece)) m_in_file.set_bit(e.piece);
 	}
 
 	bool memory_storage::in_file(piece_index_t const piece) const

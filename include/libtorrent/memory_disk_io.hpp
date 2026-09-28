@@ -25,6 +25,7 @@ namespace libtorrent {
 	namespace aux {
 		struct memory_disk_io;
 		struct memory_pool_impl;
+		struct memory_pool_test_access;
 	}
 
 	// where the pieces of a torrent (or of the files a claim names) are meant
@@ -86,10 +87,21 @@ namespace libtorrent {
 
 	// the shared state of the in-memory disk backend and the calls of the
 	// client. The pool is created by the client and handed to
-	// memory_disk_io_constructor(); one pool may serve several sessions. All
-	// calls are safe from any thread. A call naming a torrent_handle whose
-	// torrent has no storage in the pool answers not_managed (or an empty
-	// result).
+	// memory_disk_io_constructor(); one pool may serve several sessions, and
+	// one torrent may live in two of them: each torrent object has its own
+	// storage. All calls are safe from any thread.
+	//
+	// A call naming a torrent_handle finds the storage of the handle's
+	// torrent object (torrent_handle::native_handle(), without the network
+	// thread). If it has none in the pool (removed, not added through a
+	// session of this pool, or an invalid handle) the call answers
+	// not_managed (or an empty result). A claim (set_policy() by handle,
+	// persist(), set_persist(), drop_owner()) for a torrent that has no
+	// storage yet, because it has no metadata, waits for it and applies
+	// once the storage is created.
+	//
+	// Only forget_piece() waits for the network thread; every other call
+	// works under the pool's mutex and returns at once.
 	struct TORRENT_EXPORT memory_storage_pool
 	{
 		// the construction parameters of the pool
@@ -122,11 +134,15 @@ namespace libtorrent {
 		void set_policy(info_hash_t const&, memory_policy);
 
 		// the claim of one owner on a torrent, or on the given files of it
-		// (all files if empty). It replaces the owner's previous claim
+		// (all files if empty). It replaces the owner's previous claim. It
+		// decides the place of pieces that start from now on
 		void set_policy(torrent_handle const&, memory_owner_t, memory_policy, span<file_index_t const> files = {});
 
 		// the number of bytes the pool may hold, for all sessions. It is 0
-		// until this is called: every piece goes to the file
+		// until this is called: every piece goes to the file. The limit is
+		// soft: it is checked when a piece starts, and a piece that starts
+		// while the pool holds at least the limit goes to the file (see
+		// spilled_pieces()). Lowering it drops nothing already held
 		void set_limit(std::int64_t bytes);
 
 		// a one-shot request to store the given pieces in the file
@@ -144,8 +160,26 @@ namespace libtorrent {
 		// the number of moves to the file that failed
 		int persist_failures(torrent_handle const&) const;
 
-		// calls torrent_handle::forget_piece() and, if it succeeds, drops the
-		// bytes the pool holds for the piece
+		// forgets the piece atomically: one task on the network thread of
+		// the handle's session calls torrent_handle::forget_piece() and, if
+		// it returns 0, drops the bytes the pool holds for the piece (freed
+		// once no disk job holds them) and the piece is not "in file" any
+		// more. Returns that code and the place the piece's bytes had.
+		//
+		// This call waits for the network thread, like the synchronous calls
+		// of torrent_handle. It must not be called from the network thread
+		// (an alert handler or an extension running there): it would wait
+		// for itself.
+		//
+		// With place == piece_place::file the caller may release the bytes
+		// in the file, with the limitation of torrent_handle::forget_piece():
+		// in a torrent with only v2 hashes added from a magnet link, code 0
+		// may come before all the piece's blocks are in the file.
+		//
+		// A plain torrent_handle::forget_piece() is safe for a piece in the
+		// file (the piece starts again when it is downloaded again), but
+		// leaves the bytes of a piece in memory held until it is written
+		// again
 		memory_forget_result forget_piece(torrent_handle const&, piece_index_t);
 
 		// copies bytes of a piece held in memory into the buffer. Returns the
@@ -155,15 +189,17 @@ namespace libtorrent {
 		// the pieces of the torrent held in memory
 		memory_pieces in_memory(torrent_handle const&) const;
 
-		// the bytes held in memory by one torrent, and by the whole pool
+		// the bytes held in memory by one torrent (both not_managed if it has
+		// no storage in the pool), and by the whole pool
 		memory_held held_bytes(torrent_handle const&) const;
 		std::int64_t held_bytes() const;
 
-		// bytes of forgotten pieces that are still in use by disk jobs
+		// bytes of forgotten pieces that are still in use by disk jobs, of
+		// removed torrents too
 		std::int64_t retired_bytes() const;
 
 		// pieces that were bound for memory and went to the file because the
-		// pool was at its limit
+		// pool was at its limit, of removed torrents too
 		std::int64_t spilled_pieces() const;
 
 		// blocks that were missing when a piece held in memory was hashed
@@ -179,6 +215,7 @@ namespace libtorrent {
 
 	private:
 		friend struct aux::memory_disk_io;
+		friend struct aux::memory_pool_test_access;
 		std::shared_ptr<aux::memory_pool_impl> m_impl;
 	};
 

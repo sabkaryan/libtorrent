@@ -23,6 +23,7 @@ see LICENSE file.
 #include "libtorrent/aux_/memory_pool_impl.hpp"
 #include "libtorrent/aux_/memory_storage.hpp"
 #include "libtorrent/aux_/storage_free_list.hpp"
+#include "libtorrent/aux_/torrent.hpp" // for info_hash()
 #include "libtorrent/aux_/vector.hpp"
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
@@ -105,18 +106,30 @@ namespace {
 		memory_disk_io(memory_disk_io const&) = delete;
 		memory_disk_io& operator=(memory_disk_io const&) = delete;
 
+		// the storage takes the policy of the registration matching the
+		// torrent, and the claims made by torrent_handle while the torrent
+		// had no storage (no metadata)
 		storage_holder new_torrent(storage_params const& params
 			, std::shared_ptr<void> const& torrent) override
 		{
 			auto rec = std::make_shared<storage_record>();
 			rec->inner = m_inner->new_torrent(params, torrent);
 			rec->own_jobs_of_piece.resize(params.files.num_pieces(), 0);
+			// every info-hash of the torrent: storage_params::info_hash is
+			// only the best one (the truncated v2 of a hybrid torrent), while
+			// a registration may name its v1. The torrent object is the
+			// session's aux::torrent (its only caller, on the network
+			// thread); tests that drive a disk_interface pass none
+			info_hash_t const ih = torrent
+				? static_cast<aux::torrent const*>(torrent.get())->info_hash()
+				: info_hash_t{};
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				rec->storage = std::make_shared<memory_storage>(params.files
 					, params.v1, params.v2, m_pool->alloc, &m_pool->mutex);
-				rec->storage->set_torrent_policy(m_pool->default_policy);
-				m_pool->storages.push_back({torrent.get(), rec->storage});
+				rec->storage->set_torrent_policy(m_pool->policy_for(ih, params.info_hash));
+				m_pool->storages.push_back({torrent, ih, rec->storage});
+				m_pool->apply_pending(torrent, *rec->storage);
 			}
 			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
 			if (idx == m_torrents.end_index())
@@ -127,7 +140,9 @@ namespace {
 		}
 
 		// the entries not pinned are freed now, a pinned one when its last
-		// pin goes (the job holding it keeps the storage alive). Jobs parked
+		// pin goes: the storage is then kept by the pool as retired, with
+		// the torrent object that owns its file_storage, until the last pin
+		// drops (memory_entry_ref::release()). Jobs parked
 		// behind a fence of the storage answer operation_aborted once the
 		// fence lowers (the fence itself answers as the default backend
 		// did); if it never lowers they are destroyed unanswered
@@ -138,6 +153,8 @@ namespace {
 			rec->removed = true;
 			// the default backend is never called with the pool's mutex held
 			rec->inner.reset();
+			// the torrent object, released after the mutex
+			std::shared_ptr<void> torrent;
 			{
 				// the storage frees its blocks into the pool's allocator: the
 				// last reference to it is dropped under the mutex. A hash job
@@ -145,10 +162,22 @@ namespace {
 				// completion drops it, also under the mutex
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				auto& storages = m_pool->storages;
-				storages.erase(std::remove_if(storages.begin(), storages.end()
-					, [&rec](memory_pool_impl::storage_ref const& r) { return r.storage == rec->storage; })
-					, storages.end());
-				rec->storage->retire_all();
+				auto const it = std::find_if(storages.begin(), storages.end()
+					, [&rec](memory_pool_impl::storage_ref const& r) { return r.storage == rec->storage; });
+				if (it != storages.end())
+				{
+					torrent = it->torrent.lock();
+					storages.erase(it);
+				}
+				memory_storage& s = *rec->storage;
+				s.retire_all();
+				s.mark_removed();
+				m_pool->spilled_of_removed += s.spilled_pieces();
+				if (s.pinned())
+				{
+					m_pool->retired.push_back({rec->storage, torrent});
+					++m_pool->storages_retired_pinned;
+				}
 				rec->storage.reset();
 			}
 			m_free_slots.add(idx);
@@ -638,9 +667,13 @@ namespace {
 		}
 
 		// a piece starts (its place is decided) at its first write, and
-		// again at a write into a complete entry whose hash was returned:
-		// the piece was forgotten and is downloaded again (or add_piece()
-		// overwrites it). A block is written once. A write of a block that
+		// again at a write into a complete entry whose hash was returned,
+		// in memory or in the file (restarts()): the piece was forgotten
+		// and is downloaded again (or add_piece() overwrites it). A piece
+		// that starts in memory is not "in file" any more. A block of a
+		// piece in the file is handed to the default backend, which counts
+		// it; once every non-pad block is written there, the piece is "in
+		// file". A block in memory is written once. A write of a block that
 		// any other entry held in memory already has keeps the stored
 		// bytes and succeeds: the torrent fixes a block's bytes, a wrong
 		// block fails the piece's hash, and async_clear_piece() starts the
@@ -662,16 +695,27 @@ namespace {
 			std::shared_ptr<memory_entry_ref> kick;
 			storage_error error;
 			bool in_memory = false;
+			// place file: the entry, when this is the first hand-over of the
+			// block (its write is counted when the default backend answers)
+			std::weak_ptr<memory_piece_entry> counted;
+			bool count_write = false;
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage& s = *rec->storage;
 				std::shared_ptr<memory_piece_entry> e = s.current(r.piece);
-				if (!e || (e->place == piece_place::memory && e->missing_blocks == 0 && e->hash_returned))
+				if (!e || restarts(*e))
 				{
+					// the limit is soft: it is checked only here
 					bool const at_limit = m_pool->held_bytes() >= m_pool->limit;
 					e = s.start(r.piece, s.decide(r.piece, at_limit));
+					if (e->place == piece_place::memory) s.set_in_file(r.piece, false);
 				}
 				in_memory = e->place == piece_place::memory;
+				if (e->place == piece_place::file && s.hand_to_inner(*e, block))
+				{
+					counted = e;
+					count_write = true;
+				}
 				if (in_memory && s.block_data(*e, block) != nullptr)
 				{
 					// already held: keep the stored bytes
@@ -696,6 +740,14 @@ namespace {
 			}
 			if (!in_memory)
 			{
+				if (count_write)
+				{
+					handler = [pool = m_pool, rec, counted, h = std::move(handler)](storage_error const& err)
+					{
+						if (!err) inner_written(*pool, *rec, counted);
+						h(err);
+					};
+				}
 				return m_inner->async_write(static_cast<storage_index_t>(rec->inner), r, buf
 					, std::move(o)
 					, std::move(handler), flags);
@@ -727,7 +779,72 @@ namespace {
 					});
 				return;
 			}
-			m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags, std::move(handler));
+			// the default backend hashes the piece. Its answer is applied
+			// (inner_hashed()) only to the entry the piece had now, or, for a
+			// piece without an entry, only if the piece was not retired since
+			std::weak_ptr<memory_piece_entry> file_entry;
+			bool had_entry = false;
+			std::uint32_t retire_count = 0;
+			{
+				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+				memory_storage const& s = *rec->storage;
+				std::shared_ptr<memory_piece_entry> const e = s.current(piece);
+				had_entry = bool(e);
+				if (e && e->place == piece_place::file) file_entry = e;
+				retire_count = s.retire_count(piece);
+			}
+			m_inner->async_hash(static_cast<storage_index_t>(rec->inner), piece, v2, flags
+				, [pool = m_pool, rec, file_entry, had_entry, retire_count, h = std::move(handler)]
+				(piece_index_t const p, sha1_hash const& hash, storage_error const& err)
+				{
+					if (!err) inner_hashed(*pool, *rec, p, file_entry, had_entry, retire_count);
+					h(p, hash, err);
+				});
+		}
+
+		// a write into this entry starts the piece over: every block of it
+		// is present (in memory) or was handed to the default backend (in
+		// the file), and its hash was returned
+		static bool restarts(memory_piece_entry const& e)
+		{
+			return e.missing_blocks == 0 && e.hash_returned
+				&& (e.place == piece_place::memory || e.place == piece_place::file);
+		}
+
+		// the default backend wrote a block handed to it for the entry, on
+		// the network thread
+		static void inner_written(memory_pool_impl& pool, storage_record const& rec
+			, std::weak_ptr<memory_piece_entry> const& counted)
+		{
+			std::lock_guard<memory_pool_mutex> l(pool.mutex);
+			if (rec.removed) return;
+			// the last reference to the entry may go here, under the mutex
+			std::shared_ptr<memory_piece_entry> const e = counted.lock();
+			if (e && rec.storage->is_current(*e)) rec.storage->inner_block_written(*e);
+		}
+
+		// the default backend answered a hash of the piece without an
+		// error, on the network thread. The answer carries no entry: it
+		// applies only if the piece was not retired since it was issued
+		// (async_clear_piece, async_delete_files, forget_piece) and it has
+		// the entry it had then. A piece without an entry is "in file"; a
+		// complete entry in the file has its hash returned
+		static void inner_hashed(memory_pool_impl& pool, storage_record const& rec
+			, piece_index_t const piece, std::weak_ptr<memory_piece_entry> const& file_entry
+			, bool const had_entry, std::uint32_t const retire_count)
+		{
+			std::lock_guard<memory_pool_mutex> l(pool.mutex);
+			if (rec.removed) return;
+			memory_storage& s = *rec.storage;
+			if (s.retire_count(piece) != retire_count) return;
+			std::shared_ptr<memory_piece_entry> const current = s.current(piece);
+			if (!had_entry)
+			{
+				if (!current) s.set_in_file(piece, true);
+				return;
+			}
+			std::shared_ptr<memory_piece_entry> const e = file_entry.lock();
+			if (e && e == current && e->missing_blocks == 0) e->hash_returned = true;
 		}
 
 		void do_hash2(std::shared_ptr<storage_record> const& rec, piece_index_t const piece

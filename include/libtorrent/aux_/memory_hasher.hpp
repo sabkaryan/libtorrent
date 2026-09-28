@@ -50,7 +50,10 @@ namespace libtorrent::aux {
 		memory_entry_ref& operator=(memory_entry_ref const&) = delete;
 
 		// drops the pin, the entry and the storage (either may be the last
-		// reference). The caller holds the pool's mutex
+		// reference). If the storage was removed and this was its last pin,
+		// the pool forgets it; the torrent object it kept alive is released
+		// with this reference, after the mutex. The caller holds the pool's
+		// mutex
 		void release();
 		bool released() const { return !m_entry; }
 
@@ -66,6 +69,10 @@ namespace libtorrent::aux {
 		std::shared_ptr<memory_pool_impl> m_pool;
 		std::shared_ptr<memory_storage> m_storage;
 		std::shared_ptr<memory_piece_entry> m_entry;
+		// the torrent object of a removed storage whose last pin this was.
+		// Declared last: released when this reference is destroyed, which
+		// is after the pool's mutex
+		std::shared_ptr<void> m_keep_alive;
 	};
 
 	// hashes the pieces held in memory. A block write that may extend the
@@ -152,8 +159,9 @@ namespace libtorrent::aux {
 	};
 
 	// test hooks. The gate holds a hashing thread before it hashes a block
-	// of `piece` (of any storage), until it is released. An inline hash (no
-	// hashing threads) is never held: it runs on the network thread
+	// of `piece` (of any storage), and before it answers an async_hash2 of
+	// the piece, until it is released. An inline hash (no hashing threads)
+	// is never held: it runs on the network thread
 	TORRENT_EXTRA_EXPORT void memory_hasher_hold_for_test(piece_index_t piece, bool hold);
 	// the number of threads held at the gate now
 	TORRENT_EXTRA_EXPORT int memory_hasher_waiting_for_test();

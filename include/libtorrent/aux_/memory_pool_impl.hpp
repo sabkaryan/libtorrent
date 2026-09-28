@@ -11,6 +11,7 @@ see LICENSE file.
 #define TORRENT_MEMORY_POOL_IMPL_HPP_INCLUDED
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -91,7 +92,15 @@ namespace libtorrent::aux {
 	//   the mutex; they never take it themselves (no recursive locking)
 	// * the default disk backend is never called with the mutex held:
 	//   remove_torrent() releases the default backend's storage outside it
-	// * handlers of the caller are never called with the mutex held
+	// * handlers of the caller are never called with the mutex held, and
+	//   neither is a torrent object released (a retired storage keeps one
+	//   alive; memory_entry_ref drops it after the mutex)
+	//
+	// Removed torrents. remove_torrent() retires every entry of the
+	// storage. If a job still pins one, the storage is kept in `retired`
+	// with the torrent object it was created for (it owns the file_storage
+	// the storage refers to) until the last pin drops, and is freed then,
+	// under the mutex. Its counters stay in the pool's
 	struct memory_pool_impl
 	{
 		explicit memory_pool_impl(int slab_bytes);
@@ -112,9 +121,12 @@ namespace libtorrent::aux {
 		struct storage_ref
 		{
 			// the torrent object new_torrent() was given, the one
-			// torrent_handle::native_handle() refers to. Only compared, never
-			// dereferenced
-			void const* torrent = nullptr;
+			// torrent_handle::native_handle() refers to. Compared by owner
+			// (owner_before), never by address: a torrent object at the
+			// address of a removed one is another torrent
+			std::weak_ptr<void> torrent;
+			// the info-hashes of the torrent when the storage was created
+			info_hash_t info_hashes;
 			std::shared_ptr<memory_storage> storage;
 		};
 
@@ -122,11 +134,70 @@ namespace libtorrent::aux {
 		// added by new_torrent() and removed by remove_torrent()
 		std::vector<storage_ref> storages;
 
+		// a removed storage whose entries are still pinned by jobs
+		struct retired_storage
+		{
+			std::shared_ptr<memory_storage> storage;
+			// the torrent object, the owner of the file_storage the storage
+			// refers to. Null for a storage created without one
+			std::shared_ptr<void> torrent;
+		};
+		std::vector<retired_storage> retired;
+		// storages removed while an entry of theirs was pinned, in all
+		std::int64_t storages_retired_pinned = 0;
+		// the spilled pieces of removed storages
+		std::int64_t spilled_of_removed = 0;
+
+		// claims made by torrent_handle for a torrent that has no storage
+		// yet (no metadata), applied in order by its new_torrent(). Keyed
+		// by the torrent object, compared by owner; expired keys are dropped
+		// whenever the list is used
+		struct pending_claims
+		{
+			std::weak_ptr<void> torrent;
+			std::vector<std::function<void(memory_storage&)>> ops;
+		};
+		std::vector<pending_claims> pending;
+
 		std::int64_t hash_missing_blocks = 0;
 
 		// the bytes held by the current entries of every storage. The
 		// caller holds mutex
 		std::int64_t held_bytes() const;
+		// the bytes of retired entries, of live and of removed storages.
+		// The caller holds mutex
+		std::int64_t retired_bytes() const;
+
+		// the storage created for the torrent object, nullptr if it has
+		// none. The caller holds mutex
+		std::shared_ptr<memory_storage> storage_of(std::shared_ptr<void> const& torrent) const;
+		// the policy of a new storage: the first registration matching the
+		// torrent's v1 or v2 info-hash, or `best` (storage_params::info_hash)
+		// by the registration's v1 or truncated v2; otherwise the default.
+		// The caller holds mutex
+		memory_policy policy_for(info_hash_t const& ih, sha1_hash const& best) const;
+		// queues a claim for a torrent that has no storage yet. The caller
+		// holds mutex
+		void add_pending(std::weak_ptr<void> torrent, std::function<void(memory_storage&)> op);
+		// applies (and drops) the claims queued for the torrent. The caller
+		// holds mutex
+		void apply_pending(std::shared_ptr<void> const& torrent, memory_storage& s);
+		// the last pin of the removed storage s dropped: forgets its record
+		// and returns the torrent object it kept, to be released after the
+		// mutex. The caller holds mutex
+		std::shared_ptr<void> release_retired(memory_storage const& s);
+	};
+
+	// the test hooks of a memory_storage_pool
+	struct TORRENT_EXTRA_EXPORT memory_pool_test_access
+	{
+		// the blocks the pool has allocated
+		static int blocks_in_use(memory_storage_pool const& pool);
+		// removed storages kept for their pins now, and in all
+		static int retired_storages(memory_storage_pool const& pool);
+		static std::int64_t storages_retired_pinned(memory_storage_pool const& pool);
+		// torrents with claims waiting for their storage
+		static int pending_claims(memory_storage_pool const& pool);
 	};
 
 	// test hook: the place of the current entry of a piece of a storage of

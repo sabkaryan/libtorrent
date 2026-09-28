@@ -87,6 +87,12 @@ namespace libtorrent::aux {
 		// when this drops to 0
 		int pins = 0;
 		std::unique_ptr<memory_piece_hasher> hasher;
+		// place file: the blocks handed to the default backend, one flag per
+		// block (empty until the first one), and how many of the non-pad
+		// ones it wrote. A piece in the file is complete once every non-pad
+		// block was handed over (missing_blocks counts them down)
+		std::vector<bool> inner_blocks;
+		int inner_written = 0;
 	};
 
 	// the state of one torrent in the in-memory disk backend: the current
@@ -117,9 +123,15 @@ namespace libtorrent::aux {
 		// piece that starts in the file leaves the one-shot persist set. An
 		// entry that starts in memory gets its hasher
 		std::shared_ptr<memory_piece_entry> start(piece_index_t piece, piece_place place);
-		// retires the current entry; the piece has no entry afterwards
+		// retires the current entry; the piece has no entry afterwards. Both
+		// increase the retire count of the piece (of every piece)
 		void retire(piece_index_t piece);
 		void retire_all();
+		// increased by every retire() of the piece and every retire_all().
+		// An answer of the default backend for a piece without an entry
+		// carries no entry to compare: its issuer remembers this count and
+		// the answer applies only if it did not change
+		std::uint32_t retire_count(piece_index_t piece) const;
 		// drops one pin; frees a retired entry when its last pin goes
 		void unpin(std::shared_ptr<memory_piece_entry> const& e);
 		// true if e is the current entry of its piece (by identity)
@@ -137,6 +149,15 @@ namespace libtorrent::aux {
 		// the block, nullptr if it was not received (or was freed)
 		char const* block_data(memory_piece_entry const& e, int block) const;
 
+		// block ``block`` of the current entry e (place file) is handed to
+		// the default backend. Returns true the first time for a non-pad
+		// block: its write, once completed, is passed to inner_block_written()
+		bool hand_to_inner(memory_piece_entry& e, int block);
+		// the default backend wrote a block of the current entry e for which
+		// hand_to_inner() returned true. Once every non-pad block of the
+		// piece is written, the piece is "in file"
+		void inner_block_written(memory_piece_entry& e);
+
 		// the "in file" flag, per piece (not per entry)
 		bool in_file(piece_index_t piece) const;
 		void set_in_file(piece_index_t piece, bool value);
@@ -150,6 +171,7 @@ namespace libtorrent::aux {
 		void add_one_shot_persist(span<piece_index_t const> pieces);
 		void drop_owner(memory_owner_t owner);
 		void set_torrent_policy(memory_policy policy);
+		memory_policy torrent_policy() const { return m_torrent_policy; }
 		// rules 1-5: persist (one-shot or of any owner) -> file; a file
 		// claim covers it -> file; at_limit (the pool holds >= its limit)
 		// -> file; a memory claim covers it -> memory; otherwise the torrent
@@ -178,6 +200,13 @@ namespace libtorrent::aux {
 		int blocks_in_piece(piece_index_t piece) const;
 		// true if the block lies entirely in pad files
 		bool is_pad_block(piece_index_t piece, int block) const;
+
+		// the torrent was removed: the storage is kept only while jobs pin
+		// its (retired) entries
+		void mark_removed() { m_removed = true; }
+		bool removed() const { return m_removed; }
+		// an entry of the storage, current or retired, is pinned
+		bool pinned() const;
 
 	private:
 
@@ -230,7 +259,14 @@ namespace libtorrent::aux {
 		std::int64_t m_held_partial = 0;
 		std::int64_t m_retired_bytes = 0;
 		int m_spilled_pieces = 0;
+		aux::vector<std::uint32_t, piece_index_t> m_retire_count;
+		bool m_removed = false;
 	};
+
+	// test hook: storages destroyed while an entry of theirs was still
+	// pinned, since the process started. The owner keeps a storage alive
+	// until its pins drop, so this stays 0
+	TORRENT_EXTRA_EXPORT int memory_storages_destroyed_pinned_for_test();
 }
 
 #endif

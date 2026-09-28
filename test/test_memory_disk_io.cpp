@@ -31,6 +31,8 @@ see LICENSE file.
 #include "libtorrent/aux_/time.hpp"
 #include "libtorrent/aux_/memory_hasher.hpp"
 #include "libtorrent/aux_/memory_pool_impl.hpp" // for memory_place_for_test
+#include "libtorrent/aux_/memory_storage.hpp" // for memory_storages_destroyed_pinned_for_test
+#include "libtorrent/aux_/path.hpp" // for create_directories, combine_path
 
 // interposes pwrite() for this binary: include it from this file only
 #include "write_gate.hpp"
@@ -38,6 +40,7 @@ see LICENSE file.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -1175,3 +1178,130 @@ TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
 	TEST_CHECK(aborted == (std::vector<std::string>{"write", "read", "hash2"}));
 	TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
 }
+
+// a storage removed while a hashing thread holds an entry of it is retired,
+// not destroyed: the pool keeps it (with the torrent object, here none)
+// until the last pin drops, and frees it then. The held bytes leave at the
+// removal, the pinned ones are counted as retired until the pin goes. The
+// hash job answers, but its entry is no longer current: a late answer
+// changes no counter of the pool (its missing block is not counted)
+TORRENT_TEST(storage_removed_while_hasher_holds_entry)
+{
+	using access = lt::aux::memory_pool_test_access;
+	lt::file_storage const fs = one_piece("removed_held/file", 4);
+	lt::piece_index_t const p{0};
+
+	auto const pool = memory_pool();
+	int const destroyed0 = lt::aux::memory_storages_destroyed_pinned_for_test();
+	std::int64_t const missing0 = pool->hash_missing_blocks();
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	lt::storage_index_t const ms = mem.add(fs, "removed_held", true, false);
+
+	memory_hasher_gate gate(p);
+	// block 3 missing: the background hash of the first blocks holds the
+	// entry at the gate
+	mem.write(ms, p, piece_data(fs, p, true), {3});
+	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+		&& memory_hasher_gate::waiting() == 1; }));
+	bool hashed = false;
+	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const&) { hashed = true; });
+	mem.disk->submit_jobs();
+
+	mem.storages.back().reset();
+	TEST_EQUAL(access::retired_storages(*pool), 1);
+	TEST_EQUAL(access::storages_retired_pinned(*pool), 1);
+	TEST_EQUAL(pool->held_bytes(), 0);
+	TEST_EQUAL(pool->retired_bytes(), 3 * lt::default_block_size);
+	TEST_EQUAL(access::blocks_in_use(*pool), 3);
+
+	gate.release();
+	TEST_CHECK(mem.run_until([&] { return hashed && access::retired_storages(*pool) == 0; }));
+	TEST_EQUAL(pool->retired_bytes(), 0);
+	TEST_EQUAL(access::blocks_in_use(*pool), 0);
+	TEST_EQUAL(access::storages_retired_pinned(*pool), 1);
+	TEST_EQUAL(pool->hash_missing_blocks(), missing0);
+	TEST_EQUAL(lt::aux::memory_storages_destroyed_pinned_for_test(), destroyed0);
+}
+
+#if defined TORRENT_LINUX
+namespace {
+	int reads_held()
+	{
+		std::lock_guard<std::mutex> l(gate_mutex);
+		return reads_waiting_before;
+	}
+}
+
+// an answer of the default backend to a hash of a piece without an entry
+// (a full recheck of pieces that are in the file) carries no entry to
+// compare. async_delete_files clears "in file" when its fence is raised,
+// but the default backend answers a hash issued before the fence after
+// that. The answer applies only if the piece was not retired since: here
+// "in file" stays cleared. Piece 0, hashed before the delete, shows the
+// answer does set it otherwise
+TORRENT_TEST(inner_hash_answer_after_delete_files)
+{
+	int const blocks = 4;
+	lt::file_storage fs;
+	fs.set_piece_length(blocks * lt::default_block_size);
+	fs.add_file("recheck/file", 2 * blocks * lt::default_block_size, {});
+	fs.set_num_pieces(2);
+	lt::piece_index_t const p0{0};
+	lt::piece_index_t const p1{1};
+
+	// the file policy: the pieces are the default backend's
+	auto const pool = std::make_shared<lt::memory_storage_pool>();
+	pool->set_limit(std::numeric_limits<std::int64_t>::max());
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	lt::storage_index_t const ms = mem.add(fs, "recheck", true, false);
+
+	// the file of an earlier run: the storage has no entry for its pieces
+	std::vector<char> content = piece_data(fs, p0, true);
+	std::vector<char> const second = piece_data(fs, p1, true);
+	content.insert(content.end(), second.begin(), second.end());
+	{
+		lt::error_code ec;
+		lt::create_directories(lt::combine_path("recheck", "recheck"), ec);
+		TEST_CHECK(!ec);
+		std::ofstream f(lt::combine_path("recheck", lt::combine_path("recheck", "file")), std::ios::binary);
+		f.write(content.data(), std::streamsize(content.size()));
+	}
+
+	{
+		auto const h = mem.hash(ms, p0, true, 0);
+		TEST_CHECK(!h.error);
+		TEST_CHECK(h.v1 == sha1(piece_data(fs, p0, true)));
+		TEST_CHECK(lt::aux::memory_in_file_for_test(*mem.disk, ms, p0));
+		TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, ms, p0) == lt::piece_place::none);
+	}
+
+	set_hold_reads(true, false);
+	bool hashed = false;
+	lt::storage_error hash_error;
+	mem.disk->async_hash(ms, p1, {}, lt::disk_interface::v1_hash
+		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e)
+		{
+			hash_error = e;
+			hashed = true;
+		});
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([] { return reads_held() > 0; }));
+
+	bool deleted = false;
+	mem.disk->async_delete_files(ms, lt::session_handle::delete_files
+		, [&](lt::storage_error const&) { deleted = true; });
+	mem.disk->submit_jobs();
+	mem.run_for(lt::milliseconds(200));
+	TEST_CHECK(!hashed);
+	TEST_CHECK(!deleted);
+	// cleared when the fence was raised
+	TEST_CHECK(!lt::aux::memory_in_file_for_test(*mem.disk, ms, p0));
+
+	set_hold_reads(false, false);
+	TEST_CHECK(mem.run_until([&] { return hashed && deleted; }));
+	TEST_CHECK(!hash_error);
+	TEST_CHECK(!lt::aux::memory_in_file_for_test(*mem.disk, ms, p1));
+	TEST_CHECK(!lt::aux::memory_in_file_for_test(*mem.disk, ms, p0));
+}
+#endif
