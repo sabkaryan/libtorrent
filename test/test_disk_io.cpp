@@ -872,7 +872,7 @@ TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io) { disk_io_test_suite(disk_io, 3);
 // before each piece's writes, so the writes and the hash are queued behind the
 // fence. This exercises that a piece's hash still reflects every write posted
 // before it once the fence is lowered.
-TORRENT_TEST_DISK_IO(test_pread_disk_io_fence) { disk_io_test_suite(disk_io, 3, true); }
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_pread_disk_io_fence) { disk_io_test_suite(disk_io, 3, true); }
 
 TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io_hash2_before_flush) { hash2_before_flush_suite(disk_io); }
 
@@ -1101,7 +1101,7 @@ TORRENT_TEST_DISK_IO_WITH_MEMORY(num_blocks_written_counts_written_blocks)
 // middle of each piece (after its first block), leaving a partial piece queued
 // between two fences. Exercises forward progress when a stacked fence is
 // re-raised over the writes reposted by the fence ahead of it.
-TORRENT_TEST_DISK_IO(test_pread_disk_io_stacked_fence)
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_pread_disk_io_stacked_fence)
 {
 	disk_io_test_suite(disk_io, 3, false, true);
 }

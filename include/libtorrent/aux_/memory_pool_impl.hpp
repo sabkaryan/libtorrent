@@ -133,6 +133,14 @@ namespace libtorrent::aux {
 	// the memory_disk_io ``disk`` (piece_place::none without an entry)
 	TORRENT_EXTRA_EXPORT piece_place memory_place_for_test(disk_interface& disk
 		, storage_index_t storage, piece_index_t piece);
+	// test hooks: the "in file" flag of a piece of a storage of ``disk``
+	TORRENT_EXTRA_EXPORT bool memory_in_file_for_test(disk_interface& disk
+		, storage_index_t storage, piece_index_t piece);
+	TORRENT_EXTRA_EXPORT void memory_set_in_file_for_test(disk_interface& disk
+		, storage_index_t storage, piece_index_t piece, bool value);
+	// test hook: the blocks the pool of ``disk`` has allocated, of every
+	// storage, current or retired
+	TORRENT_EXTRA_EXPORT int memory_blocks_in_use_for_test(disk_interface& disk);
 }
 
 #endif
