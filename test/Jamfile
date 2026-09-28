@@ -240,6 +240,7 @@ run test_disk_io.cpp ;
 run test_memory_slab.cpp ;
 run test_memory_storage.cpp ;
 run test_memory_session.cpp ;
+run test_memory_disk_io.cpp ;
 run test_slow_hash.cpp ;
 
 run test_rtc.cpp ;

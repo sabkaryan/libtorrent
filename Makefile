@@ -937,6 +937,7 @@ TEST_SOURCES = \
   test_disk_io.cpp \
   test_forget_piece.cpp \
   test_memory_session.cpp \
+  test_memory_disk_io.cpp \
   test_piece_flushed_alert.cpp \
   test_slow_hash.cpp \
   test_dos_blocker.cpp \
