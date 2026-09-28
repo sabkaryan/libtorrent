@@ -395,10 +395,14 @@ struct TORRENT_EXTRA_EXPORT disk_cache
 		// consulted by the caller before reaching here.
 		if (cbe.data())
 		{
-			int const blk_size = std::min(default_block_size
-				, i->piece_size2 - block_idx * default_block_size);
+			// the block was written with its v1 size, which may extend into
+			// a pad file past the end of the v2 piece
+			int const blk_size =
+				std::min(default_block_size, i->piece_size - block_idx * default_block_size);
+			int const blk_size2 =
+				std::min(default_block_size, i->piece_size2 - block_idx * default_block_size);
 			hasher256 h;
-			h.update(cbe.buf(blk_size));
+			h.update(cbe.buf(blk_size).first(blk_size2));
 			return h.final();
 		}
 		l.unlock();
