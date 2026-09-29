@@ -35,13 +35,23 @@ namespace libtorrent::aux {
 	struct memory_storage;
 	struct memory_piece_entry;
 
+	// lock() and unlock() forward to a std::mutex. clang's thread safety
+	// analysis (on with -Weverything, with a standard library that
+	// annotates std::mutex) sees the inner mutex held at the end of lock()
+	// and released in unlock() without being held: both are exempt
+#if defined __clang__
+#define TORRENT_MEMORY_POOL_NO_TSA __attribute__((no_thread_safety_analysis))
+#else
+#define TORRENT_MEMORY_POOL_NO_TSA
+#endif
+
 	// the mutex of a pool. A std::mutex that, in builds with asserts, also
 	// knows which thread holds it, so the code that frees blocks can assert
 	// that its caller holds it. Use it with std::lock_guard or
 	// std::unique_lock
 	struct memory_pool_mutex
 	{
-		void lock()
+		TORRENT_MEMORY_POOL_NO_TSA void lock()
 		{
 			m_mutex.lock();
 #if TORRENT_USE_ASSERTS
@@ -49,7 +59,7 @@ namespace libtorrent::aux {
 #endif
 		}
 
-		void unlock()
+		TORRENT_MEMORY_POOL_NO_TSA void unlock()
 		{
 #if TORRENT_USE_ASSERTS
 			m_owner.store(std::thread::id{}, std::memory_order_relaxed);
@@ -74,6 +84,7 @@ namespace libtorrent::aux {
 		std::atomic<std::thread::id> m_owner{};
 #endif
 	};
+#undef TORRENT_MEMORY_POOL_NO_TSA
 
 	// the state shared by a memory_storage_pool and every memory_disk_io
 	// created from it. Every member is guarded by mutex.
