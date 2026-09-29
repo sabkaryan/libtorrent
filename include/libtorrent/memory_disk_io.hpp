@@ -191,7 +191,7 @@ namespace libtorrent {
 		//
 		// This call waits for the network thread, like the synchronous calls
 		// of torrent_handle. It must not be called from the network thread
-		// (an alert handler or an extension running there): like the
+		// (the set_alert_notify() callback or an extension): like the
 		// synchronous calls of torrent_handle, it would run
 		// torrent::forget_piece() inline, in the middle of what that thread
 		// is doing.
@@ -221,7 +221,8 @@ namespace libtorrent {
 		// release() is called, both with the mutex held. Neither may call the
 		// pool. acquire() is not called when nothing is copied (not_in_memory,
 		// not_managed, len <= 0); if it returns nullptr, release() is not called
-		// and 0 is returned
+		// and 0 is returned. An exception thrown by acquire() leaves the call
+		// (the mutex is released) and release() is not called
 		int read(torrent_handle const&, piece_index_t, int offset, int len
 			, std::function<char*()> const& acquire, std::function<void()> const& release) const;
 
@@ -263,7 +264,8 @@ namespace libtorrent {
 		void filter_resume(add_torrent_params&) const;
 
 		// drops what the pool keeps of removed torrents with these
-		// info-hashes (the v1 or the v2 one matches) for filter_resume()
+		// info-hashes (the v1 or the v2 one matches) for filter_resume().
+		// Call it after the filtered resume data is written
 		void forget_record(info_hash_t const&);
 
 	private:

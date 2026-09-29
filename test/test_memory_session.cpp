@@ -1603,7 +1603,7 @@ TORRENT_TEST(read_acquires_under_lock)
 				++released;
 				copied_before_release = std::equal(buf.begin(), buf.end(), piece_ptr(content, p));
 				blocked_in_release = other.valid()
-					&& other.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+					&& other.wait_for(std::chrono::milliseconds(50)) == std::future_status::timeout;
 			});
 		TEST_EQUAL(r, piece_size);
 		TEST_EQUAL(acquired, 1);
