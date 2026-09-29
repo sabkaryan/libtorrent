@@ -1206,6 +1206,37 @@ int held_writes()
 	std::lock_guard<std::mutex> l(gate_mutex);
 	return writes_waiting;
 }
+
+// read on the network thread: the jobs of the piece that wait on the tail
+// of a transfer, and the steps of transfers issued for the torrent's storage
+int tail_jobs(lt::session& ses, torrent_handle const& th, piece_index_t const p)
+{
+	std::shared_ptr<aux::torrent> const t = th.native_handle();
+	int ret = 0;
+	on_network(ses, [&ret, &t, p](aux::session_impl& s)
+		{ ret = aux::memory_tail_jobs_for_test(s.disk_thread(), t->storage(), p); });
+	return ret;
+}
+
+int steps_issued(lt::session& ses, torrent_handle const& th)
+{
+	std::shared_ptr<aux::torrent> const t = th.native_handle();
+	int ret = 0;
+	on_network(ses, [&ret, &t](aux::session_impl& s)
+		{ ret = aux::memory_steps_issued_for_test(s.disk_thread(), t->storage()); });
+	return ret;
+}
+
+// the jobs of the torrent's storage parked behind a fence, read on the
+// network thread
+int fence_jobs(lt::session& ses, torrent_handle const& th)
+{
+	std::shared_ptr<aux::torrent> const t = th.native_handle();
+	int ret = 0;
+	on_network(ses, [&ret, &t](aux::session_impl& s)
+		{ ret = aux::memory_fence_jobs_for_test(s.disk_thread(), t->storage()); });
+	return ret;
+}
 #endif
 
 // the answers of disk jobs a test issued itself
@@ -1299,8 +1330,10 @@ TORRENT_TEST(transfer_tail_parks_piece_jobs)
 		TEST_EQUAL(r.code, 0);
 		std::vector<char> const bad = corrupt_piece(content, p, 1);
 		th.add_piece(p, bad.data());
-		// libtorrent issues the hash with the writes
-		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		// libtorrent issues the hash with the writes: every block of the
+		// piece and its hash wait on the tail
+		int const blocks = piece_size / default_block_size;
+		TEST_CHECK(wait_for([&] { return tail_jobs(*ses, th, p) >= blocks + 1; }));
 		TEST_CHECK(!th.have_piece(p));
 
 		set_hold_writes(false);
@@ -1432,10 +1465,13 @@ TORRENT_TEST(persist_spent_by_transfer)
 // back-pressure between pieces. The default backend's queue holds two
 // blocks and the write gate holds its writes: the first piece's step hands
 // over all its blocks and its hash, the second one waits for the queue.
-// Between them the first piece is forgotten (code 0) and the storage is
-// stopped: the stop answers only after the step's writes. The piece,
-// written again into the file with a corrupt block, fails its hash; the
-// second piece is moved after the stop
+// Both pieces are queued for their steps in one pass of the network
+// thread, which issues the first step and stops: one step is issued while
+// the gate holds, the second one once the queue has room. Between them the
+// first piece is forgotten (code 0) and the storage is stopped: the stop
+// answers only after the step's writes. The piece, written again into the
+// file with a corrupt block, fails its hash; the second piece is moved
+// after the stop
 TORRENT_TEST(transfer_backpressure_between_pieces)
 {
 	std::vector<char> const content = random_content();
@@ -1455,7 +1491,8 @@ TORRENT_TEST(transfer_backpressure_between_pieces)
 		piece_index_t const set[] = {p0, p1};
 		pool->set_persist(th, 1, set);
 		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
-		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		// the pass that issued the first step is over
+		TEST_EQUAL(steps_issued(*ses, th), 1);
 		TEST_EQUAL(pool->pending_persist_bytes(th), 2 * piece_size);
 
 		memory_forget_result const r = pool->forget_piece(th, p0);
@@ -1469,15 +1506,19 @@ TORRENT_TEST(transfer_backpressure_between_pieces)
 		});
 		std::vector<char> const bad = corrupt_piece(content, p0, 1);
 		th.add_piece(p0, bad.data());
-		std::this_thread::sleep_for(std::chrono::milliseconds(300));
+		// its blocks and its hash wait behind the stop
+		int const blocks = piece_size / default_block_size;
+		TEST_CHECK(wait_for([&] { return fence_jobs(*ses, th) >= blocks + 1; }));
 		// the step's writes are held
 		TEST_CHECK(!stopped);
+		TEST_EQUAL(steps_issued(*ses, th), 1);
 
 		set_hold_writes(false);
 		TEST_CHECK(wait_for([&stopped] { return stopped.load(); }));
 		TEST_CHECK(hash_failed(*ses, p0));
 		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
 		TEST_CHECK(in_file(*ses, th, p1));
+		TEST_EQUAL(steps_issued(*ses, th), 2);
 		TEST_EQUAL(pool->persist_failures(th), 0);
 	}
 	error_code ec;
@@ -2199,9 +2240,27 @@ TORRENT_TEST(e2e_persist_set_on_disk)
 	remove_all("tmp2" + suffix, ec);
 }
 
+namespace {
+// the bytes read_piece() gives for the piece, empty on an error
+std::vector<char> read_piece_bytes(lt::session& ses, torrent_handle const& th, piece_index_t const p)
+{
+	std::vector<char> ret;
+	th.read_piece(p);
+	bool const answered = wait_alert<read_piece_alert>(ses, [&ret, p](read_piece_alert const& a)
+		{
+			if (a.piece != p) return false;
+			if (!a.error) ret.assign(a.buffer.get(), a.buffer.get() + a.size);
+			return true;
+		});
+	TEST_CHECK(answered);
+	return ret;
+}
+}
+
 // end to end: the filtered resume data of a torrent with a persist set,
-// added to a new session: the torrent has exactly the pieces in the file.
-// The check of that resume data makes them "in file" in the new pool
+// added to a new session: the torrent has exactly the pieces in the file,
+// and read_piece() gives their bytes. The check of that resume data makes
+// them "in file" in the new pool
 TORRENT_TEST(e2e_restart_with_filtered_resume)
 {
 	std::string const suffix = "_e2e_restart";
@@ -2230,6 +2289,19 @@ TORRENT_TEST(e2e_restart_with_filtered_resume)
 		TEST_CHECK(wait_state(th, torrent_status::downloading));
 		for (int i = 0; i < e2e_pieces; ++i)
 			TEST_EQUAL(th.have_piece(piece_index_t{i}), in_set(piece_index_t{i}));
+		// every piece the torrent has is read back from the file
+		int read_back = 0;
+		for (int i = 0; i < e2e_pieces; ++i)
+		{
+			piece_index_t const p{i};
+			if (!th.have_piece(p)) continue;
+			std::vector<char> const b = read_piece_bytes(*ses, th, p);
+			std::size_t const at = std::size_t(i) * e2e_piece_size;
+			TEST_CHECK(b.size() == std::size_t(e2e_piece_size)
+				&& std::equal(b.begin(), b.end(), content.begin() + std::ptrdiff_t(at)));
+			++read_back;
+		}
+		TEST_EQUAL(read_back, int(e2e_set.size()));
 		add_torrent_params again = save_resume(*ses, th);
 		pool2->filter_resume(th, again);
 		TEST_EQUAL(again.have_pieces.count(), int(e2e_set.size()));
