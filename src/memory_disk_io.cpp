@@ -96,8 +96,10 @@ namespace {
 	// entry too. The piece goes to the file (and its memory is freed) once
 	// every handler answered, the two hashes are equal and its entry is
 	// still current; otherwise it stays in memory, a failure. A partial
-	// piece hands its blocks with flush_piece; its later blocks go to the
-	// default backend and its memory is freed by the write handlers. A step
+	// piece hands its blocks with flush_piece, then a release_files fence of
+	// the default backend flushes them (nothing else may wake it on a paused
+	// or idle torrent); its later blocks go to the default backend and its
+	// memory is freed by the write handlers. A step
 	// is one of our jobs a fence waits for; a step whose write returned
 	// true (the default backend's queue is full) makes the next piece wait
 	// for its disk_observer. Transfers asked for while a fence is up start
@@ -1014,15 +1016,24 @@ namespace {
 				return;
 			}
 			bool issued = false;
+			bool partial = false;
 			while (!rec->transfer_waits && !rec->transfers.empty())
-				issued = start_step(rec) || issued;
+				issued = start_step(rec, partial) || issued;
+			// the default backend flushes the blocks of a partial piece when
+			// one of its threads wakes up: the piece completes, its cache is
+			// full or a fence comes. A paused or idle torrent brings none of
+			// these, and its moved blocks would wait in the cache. A
+			// release_files fence of the default backend flushes the storage
+			// now, whether or not the torrent downloads
+			if (partial)
+				m_inner->async_release_files(static_cast<storage_index_t>(rec->inner), {});
 			if (issued) m_inner->submit_jobs();
 		}
 
 		// the step of the transfer at the front of the queue, in one pass of
 		// the network thread. Returns true if it handed jobs to the default
-		// backend
-		bool start_step(std::shared_ptr<storage_record> const& rec)
+		// backend. Sets `partial` if they are blocks of a partial piece
+		bool start_step(std::shared_ptr<storage_record> const& rec, bool& partial)
 		{
 			auto step = std::make_shared<transfer_step>();
 			std::shared_ptr<memory_entry_ref> pool_ref;
@@ -1129,6 +1140,7 @@ namespace {
 			}
 			// the next piece waits until the default backend has room
 			if (exceeded) rec->transfer_waits = true;
+			if (step->partial) partial = true;
 			return true;
 		}
 

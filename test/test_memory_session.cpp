@@ -1530,6 +1530,38 @@ TORRENT_TEST(filter_resume_race)
 	remove_all(path, ec);
 }
 
+// writes blocks [first, last) of the piece through the session's
+// disk_interface (libtorrent does not know them) and waits for their answers
+bool write_blocks(lt::session& ses, torrent_handle const& th, std::vector<char> const& content
+	, piece_index_t const p, int const first, int const last)
+{
+	std::shared_ptr<aux::torrent> const t = th.native_handle();
+	auto done = std::make_shared<answers>();
+	on_network(ses, [&](aux::session_impl& s)
+	{
+		for (int b = first; b < last; ++b)
+		{
+			peer_request const r{p, b * default_block_size, default_block_size};
+			s.disk_thread().async_write(t->storage(), r
+				, piece_ptr(content, p) + std::size_t(b) * default_block_size, {}
+				, [done](storage_error const& e) { TEST_CHECK(!e); (*done)(e); }, {});
+		}
+		s.disk_thread().submit_jobs();
+	});
+	return wait_for([&] { return done->answered == last - first; });
+}
+
+// the blocks [0, n) of piece p are in file b (p lies in file b)
+bool blocks_in_file(std::string const& path, std::vector<char> const& content
+	, piece_index_t const p, int const n)
+{
+	std::vector<char> const b = read_file(combine_path(path, combine_path("unregistered", "b")));
+	std::size_t const at = std::size_t(static_cast<int>(p) * piece_size - file_a);
+	std::size_t const len = std::size_t(n) * default_block_size;
+	return b.size() >= at + len
+		&& std::equal(b.begin() + std::ptrdiff_t(at), b.begin() + std::ptrdiff_t(at + len), piece_ptr(content, p));
+}
+
 // property 11: a claim for the file moves a partial piece: its blocks in
 // memory are written to the file (and leave memory), and its later blocks
 // go to the file too. Once all are there the piece is "in file".
@@ -1550,39 +1582,16 @@ TORRENT_TEST(policy_file_migrates_partial)
 		auto ses = make_session(pool);
 		torrent_handle const th = add(*ses, make_torrent(content), path);
 		TEST_CHECK(wait_state(th, torrent_status::downloading));
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
 
-		// blocks [first, last) of the piece, through the session's
-		// disk_interface (libtorrent does not know them)
-		auto const write_blocks = [&](int const first, int const last, disk_job_flags_t const flags)
-		{
-			auto done = std::make_shared<answers>();
-			on_network(*ses, [&](aux::session_impl& s)
-			{
-				for (int b = first; b < last; ++b)
-				{
-					peer_request const r{p, b * default_block_size, default_block_size};
-					s.disk_thread().async_write(t->storage(), r
-						, piece_ptr(content, p) + std::size_t(b) * default_block_size, {}
-						, [done](storage_error const& e) { TEST_CHECK(!e); (*done)(e); }, flags);
-				}
-				s.disk_thread().submit_jobs();
-			});
-			TEST_CHECK(wait_for([&] { return done->answered == last - first; }));
-		};
-
-		write_blocks(0, 2, {});
+		TEST_CHECK(write_blocks(*ses, th, content, p, 0, 2));
 		TEST_CHECK(pool->in_memory(th).partial.get_bit(p));
 		TEST_EQUAL(pool->held_bytes(th).partial, 2 * default_block_size);
 
 		pool->set_policy(th, 1, memory_policy::file);
 		TEST_EQUAL(pool->pending_persist_bytes(th), 2 * default_block_size);
 		// the rest of the piece, after the move's step (the network thread
-		// runs the move first). pread_disk_io flushes the blocks of a
-		// partial piece when a thread of its wakes up (the piece completes,
-		// the cache is full, a fence), not when they come, flush_piece or
-		// not: the move's writes are answered then
-		write_blocks(2, 4, {});
+		// runs the move first)
+		TEST_CHECK(write_blocks(*ses, th, content, p, 2, 4));
 		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
 		TEST_EQUAL(read_code(*pool, th, p), memory_storage_pool::not_in_memory);
 		TEST_CHECK(wait_for([&] { return in_file(*ses, th, p); }));
@@ -1595,6 +1604,62 @@ TORRENT_TEST(policy_file_migrates_partial)
 		if (b.size() >= at + std::size_t(piece_size))
 			TEST_CHECK(std::equal(b.begin() + std::ptrdiff_t(at), b.begin() + std::ptrdiff_t(at + piece_size)
 				, piece_ptr(content, p)));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a partial piece moved while the torrent is paused: nothing else wakes the
+// default backend to flush the moved blocks, the back end does. The
+// pending bytes reach 0 and the blocks are in the file, with no call from
+// the client. Not in builds with invariant checks (see above)
+TORRENT_TEST(pending_zero_paused_partial)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("pending_paused_partial");
+	auto const pool = make_pool(memory_policy::memory);
+	piece_index_t const p{3};
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(write_blocks(*ses, th, content, p, 0, 2));
+		TEST_CHECK(pool->in_memory(th).partial.get_bit(p));
+		th.pause();
+		TEST_CHECK(wait_for([&] { return bool(th.flags() & torrent_flags::paused); }));
+		TEST_CHECK(wait_alert<torrent_paused_alert>(*ses, [](torrent_paused_alert const&) { return true; }));
+
+		piece_index_t const set[] = {p};
+		pool->set_persist(th, 1, set);
+		TEST_EQUAL(pool->pending_persist_bytes(th), 2 * default_block_size);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(!pool->in_memory(th).partial.get_bit(p));
+		TEST_EQUAL(pool->held_bytes(), 0);
+		TEST_CHECK(wait_for([&] { return access::blocks_in_use(*pool) == 0; }));
+		TEST_CHECK(blocks_in_file(path, content, p, 2));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a partial piece moved while its torrent downloads nothing (no peers): the
+// pending bytes reach 0 as they do on a paused torrent
+TORRENT_TEST(pending_zero_idle_partial)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("pending_idle_partial");
+	auto const pool = make_pool(memory_policy::memory);
+	piece_index_t const p{3};
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(write_blocks(*ses, th, content, p, 0, 2));
+
+		piece_index_t const set[] = {p};
+		pool->set_persist(th, 1, set);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(blocks_in_file(path, content, p, 2));
 	}
 	error_code ec;
 	remove_all(path, ec);
