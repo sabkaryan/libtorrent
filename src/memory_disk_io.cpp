@@ -263,13 +263,11 @@ namespace {
 				rec->storage.reset();
 			}
 			m_free_slots.add(idx);
-			// a fence that waited for the tail is raised now (the storage is
-			// removed: the jobs behind it answer operation_aborted)
-			if (rec->fence.waits_tail)
-			{
-				rec->fence.waits_tail = false;
-				resume(rec);
-			}
+			// a fence that waits for the tail is not raised here: it could
+			// not lower before the steps of the transfers end (they are our
+			// jobs), and finish_step() of the last one raises it. Started on
+			// the removed storage, it answers as the fence's code says, then
+			// the jobs behind it answer operation_aborted
 		}
 
 		void async_read(storage_index_t const storage, peer_request const& r
@@ -535,6 +533,8 @@ namespace {
 					rec->transfers.clear();
 					rec->fence.deferred_transfers.clear();
 				}
+				// a fence that waited for the tail goes to the default backend
+				// now: every job is handed to it before its abort()
 				if (rec->fence.waits_tail)
 				{
 					rec->fence.waits_tail = false;
@@ -1275,7 +1275,7 @@ namespace {
 					, [&rec](std::weak_ptr<storage_record> const& w)
 					{ return w.expired() || w.lock() == rec; }), m_draining.end());
 			}
-			// a fence that waited for the tail
+			// a fence that waited for the tail, also of a removed storage
 			fence_state& fs = rec->fence;
 			if (fs.waits_tail && !fs.raised)
 			{
@@ -1299,9 +1299,6 @@ namespace {
 			bool in_memory = false;
 			storage_error error;
 			disk_buffer_holder buffer;
-			// the buffer of an answer from memory is taken before the pool's
-			// mutex. A read the default backend answers frees it unused
-			read_buffer buf(static_cast<char*>(std::malloc(std::size_t(default_block_size))));
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage const& s = *rec->storage;
@@ -1310,7 +1307,7 @@ namespace {
 				// there; a partial one's later blocks are in the file
 				in_memory = e && (e->place == piece_place::memory
 					|| (e->place == piece_place::transfer && holds(s, *e, r)));
-				if (in_memory) buffer = read_block(s, *e, r, buf, error);
+				if (in_memory) buffer = read_block(s, *e, r, error);
 			}
 			if (!in_memory)
 			{
@@ -1578,18 +1575,11 @@ namespace {
 			return true;
 		}
 
-		// a buffer of default_block_size bytes taken with malloc
-		struct free_buffer
-		{
-			void operator()(char* const b) const { std::free(b); }
-		};
-		using read_buffer = std::unique_ptr<char, free_buffer>;
-
-		// copies the bytes of r from the entry into `buf`, which the answer
-		// takes over. A missing block that is not entirely in pad files is
-		// an error (eof, file_read). The caller holds the pool's mutex
+		// copies the bytes of r from the entry. A missing block that is not
+		// entirely in pad files is an error (eof, file_read). The caller
+		// holds the pool's mutex
 		disk_buffer_holder read_block(memory_storage const& s, memory_piece_entry const& e
-			, peer_request const& r, read_buffer& buf, storage_error& error)
+			, peer_request const& r, storage_error& error)
 		{
 			int const piece_size = e.hasher->piece_size;
 			if (r.length <= 0 || r.start < 0 || r.length > default_block_size
@@ -1598,13 +1588,15 @@ namespace {
 				error = storage_error(errors::invalid_request, operation_t::file_read);
 				return {};
 			}
-			if (!buf)
+			// taken here, for a piece in memory only: a read the default
+			// backend answers does not pay for a buffer it does not use
+			char* const buf = static_cast<char*>(std::malloc(std::size_t(default_block_size)));
+			if (buf == nullptr)
 			{
 				error = storage_error(errors::no_memory, operation_t::alloc_cache_piece);
 				return {};
 			}
-			disk_buffer_holder ret(m_read_buffers, buf.release());
-			char* const out = ret.data();
+			disk_buffer_holder ret(m_read_buffers, buf);
 			int pos = 0;
 			while (pos < r.length)
 			{
@@ -1614,9 +1606,9 @@ namespace {
 				int const len = std::min(default_block_size - in_block, r.length - pos);
 				char const* const data = s.block_data(e, block);
 				if (data != nullptr)
-					std::memcpy(out + pos, data + in_block, std::size_t(len));
+					std::memcpy(buf + pos, data + in_block, std::size_t(len));
 				else if (s.is_pad_block(e.piece, block))
-					std::memset(out + pos, 0, std::size_t(len));
+					std::memset(buf + pos, 0, std::size_t(len));
 				else
 				{
 					error = storage_error(boost::asio::error::eof, operation_t::file_read);

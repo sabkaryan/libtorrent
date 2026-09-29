@@ -1008,8 +1008,9 @@ TORRENT_TEST(delete_and_remove_free_memory)
 namespace {
 
 // issues one of the eight fences of disk_interface on `st`. `done` is called
-// by its handler, with its error (none for a handler without one)
-using fence_done = std::function<void(lt::storage_error const&)>;
+// by its handler, with its status and its error (none for a handler without
+// them)
+using fence_done = std::function<void(lt::status_t, lt::storage_error const&)>;
 using fence_call = std::function<void(lt::disk_interface&, lt::storage_index_t, fence_done done)>;
 
 struct fence_case
@@ -1021,6 +1022,9 @@ struct fence_case
 	// its handler takes an error: on a removed storage it is
 	// operation_aborted
 	bool aborted_when_removed;
+	// its handler takes a status: on a removed storage it is
+	// fatal_disk_error
+	bool fatal_when_removed;
 	// the default backend closes the files of the storage for it
 	bool closes_files;
 };
@@ -1029,42 +1033,42 @@ std::vector<fence_case> every_fence(lt::piece_index_t const hashed)
 {
 	return {
 		{"clear_piece", [hashed](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
-			{ d.async_clear_piece(st, hashed, [done](lt::piece_index_t) { done({}); }); }
-			, true, false, false},
+			{ d.async_clear_piece(st, hashed, [done](lt::piece_index_t) { done({}, {}); }); }
+			, true, false, false, false},
 		{"move_storage", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_move_storage(st, "every_fence_moved", lt::move_flags_t::always_replace_files
-					, [done](lt::status_t, std::string const&, lt::storage_error const& e) { done(e); });
-			}, false, true, false},
+					, [done](lt::status_t const st, std::string const&, lt::storage_error const& e) { done(st, e); });
+			}, false, true, true, false},
 		{"release_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
-			{ d.async_release_files(st, [done] { done({}); }); }
-			, false, false, true},
+			{ d.async_release_files(st, [done] { done({}, {}); }); }
+			, false, false, false, true},
 		{"stop_torrent", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
-			{ d.async_stop_torrent(st, [done] { done({}); }); }
-			, false, false, true},
+			{ d.async_stop_torrent(st, [done] { done({}, {}); }); }
+			, false, false, false, true},
 		{"rename_file", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_rename_file(st, lt::file_index_t{0}, "every_fence/renamed"
-					, [done](std::string const&, lt::file_index_t, lt::storage_error const& e) { done(e); });
-			}, false, true, false},
+					, [done](std::string const&, lt::file_index_t, lt::storage_error const& e) { done({}, e); });
+			}, false, true, false, false},
 		{"delete_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_delete_files(st, lt::session_handle::delete_files
-					, [done](lt::storage_error const& e) { done(e); });
-			}, false, true, false},
+					, [done](lt::storage_error const& e) { done({}, e); });
+			}, false, true, false, false},
 		{"set_file_priority", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				lt::aux::vector<lt::download_priority_t, lt::file_index_t> prio;
 				prio.push_back(lt::default_priority);
 				d.async_set_file_priority(st, std::move(prio)
 					, [done](lt::storage_error const& e, lt::aux::vector<lt::download_priority_t, lt::file_index_t>)
-					{ done(e); });
-			}, false, true, false},
+					{ done({}, e); });
+			}, false, true, false, false},
 		{"check_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_check_files(st, nullptr, {}
-					, [done](lt::status_t, lt::storage_error const& e) { done(e); });
-			}, false, true, false},
+					, [done](lt::status_t const st, lt::storage_error const& e) { done(st, e); });
+			}, false, true, true, false},
 	};
 }
 
@@ -1138,7 +1142,7 @@ TORRENT_TEST(every_fence_parks_jobs)
 		mem.disk->submit_jobs();
 		TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
 
-		fc.issue(*mem.disk, ms, [&](lt::storage_error const&) { order.emplace_back("fence"); });
+		fc.issue(*mem.disk, ms, [&](lt::status_t, lt::storage_error const&) { order.emplace_back("fence"); });
 		lt::peer_request const r = fc.clears_hashed_piece
 			? lt::peer_request{p, 0, lt::default_block_size}
 			: lt::peer_request{q, (blocks - 1) * lt::default_block_size, lt::default_block_size};
@@ -1247,7 +1251,7 @@ TORRENT_TEST(clear_piece_in_file_goes_to_default_backend)
 // holds. Behind it: a write, a read, a second async_hash, an async_hash2 and
 // a fence, each of the eight in turn. Started on the removed storage, the
 // fence answers without the default backend: with operation_aborted if its
-// handler takes an error
+// handler takes an error, and fatal_disk_error if it takes a status
 TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
 {
 	lt::file_storage const fs = one_piece("removed_parked/file", 4);
@@ -1290,7 +1294,12 @@ TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
 			, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("rehash", e); });
 		mem.disk->async_hash2(ms, p, 0, {}
 			, [&](lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const& e) { record("hash2", e); });
-		fc.issue(*mem.disk, ms, [&](lt::storage_error const& e) { record("fence", e); });
+		lt::status_t fence_status{};
+		fc.issue(*mem.disk, ms, [&](lt::status_t const st, lt::storage_error const& e)
+		{
+			fence_status = st;
+			record("fence", e);
+		});
 		mem.disk->submit_jobs();
 
 		mem.storages.back().reset();
@@ -1302,6 +1311,7 @@ TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
 		std::vector<std::string> expected{"write", "read", "rehash", "hash2"};
 		if (fc.aborted_when_removed) expected.emplace_back("fence");
 		TEST_CHECK(aborted == expected);
+		TEST_EQUAL(bool(fence_status & lt::disk_status::fatal_disk_error), fc.fatal_when_removed);
 		TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
 	}
 }
@@ -1456,22 +1466,19 @@ struct tail_answers
 	}
 };
 
-// a piece held in memory is moved to the file (persist set of owner 1).
-// The hasher gate holds the pool's hash of the move, so its step does not
-// end, while the default backend writes and hashes the piece (it must not
-// be flushing it when its storage is removed: libtorrent removes a storage
-// only after a fence). The piece is forgotten, and a write, a read, a hash
-// and a block hash of it go to the default backend: they wait on the tail
-// of the transfer. Then `end` runs (it removes the storage or aborts the
-// disk_interface): every one of them answers operation_aborted.
-//
-// With `fence_behind`, a fence (async_rename_file) issued after them waits
-// behind them, as a fence waits for the jobs on a tail issued before it.
-// The storage is removed: the fence, started on the removed storage,
-// answers operation_aborted once the step of the transfer (one of our jobs)
-// ends
+#if defined TORRENT_LINUX
+// a piece held in memory is moved to the file (persist set of owner 1). The
+// write gate holds the default backend's writes of the move, so its step
+// does not end. The piece is forgotten, and a write, a read, a hash and a
+// block hash of it go to the default backend: they wait on the tail of the
+// transfer. A fence (async_rename_file) issued after them waits behind them.
+// Then `end` runs (it removes the storage or aborts the disk_interface)
+// while the step's writes are still held: the jobs on the tail answer
+// operation_aborted at once. The fence waits for the step, one of our jobs:
+// it answers once the writes are released (on a removed storage with
+// operation_aborted, without the default backend)
 void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)> const& end
-	, bool const fence_behind)
+	, bool const removed)
 {
 	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
 	lt::file_storage fs;
@@ -1481,19 +1488,14 @@ void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)>
 	lt::storage_index_t const st = env.add(fs, "tail_torrent", true, false);
 	lt::piece_index_t const p{0};
 	std::vector<char> const data = piece_data(fs, p, true);
-	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
 	env.write(st, p, data);
 	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
 	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::memory);
-	// the background hash of the blocks is done: the gate below holds the
-	// pool's hash of the move, not a background hash
-	TEST_CHECK(env.run_until([&] {
-		return lt::aux::memory_hasher_background_blocks_for_test() - background0 == 2; }));
 
-	memory_hasher_gate gate(p);
+	set_hold_writes(true);
 	lt::piece_index_t const set[] = {p};
 	lt::aux::memory_set_persist_for_test(*env.disk, st, set);
-	TEST_CHECK(env.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+	TEST_CHECK(env.run_until([] { return held_writes() > 0; }));
 	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::transfer);
 	lt::aux::memory_forget_for_test(*env.disk, st, p);
 
@@ -1505,39 +1507,36 @@ void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)>
 		, [&a](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { a(e); });
 	env.disk->async_hash2(st, p, 0, {}
 		, [&a](lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const& e) { a(e); });
-	env.disk->submit_jobs();
-	// the default backend answers the move's writes and hash meanwhile
-	env.run_for(lt::milliseconds(300));
-	TEST_EQUAL(a.answered, 0);
-	TEST_EQUAL(lt::aux::memory_tail_jobs_for_test(*env.disk, st, p), 4);
 	bool fenced = false;
-	if (fence_behind)
-	{
-		env.disk->async_rename_file(st, lt::file_index_t{0}, "tail/renamed"
-			, [&](std::string const&, lt::file_index_t, lt::storage_error const& e)
-			{
-				fenced = true;
-				a(e);
-			});
-		env.disk->submit_jobs();
-	}
+	lt::storage_error fence_error;
+	env.disk->async_rename_file(st, lt::file_index_t{0}, "tail/renamed"
+		, [&](std::string const&, lt::file_index_t, lt::storage_error const& e)
+		{
+			fenced = true;
+			fence_error = e;
+		});
+	env.disk->submit_jobs();
+	TEST_EQUAL(lt::aux::memory_tail_jobs_for_test(*env.disk, st, p), 4);
+	TEST_EQUAL(lt::aux::memory_fence_jobs_for_test(*env.disk, st), 1);
 
 	end(env, st);
 	TEST_CHECK(env.run_until([&] { return a.answered == 4; }));
 	TEST_EQUAL(a.aborted, 4);
+	// the step's writes are still held
+	TEST_CHECK(held_writes() > 0);
 	TEST_CHECK(!fenced);
-	gate.release();
-	if (fence_behind)
-	{
-		TEST_CHECK(env.run_until([&] { return fenced; }));
-		TEST_EQUAL(a.aborted, 5);
-	}
+
+	set_hold_writes(false);
+	TEST_CHECK(env.run_until([&] { return fenced; }));
+	if (removed) TEST_CHECK(fence_error.ec == boost::asio::error::operation_aborted);
 	env.run_for(lt::milliseconds(200));
-	TEST_EQUAL(a.answered, fence_behind ? 5 : 4);
+	TEST_EQUAL(a.answered, 4);
 }
+#endif
 
 } // anonymous namespace
 
+#if defined TORRENT_LINUX
 TORRENT_TEST(transfer_parked_answered_on_remove)
 {
 	parked_on_tail_answered([](disk_env& env, lt::storage_index_t const st)
@@ -1554,6 +1553,7 @@ TORRENT_TEST(transfer_parked_answered_on_abort)
 		env.disk->abort(false);
 	}, false);
 }
+#endif
 
 namespace {
 
