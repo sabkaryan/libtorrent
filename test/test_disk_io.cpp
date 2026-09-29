@@ -319,11 +319,9 @@ static void disk_io_test_suite(lt::disk_io_constructor_type disk_io,
 // store buffer (for mmap_disk_io). With aio_threads=0 there is no thread to
 // flush the cache to disk. In this state any hash2 implementation that falls
 // through to a disk read would read zeros (the block has not been written to
-// disk yet) and produce a wrong hash. pread_disk_io hashes v2 blocks as they
-// are written and the first async_hash2 of a block takes that hash, so each
-// block is hashed twice: the second time from the cache. With `pad`, file-0
-// is followed by a pad file, so in a hybrid torrent the block at its end is
-// written with more bytes than its v2 hash covers.
+// disk yet) and produce a wrong hash. With `pad`, file-0 is followed by a pad
+// file, so in a hybrid torrent the block at its end is written with more bytes
+// than its v2 hash covers.
 static void hash2_before_flush_impl(lt::disk_io_constructor_type disk_io,
 	disk_test_mode_t const flags,
 	int const piece_size,
@@ -397,6 +395,9 @@ static void hash2_before_flush_impl(lt::disk_io_constructor_type disk_io,
 			hh.update({buffer->data() + off, v2_size});
 			lt::sha256_hash const expected = hh.final();
 
+			// pread_disk_io hashes v2 blocks as they are written, and the first
+			// async_hash2() of a block takes that hash. The second call misses
+			// it and hashes the block from the cache.
 			for (int i = 0; i < 2; ++i)
 			{
 				disk_thread->async_hash2(storage,
