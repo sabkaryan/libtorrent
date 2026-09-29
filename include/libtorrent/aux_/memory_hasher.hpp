@@ -82,6 +82,8 @@ namespace libtorrent::aux {
 		// and the io_context of its network thread. Released when this
 		// reference is destroyed, which is after the pool's mutex
 		std::shared_ptr<void> m_keep_alive;
+		// outlives every pin, as memory_pool_impl::retired_storage::ios
+		// (which it is taken from): this reference is a pin
 		io_context* m_keep_alive_ios = nullptr;
 	};
 
@@ -168,10 +170,11 @@ namespace libtorrent::aux {
 		std::vector<thread_slot> m_threads;
 	};
 
-	// test hooks. The gate holds a hashing thread before it hashes a block
-	// of `piece` (of any storage), and before it answers an async_hash2 of
-	// the piece, until it is released. An inline hash (no hashing threads)
-	// is never held: it runs on the network thread
+	// test hooks: compiled in every build, inert unless called. The gate
+	// holds a hashing thread before it hashes a block of `piece` (of any
+	// storage), and before it answers an async_hash2 of the piece, until it
+	// is released. An inline hash (no hashing threads) is never held: it
+	// runs on the network thread
 	TORRENT_EXTRA_EXPORT void memory_hasher_hold_for_test(piece_index_t piece, bool hold);
 	// the number of threads held at the gate now
 	TORRENT_EXTRA_EXPORT int memory_hasher_waiting_for_test();

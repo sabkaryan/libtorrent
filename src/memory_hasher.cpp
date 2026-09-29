@@ -434,11 +434,13 @@ namespace {
 				g_tail_blocks.fetch_add(1, std::memory_order_relaxed);
 			}
 			record_answer_thread();
-			if (known || present)
+			if (present)
 			{
 				// keep the hash of a present block, as a background hash
 				// would. Only in this job's entry, and only while it is
-				// current: an old generation never writes into a new one
+				// current: an old generation never writes into a new one. A
+				// known hash is already stored (an entry's block hashes are
+				// set once and never cleared)
 				l.lock();
 				memory_piece_entry* const target = s.is_current(e) ? &e : nullptr;
 				if (target != nullptr && target->hasher

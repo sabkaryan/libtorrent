@@ -24,6 +24,7 @@ see LICENSE file.
 #include "libtorrent/aux_/memory_hasher.hpp"
 #include "libtorrent/aux_/memory_pool_impl.hpp"
 #include "libtorrent/aux_/memory_storage.hpp"
+#include "libtorrent/aux_/scope_end.hpp"
 #include "libtorrent/aux_/storage_free_list.hpp"
 #include "libtorrent/aux_/torrent.hpp" // for info_hash()
 #include "libtorrent/aux_/vector.hpp"
@@ -41,6 +42,7 @@ see LICENSE file.
 #include <map>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -164,27 +166,45 @@ namespace {
 				: info_hash_t{};
 			// a foreign object would not have the torrent's info-hash
 			TORRENT_ASSERT(!torrent || ih.get_best() == params.info_hash);
+			// the slot is taken before the storage enters the pool: a throw
+			// after that would leave a storage in the pool that the torrent's
+			// calls find and remove_torrent() never removes
+			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
+			if (idx == m_torrents.end_index()) m_torrents.emplace_back();
+			// on a throw below the slot goes back to the free list. That does
+			// not allocate: new_index() reserved room for every slot
+			auto slot_guard = aux::scope_end([this, idx] { m_free_slots.add(idx); });
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				rec->storage = std::make_shared<memory_storage>(params.files
 					, params.v1, params.v2, m_pool->alloc, &m_pool->mutex);
+				// on a throw below the storage leaves the pool, and is
+				// destroyed, with the mutex held (declared after the lock, it
+				// runs before the unlock)
+				auto pool_guard = aux::scope_end([this, &rec]
+				{
+					auto& storages = m_pool->storages;
+					storages.erase(std::remove_if(storages.begin(), storages.end()
+						, [&rec](memory_pool_impl::storage_ref const& r) { return r.storage == rec->storage; })
+						, storages.end());
+					rec->storage.reset();
+				});
 				rec->storage->set_torrent_policy(m_pool->policy_for(ih, params.info_hash));
 				m_pool->storages.push_back({torrent, ih, rec->storage
 					, [this, w = std::weak_ptr<storage_record>(rec)]
 					(std::vector<std::shared_ptr<memory_piece_entry>> entries)
 					{ post_transfers(w, std::move(entries)); }});
+				m_pool->apply_pending(torrent, *rec->storage);
 				// the live storage supersedes what an earlier lifetime of the
 				// torrent in this backend left: its "in file" comes from its
 				// own resume data. What another session left still describes
-				// that session's files, and stays
+				// that session's files, and stays. Last, as it cannot be
+				// undone: it does not throw (an erase from a vector)
 				m_pool->drop_own_residues(ih, m_backend);
-				m_pool->apply_pending(torrent, *rec->storage);
+				pool_guard.disarm();
 			}
-			storage_index_t const idx = m_free_slots.new_index(m_torrents.end_index());
-			if (idx == m_torrents.end_index())
-				m_torrents.emplace_back(std::move(rec));
-			else
-				m_torrents[idx] = std::move(rec);
+			slot_guard.disarm();
+			m_torrents[idx] = std::move(rec);
 			return {idx, *this};
 		}
 
@@ -1284,11 +1304,17 @@ namespace {
 		// piece in the file is handed to the default backend, which counts
 		// it; once every non-pad block is written there, the piece is "in
 		// file". A block in memory is written once. A write of a block that
-		// any other entry held in memory already has keeps the stored
-		// bytes and succeeds: the torrent fixes a block's bytes, a wrong
-		// block fails the piece's hash, and async_clear_piece() starts the
-		// piece over. So blocks that arrive again after a recheck, in any
-		// order, fill the entry instead of dropping it
+		// the current entry of the piece already holds, or that a partial
+		// transfer of it already handed to the default backend, keeps the
+		// stored bytes and succeeds: the torrent fixes a block's bytes, a
+		// wrong block fails the piece's hash, and async_clear_piece() starts
+		// the piece over. So blocks that arrive again after a recheck, in
+		// any order, fill the entry instead of dropping it. The costs:
+		// add_piece() with overwrite_existing on a partial piece keeps the
+		// blocks already held, so different bytes cost one failed hash and a
+		// new download of the piece; and if the stored bytes are corrupt and
+		// the new ones right, the piece fails its hash with the block
+		// attributed to the peer that sent it again, whom smart_ban may ban
 		bool do_write(std::shared_ptr<storage_record> const& rec, peer_request const& r
 			, char const* buf, std::shared_ptr<disk_observer> o
 			, std::function<void(storage_error const&)> handler
@@ -1645,7 +1671,7 @@ namespace {
 
 	disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool> shared_pool)
 	{
-		TORRENT_ASSERT(shared_pool);
+		if (!shared_pool) throw std::invalid_argument("memory_disk_io_constructor: null pool");
 		return [pool = std::move(shared_pool)](io_context& ioc, settings_interface const& sett
 			, counters& cnt) -> std::unique_ptr<disk_interface>
 		{

@@ -199,8 +199,6 @@ namespace libtorrent::aux {
 		// the transfer of the current entry e failed: back to place memory,
 		// counted in persist_failures()
 		void transfer_failed(memory_piece_entry& e);
-		// a write of a transfer to the default backend failed
-		void add_persist_failure() { ++m_persist_failures; }
 		int persist_failures() const { return m_persist_failures; }
 
 		// the "in file" flag, per piece (not per entry)

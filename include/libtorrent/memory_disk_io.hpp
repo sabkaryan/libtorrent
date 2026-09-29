@@ -180,7 +180,9 @@ namespace libtorrent {
 		// hash of the default backend differs from the pool's): the piece
 		// stays in memory. A partial piece whose write failed goes to the
 		// file anyway, without the failed block: its hash fails later and
-		// it is downloaded again. not_managed for a torrent without storage
+		// it is downloaded again. Every failed attempt counts: a piece that
+		// is moved again and fails again counts again. not_managed for a
+		// torrent without storage
 		int persist_failures(torrent_handle const&) const;
 
 		// forgets the piece atomically: one task on the network thread of
@@ -265,7 +267,10 @@ namespace libtorrent {
 
 		// drops what the pool keeps of removed torrents with these
 		// info-hashes (the v1 or the v2 one matches) for filter_resume().
-		// Call it after the filtered resume data is written
+		// Every removal of a torrent leaves such a record (two bits per
+		// piece and a few dozen bytes) until this call: records pile up
+		// for the pool's lifetime without it. Call it after the filtered
+		// resume data is written, or at the removal when there will be none
 		void forget_record(info_hash_t const&);
 
 	private:
@@ -278,7 +283,8 @@ namespace libtorrent {
 	// the in-memory disk backend on top of the default disk backend, with
 	// ``pool`` as its shared state. The backend reads the torrent object the
 	// session passes to new_torrent() (the session's own torrent); a direct
-	// user of disk_interface passes an empty one
+	// user of disk_interface passes an empty one. ``pool`` must not be
+	// null: a null one throws std::invalid_argument
 	TORRENT_EXPORT disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool>);
 }
 

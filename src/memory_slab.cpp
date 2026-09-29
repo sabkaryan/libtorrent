@@ -66,7 +66,8 @@ namespace {
 	}
 
 	// a decommitted block needs to be recommitted before it can be handed
-	// out again; a no-op on a block that was never decommitted
+	// out again; a no-op on a block that was never decommitted. The Windows
+	// path is neither built nor tested here
 	void recommit_block(char* const block)
 	{
 #ifdef TORRENT_WINDOWS
@@ -234,6 +235,9 @@ namespace {
 		release_empty_slabs();
 	}
 
+	// unmaps every empty slab but one spare: the lowest-addressed empty
+	// slab is kept (m_slabs is ordered by base address), so a free/allocate
+	// cycle around a slab boundary does not map and unmap a slab each time
 	void memory_slab_allocator::release_empty_slabs()
 	{
 		bool have_spare = false;

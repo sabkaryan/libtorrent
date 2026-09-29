@@ -31,7 +31,8 @@ namespace libtorrent::aux {
 		// nullptr when mmap fails
 		char* allocate();
 		// returns the block's pages to the system (MADV_DONTNEED); unmaps a slab
-		// that becomes empty, except one kept as a spare
+		// that becomes empty, except one kept as a spare (the lowest-addressed
+		// empty slab)
 		void free(char* block);
 		// frees several blocks, coalescing madvise over adjacent ones
 		void free(span<char* const> blocks);

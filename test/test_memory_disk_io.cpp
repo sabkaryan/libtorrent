@@ -44,6 +44,7 @@ see LICENSE file.
 #include <functional>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -116,6 +117,10 @@ void observer_woken_after_back_pressure(lt::disk_io_constructor_type const& disk
 	TEST_EQUAL(obs->calls, 1);
 
 	disk->abort(true);
+	storage.reset();
+	disk.reset();
+	lt::error_code ec;
+	remove_all("back_pressure_torrent", ec);
 }
 
 // a pool that keeps every piece in memory
@@ -126,6 +131,14 @@ std::shared_ptr<lt::memory_storage_pool> memory_pool()
 	pool->set_limit(std::numeric_limits<std::int64_t>::max());
 	return pool;
 }
+
+// the default limit of disk_env::run_until(). A build that slows every hash
+// down (simulate-slow=hash) needs longer, as test_disk_io.cpp does
+#ifdef TORRENT_SIMULATE_SLOW_HASH
+lt::time_duration const run_limit = lt::seconds(60);
+#else
+lt::time_duration const run_limit = lt::seconds(10);
+#endif
 
 // a disk_interface and the storages of one test. The storages are removed
 // after abort(), before the disk_interface goes, as the tests of
@@ -172,7 +185,7 @@ struct disk_env
 
 	// runs the handlers until pred() is true, for at most `limit`
 	template <typename Pred>
-	bool run_until(Pred pred, lt::time_duration const limit = lt::seconds(10))
+	bool run_until(Pred pred, lt::time_duration const limit = run_limit)
 	{
 		auto const end = lt::aux::time_now() + limit;
 		while (!pred())
@@ -359,6 +372,22 @@ TORRENT_TEST(observer_woken_after_back_pressure_pread)
 TORRENT_TEST(observer_woken_after_back_pressure_memory_file)
 {
 	observer_woken_after_back_pressure(memory_file_disk_io());
+}
+
+// a null pool is refused when the constructor is made, not dereferenced
+// when the session creates its disk backend
+TORRENT_TEST(constructor_refuses_null_pool)
+{
+	bool thrown = false;
+	try
+	{
+		lt::memory_disk_io_constructor(nullptr);
+	}
+	catch (std::invalid_argument const&)
+	{
+		thrown = true;
+	}
+	TEST_CHECK(thrown);
 }
 
 // the same blocks, written to memory and to pread_disk_io, give the same
@@ -671,9 +700,9 @@ TORRENT_TEST(recheck_partial_in_memory)
 	TEST_EQUAL(pool->hash_missing_blocks(), missing_before);
 }
 
-// property 19a: a fence waits for our own jobs issued before it. Every block
-// is written and hashed in the background; the gate holds the async_hash
-// that follows at its tail stage. async_stop_torrent (a fence) answers only once the
+// a fence waits for our own jobs issued before it. Every block is written
+// and hashed in the background; the gate holds the async_hash that follows
+// at its tail stage. async_stop_torrent (a fence) answers only once the
 // gate is released, after the hash answered
 TORRENT_TEST(stop_waits_for_async_hash)
 {
@@ -714,9 +743,8 @@ TORRENT_TEST(stop_waits_for_async_hash)
 	TEST_CHECK(order == (std::vector<std::string>{"hash", "stop"}));
 }
 
-// property 19b: the background hash of written blocks is not a job a fence
-// waits for. The gate holds it, no async_hash is issued, and
-// async_stop_torrent answers
+// the background hash of written blocks is not a job a fence waits for. The
+// gate holds it, no async_hash is issued, and async_stop_torrent answers
 TORRENT_TEST(stop_does_not_wait_for_background_hasher)
 {
 	lt::file_storage const fs = one_piece("stop_background/file", 4);
@@ -739,12 +767,12 @@ TORRENT_TEST(stop_does_not_wait_for_background_hasher)
 	gate.release();
 }
 
-// property 20: jobs behind a fence are parked in posting order. The gate
-// holds the hashing thread while an async_hash2 of the piece is issued (our
-// job, on a pinned entry); then async_clear_piece of the piece, a write of
-// its block 0 with new bytes and a read of that block. While the gate holds,
-// none of the three answers. Once released they answer in posting order, and
-// the read sees the new bytes, copied when the write was called
+// jobs behind a fence are parked in posting order. The gate holds the
+// hashing thread while an async_hash2 of the piece is issued (our job, on a
+// pinned entry); then async_clear_piece of the piece, a write of its block
+// 0 with new bytes and a read of that block. While the gate holds, none of
+// the three answers. Once released they answer in posting order, and the
+// read sees the new bytes, copied when the write was called
 TORRENT_TEST(write_after_clear_is_parked)
 {
 	lt::file_storage const fs = one_piece("parked/file", 4);
@@ -798,9 +826,9 @@ TORRENT_TEST(write_after_clear_is_parked)
 	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, ms, p) == lt::piece_place::memory);
 }
 
-// property 14: async_clear_piece of a piece in memory (its hash failed)
-// leaves it without an entry and not in the file. The next write decides its
-// place again: with the memory policy the block goes to memory, and the piece
+// async_clear_piece of a piece in memory (its hash failed) leaves it
+// without an entry and not in the file. The next write decides its place
+// again: with the memory policy the block goes to memory, and the piece
 // written again hashes right
 TORRENT_TEST(clear_piece_new_entry)
 {
@@ -851,9 +879,9 @@ TORRENT_TEST(clear_piece_new_entry)
 	}
 }
 
-// property 15: async_delete_files and remove_torrent free the memory of the
-// torrent. An entry a hash job holds (the gate holds the job) is freed when
-// the job lets go of it, the others at once
+// async_delete_files and remove_torrent free the memory of the torrent. An
+// entry a hash job holds (the gate holds the job) is freed when the job
+// lets go of it, the others at once
 TORRENT_TEST(delete_and_remove_free_memory)
 {
 	int const blocks = 4;
@@ -899,7 +927,8 @@ TORRENT_TEST(delete_and_remove_free_memory)
 		memory_hasher_gate gate(p0);
 		auto const hashed = pin(ms);
 		bool deleted = false;
-		mem.disk->async_delete_files(ms, lt::session_handle::delete_files, [&](lt::storage_error const&) { deleted = true; });
+		mem.disk->async_delete_files(ms, lt::session_handle::delete_files
+			, [&](lt::storage_error const&) { deleted = true; });
 		mem.disk->submit_jobs();
 		TEST_EQUAL(pool->held_bytes(), 0);
 		TEST_EQUAL(pool->retired_bytes(), piece_bytes);

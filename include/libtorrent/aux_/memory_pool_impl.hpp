@@ -152,7 +152,11 @@ namespace libtorrent::aux {
 			// refers to. Null for a storage created without one
 			std::shared_ptr<void> torrent;
 			// the network thread's io_context of the session the torrent
-			// lived in: the torrent object is released there
+			// lived in: the torrent object is released there. It outlives
+			// every pin: pins are held only by that session's disk
+			// backend, its hasher threads and the default backend's
+			// threads (each holds a work guard on it), and by the
+			// completions they post to it
 			io_context* ios = nullptr;
 		};
 		std::vector<retired_storage> retired;
@@ -238,7 +242,8 @@ namespace libtorrent::aux {
 		void drop_own_residues(info_hash_t const& ih, std::uint64_t backend);
 	};
 
-	// the test hooks of a memory_storage_pool
+	// test hooks: compiled in every build, inert unless called. The
+	// hooks of a memory_storage_pool
 	struct TORRENT_EXTRA_EXPORT memory_pool_test_access
 	{
 		// the blocks the pool has allocated

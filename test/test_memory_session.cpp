@@ -244,9 +244,9 @@ TORRENT_TEST(unregistered_torrent_goes_to_file)
 	TEST_CHECK(mem.resume.flags == ref.resume.flags);
 }
 
-// two torrents live in one session at the same time: each one's writes,
-// hashes and file operations reach the storage the default backend created
-// for it, not the other one's
+// two torrents live in one session at the same time: each one's writes and
+// hashes reach the storage the default backend created for it, not the
+// other one's (the default policy sends every piece to the file)
 TORRENT_TEST(two_torrents_keep_their_own_storage)
 {
 	std::vector<char> const content_a = random_content();
@@ -523,9 +523,9 @@ std::vector<char> four_pieces()
 
 } // anonymous namespace
 
-// property 2: pool.forget_piece() of a piece in memory answers 0 and the
-// place it had; its bytes are gone (read: not_in_memory, held 0). Written
-// again, the piece is read back
+// pool.forget_piece() of a piece in memory answers 0 and the place it had;
+// its bytes are gone (read: not_in_memory, held 0). Written again, the
+// piece is read back
 TORRENT_TEST(forget_frees_memory)
 {
 	std::vector<char> const content = random_content();
@@ -555,11 +555,12 @@ TORRENT_TEST(forget_frees_memory)
 	remove_all(path, ec);
 }
 
-// property 3: pool.forget_piece() that libtorrent answers with a code other
-// than 0 drops nothing. Code 1: a plain torrent_handle::forget_piece() made
+// pool.forget_piece() that libtorrent answers with a code other than 0
+// drops nothing. Code 1: a plain torrent_handle::forget_piece() made
 // libtorrent forget the piece, whose bytes the pool still holds. Code 3: a
 // piece in the file that passed its hash but whose blocks are not written
-// yet (the write gate holds them); its entry keeps its place
+// yet (the write gate holds them); its entry keeps its place. The code 3
+// half runs on Linux only, where the write gate exists (write_gate.hpp)
 TORRENT_TEST(forget_nonzero_keeps_memory)
 {
 	std::vector<char> const content = random_content();
@@ -605,10 +606,10 @@ TORRENT_TEST(forget_nonzero_keeps_memory)
 	remove_all(path, ec);
 }
 
-// property 4: a plain torrent_handle::forget_piece() leaves the piece in
-// memory; downloaded again, it starts over: new bytes with a corrupt block
-// fail the hash (they are not merged into the old entry, whose hash would
-// pass). Written again right, it passes and the pool holds it once
+// a plain torrent_handle::forget_piece() leaves the piece in memory;
+// downloaded again, it starts over: new bytes with a corrupt block fail the
+// hash (they are not merged into the old entry, whose hash would pass).
+// Written again right, it passes and the pool holds it once
 TORRENT_TEST(plain_forget_then_rewrite)
 {
 	std::vector<char> const content = random_content();
@@ -634,13 +635,13 @@ TORRENT_TEST(plain_forget_then_rewrite)
 	remove_all(path, ec);
 }
 
-// property 5: generations. A v2 torrent; the gate holds the hashing thread
-// on an async_hash2 of a piece it has (its entry pinned). Under it,
+// generations of a piece. A v2 torrent; the gate holds the hashing
+// thread on an async_hash2 of a piece it has (its entry pinned). Under it,
 // pool.forget_piece() answers 0 and the piece is written again with a
 // corrupt block 0: the pool holds one generation, the old one is retired.
-// Released, the old job neither frees the new entry's blocks nor stores
-// its (right) hash of block 0 in the new entry: the new piece fails its
-// hash, and once cleared nothing is left
+// Released, the old job neither frees the new entry's blocks nor stores its
+// (right) hash of block 0 in the new entry: the new piece fails its hash,
+// and once cleared nothing is left
 TORRENT_TEST(generations_hash2_pin)
 {
 	std::vector<char> const content = four_pieces();
@@ -690,8 +691,8 @@ TORRENT_TEST(generations_hash2_pin)
 	remove_all(path, ec);
 }
 
-// property 16: a piece that starts while the pool holds its limit goes to
-// the file and counts as spilled
+// a piece that starts while the pool holds its limit goes to the file and
+// counts as spilled
 TORRENT_TEST(limit_spills_to_file)
 {
 	std::vector<char> const content = random_content();
@@ -749,9 +750,9 @@ TORRENT_TEST(limit_lowered_below_held)
 	remove_all(path, ec);
 }
 
-// property 18a: a hybrid torrent added from a magnet link with its v1
-// info-hash gets its metadata later; its storage (keyed by the truncated
-// v2 info-hash) still matches the registration by v1
+// a hybrid torrent added from a magnet link with its v1 info-hash gets its
+// metadata later; its storage (keyed by the truncated v2 info-hash) still
+// matches the registration by v1
 TORRENT_TEST(key_magnet_v1_hybrid)
 {
 	std::vector<char> const content = four_pieces();
@@ -778,8 +779,8 @@ TORRENT_TEST(key_magnet_v1_hybrid)
 	remove_all(path, ec);
 }
 
-// property 18b: one torrent in two sessions on one pool has two storages;
-// a handle reads its own
+// one torrent in two sessions on one pool has two storages; a handle reads
+// its own
 TORRENT_TEST(two_sessions_one_pool)
 {
 	std::vector<char> const content = random_content();
@@ -811,8 +812,8 @@ TORRENT_TEST(two_sessions_one_pool)
 	remove_all(path2, ec);
 }
 
-// property 22: the persist sets of two owners add up: owner 2's set does
-// not replace owner 1's
+// the persist sets of two owners add up: owner 2's set does not replace
+// owner 1's
 TORRENT_TEST(claims_two_owners_persist)
 {
 	std::vector<char> const content = random_content();
@@ -843,9 +844,9 @@ TORRENT_TEST(claims_two_owners_persist)
 	remove_all(path, ec);
 }
 
-// property 23: owner 1 claims file 0 for memory, owner 2 file 1 for the
-// file: the pieces of file 0 are in memory, those of file 1 in the file,
-// and the piece on their boundary in the file
+// owner 1 claims file 0 for memory, owner 2 file 1 for the file: the pieces
+// of file 0 are in memory, those of file 1 in the file, and the piece on
+// their boundary in the file
 TORRENT_TEST(claims_policy_per_file)
 {
 	std::vector<char> const content = random_content();
@@ -871,10 +872,10 @@ TORRENT_TEST(claims_policy_per_file)
 	remove_all(path, ec);
 }
 
-// property 24: a piece in the file ("in file" once its blocks are written)
-// forgotten by a plain torrent_handle::forget_piece() while a claim asks
-// for memory starts over when it is downloaded again: it goes to memory
-// and is not "in file" any more
+// a piece in the file ("in file" once its blocks are written) forgotten by
+// a plain torrent_handle::forget_piece() while a claim asks for memory
+// starts over when it is downloaded again: it goes to memory and is not "in
+// file" any more
 TORRENT_TEST(plain_forget_file_piece_replaced)
 {
 	std::vector<char> const content = random_content();
@@ -1001,7 +1002,8 @@ TORRENT_TEST(session_destroyed_while_hash_issued)
 // keeps the torrent object until the last pin drops, which happens on the
 // hashing thread, and then releases it on the network thread. The torrent
 // has peers in its list: ~torrent frees them into the session's allocator,
-// which only the network thread may touch (run under TSan)
+// which only the network thread may touch. The check is the id of the
+// releasing thread: TSan does not flag a release on the hashing thread
 TORRENT_TEST(removed_torrent_released_on_network_thread)
 {
 	std::vector<char> const content = random_content();
@@ -1221,12 +1223,12 @@ struct answers
 } // anonymous namespace
 
 #if defined TORRENT_LINUX
-// property 6: generations of a transfer. The write gate holds the transfer
-// of a piece (the claim of owner 1 sends it to the file). Under it the
-// piece is forgotten (code 0), the claim dropped and the piece written
-// again, into memory. Released, the old transfer changes nothing of the new
-// generation: the piece stays in memory and is not "in file", so the resume
-// data loses it
+// generations of a transfer. The write gate holds the transfer of a piece
+// (the claim of owner 1 sends it to the file). Under it the piece is
+// forgotten (code 0), the claim dropped and the piece written again, into
+// memory. Released, the old transfer changes nothing of the new generation:
+// the piece stays in memory and is not "in file", so the resume data loses
+// it
 TORRENT_TEST(transfer_generation_check)
 {
 	std::vector<char> const content = random_content();
@@ -1269,14 +1271,13 @@ TORRENT_TEST(transfer_generation_check)
 	remove_all(path, ec);
 }
 
-// property 6a: the tail of a transfer. The write gate holds the transfer
-// of a piece in a persist set. Under it the piece is forgotten (code 0) and
-// written again with a corrupt block: the set sends it to the file, and
-// libtorrent asks for its hash as soon as the writes are issued. Neither
-// the writes nor the hash may reach the default backend's cache entry of
-// the transfer: a write there would be refused, and the hash would answer
-// the transfer's (right) hash. They wait for the transfer and the piece
-// fails its hash
+// the tail of a transfer. The write gate holds the transfer of a piece in a
+// persist set. Under it the piece is forgotten (code 0) and written again
+// with a corrupt block: the set sends it to the file, and libtorrent asks
+// for its hash as soon as the writes are issued. Neither the writes nor the
+// hash may reach the default backend's cache entry of the transfer: a write
+// there would be refused, and the hash would answer the transfer's (right)
+// hash. They wait for the transfer and the piece fails its hash
 TORRENT_TEST(transfer_tail_parks_piece_jobs)
 {
 	std::vector<char> const content = random_content();
@@ -1309,9 +1310,9 @@ TORRENT_TEST(transfer_tail_parks_piece_jobs)
 	remove_all(path, ec);
 }
 
-// property 7: a piece is read from memory for the whole transfer; its
-// memory is freed only once the default backend answered, and then it is
-// "in file" and stays in the filtered resume data
+// a piece is read from memory for the whole transfer; its memory is freed
+// only once the default backend answered, and then it is "in file" and
+// stays in the filtered resume data
 TORRENT_TEST(transfer_reads_without_gap)
 {
 	std::vector<char> const content = random_content();
@@ -1358,15 +1359,15 @@ TORRENT_TEST(transfer_reads_without_gap)
 }
 #endif
 
-// property 8: a transfer leaves no cache entry of the default backend
-// without its hash returned. A v2-only torrent: pread_disk_io flushes the
-// blocks of a v2-only piece only after its async_hash (or under pressure),
-// so a transfer that skipped the hash would never end (with v1 hashes the
-// blocks are flushed once pread's hasher reaches the end, and the skip
-// would only show in the next generation). The transfer ends within 5
-// seconds; the piece, forgotten and written again into the file with a
-// corrupt block, fails its hash (an entry left without its hash returned
-// would take the new blocks and answer the old hash)
+// a transfer leaves no cache entry of the default backend without its hash
+// returned. A v2-only torrent: pread_disk_io flushes the blocks of a
+// v2-only piece only after its async_hash (or under pressure), so a
+// transfer that skipped the hash would never end (with v1 hashes the blocks
+// are flushed once pread's hasher reaches the end, and the skip would only
+// show in the next generation). The transfer ends within 5 seconds; the
+// piece, forgotten and written again into the file with a corrupt block,
+// fails its hash (an entry left without its hash returned would take the
+// new blocks and answer the old hash)
 TORRENT_TEST(transfer_leaves_no_pread_entry)
 {
 	std::vector<char> const content = four_pieces();
@@ -1428,13 +1429,13 @@ TORRENT_TEST(persist_spent_by_transfer)
 }
 
 #if defined TORRENT_LINUX
-// property 9: back-pressure between pieces. The default backend's queue
-// holds two blocks and the write gate holds its writes: the first piece's
-// step hands over all its blocks and its hash, the second one waits for
-// the queue. Between them the first piece is forgotten (code 0) and the
-// storage is stopped: the stop answers only after the step's writes. The
-// piece, written again into the file with a corrupt block, fails its hash;
-// the second piece is moved after the stop
+// back-pressure between pieces. The default backend's queue holds two
+// blocks and the write gate holds its writes: the first piece's step hands
+// over all its blocks and its hash, the second one waits for the queue.
+// Between them the first piece is forgotten (code 0) and the storage is
+// stopped: the stop answers only after the step's writes. The piece,
+// written again into the file with a corrupt block, fails its hash; the
+// second piece is moved after the stop
 TORRENT_TEST(transfer_backpressure_between_pieces)
 {
 	std::vector<char> const content = random_content();
@@ -1484,10 +1485,10 @@ TORRENT_TEST(transfer_backpressure_between_pieces)
 }
 #endif
 
-// property 10: filter_resume() drops a piece that is not in the file. The
-// race: resume data saved while the piece was in memory, then the piece is
-// forgotten. And the path file -> forgotten -> in memory again: the resume
-// data saved last names the piece, which is in memory only
+// filter_resume() drops a piece that is not in the file. The race: resume
+// data saved while the piece was in memory, then the piece is forgotten.
+// And the path file -> forgotten -> in memory again: the resume data saved
+// last names the piece, which is in memory only
 TORRENT_TEST(filter_resume_race)
 {
 	std::vector<char> const content = random_content();
@@ -1758,9 +1759,9 @@ TORRENT_TEST(read_pad_block_zeros)
 	remove_all(path, ec);
 }
 
-// property 11: a claim for the file moves a partial piece: its blocks in
-// memory are written to the file (and leave memory), and its later blocks
-// go to the file too. Once all are there the piece is "in file".
+// a claim for the file moves a partial piece: its blocks in memory are
+// written to the file (and leave memory), and its later blocks go to the
+// file too. Once all are there the piece is "in file".
 //
 // The move writes the blocks of the partial piece with flush_piece.
 // pread_disk_io's invariant check (disk_cache.cpp, check_invariant, in
@@ -1862,9 +1863,9 @@ TORRENT_TEST(pending_zero_idle_partial)
 }
 #endif
 
-// property 12: pending_persist_bytes() counts the bytes in memory only. A
-// paused torrent with a persist set of four pieces, two of them held:
-// once those two are moved it is 0, though the other two never arrive
+// pending_persist_bytes() counts the bytes in memory only. A paused torrent
+// with a persist set of four pieces, two of them held: once those two are
+// moved it is 0, though the other two never arrive
 TORRENT_TEST(pending_zero_when_paused)
 {
 	std::vector<char> const content = random_content();
