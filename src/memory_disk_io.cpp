@@ -272,20 +272,20 @@ namespace {
 		// bytes and applies no back-pressure, like the jobs pread_disk_io
 		// parks behind a fence
 		bool async_write(storage_index_t const storage, peer_request const& r
-			, char const* buf, std::shared_ptr<disk_observer> o
+			, char const* buf, std::shared_ptr<disk_observer> observer
 			, std::function<void(storage_error const&)> handler
 			, disk_job_flags_t const flags) override
 		{
 			std::shared_ptr<storage_record> const& rec = m_torrents[storage];
 			if (held_back(rec->fence))
 			{
-				std::vector<char> copy(buf, buf + std::max(0, r.length));
+				std::vector<char> copied(buf, buf + std::max(0, r.length));
 				rec->fence.parked.emplace_back([this, w = std::weak_ptr<storage_record>(rec), r
-					, copy = std::move(copy), o = std::move(o), h = std::move(handler), flags]() mutable
+					, copy = std::move(copied), o = std::move(observer), h = std::move(handler), flags]() mutable
 					{ do_write(w.lock(), r, copy.data(), std::move(o), std::move(h), flags); });
 				return false;
 			}
-			return do_write(rec, r, buf, std::move(o), std::move(handler), flags);
+			return do_write(rec, r, buf, std::move(observer), std::move(handler), flags);
 		}
 
 		void async_hash(storage_index_t const storage, piece_index_t const piece
@@ -318,11 +318,11 @@ namespace {
 			do_hash2(rec, piece, offset, flags, std::move(handler));
 		}
 
-		void async_move_storage(storage_index_t const storage, std::string p
+		void async_move_storage(storage_index_t const storage, std::string destination
 			, move_flags_t const flags
 			, std::function<void(status_t, std::string const&, storage_error const&)> handler) override
 		{
-			fence(storage, all_pieces, [this, p = std::move(p), flags, h = std::move(handler)]
+			fence(storage, all_pieces, [this, p = std::move(destination), flags, h = std::move(handler)]
 				(std::shared_ptr<storage_record> const& rec)
 			{
 				if (rec->removed)
@@ -354,10 +354,10 @@ namespace {
 
 		void async_check_files(storage_index_t const storage
 			, add_torrent_params const* resume_data
-			, aux::vector<std::string, file_index_t> links
+			, aux::vector<std::string, file_index_t> file_links
 			, std::function<void(status_t, storage_error const&)> handler) override
 		{
-			fence(storage, all_pieces, [this, resume_data, links = std::move(links), h = std::move(handler)]
+			fence(storage, all_pieces, [this, resume_data, links = std::move(file_links), h = std::move(handler)]
 				(std::shared_ptr<storage_record> const& rec)
 			{
 				if (rec->removed)
@@ -367,10 +367,10 @@ namespace {
 				}
 				// the pieces the resume data names: "in file" once the check
 				// accepted it
-				typed_bitfield<piece_index_t> have;
-				if (resume_data != nullptr) have = resume_data->have_pieces;
+				typed_bitfield<piece_index_t> resume_have;
+				if (resume_data != nullptr) resume_have = resume_data->have_pieces;
 				m_inner->async_check_files(to_inner(*rec), resume_data, links
-					, [this, rec, h, have = std::move(have)](status_t const st, storage_error const& e)
+					, [this, rec, h, have = std::move(resume_have)](status_t const st, storage_error const& e)
 					{
 						if (!e && !(st & (disk_status::fatal_disk_error | disk_status::need_full_check)))
 							checked(*rec, have);
@@ -396,10 +396,10 @@ namespace {
 		}
 
 		void async_rename_file(storage_index_t const storage
-			, file_index_t const index, std::string name
+			, file_index_t const index, std::string new_name
 			, std::function<void(std::string const&, file_index_t, storage_error const&)> handler) override
 		{
-			fence(storage, all_pieces, [this, index, name = std::move(name), h = std::move(handler)]
+			fence(storage, all_pieces, [this, index, name = std::move(new_name), h = std::move(handler)]
 				(std::shared_ptr<storage_record> const& rec)
 			{
 				if (rec->removed)
@@ -439,11 +439,11 @@ namespace {
 		}
 
 		void async_set_file_priority(storage_index_t const storage
-			, aux::vector<download_priority_t, file_index_t> prio
+			, aux::vector<download_priority_t, file_index_t> priorities
 			, std::function<void(storage_error const&
 				, aux::vector<download_priority_t, file_index_t>)> handler) override
 		{
-			fence(storage, all_pieces, [this, prio = std::move(prio), h = std::move(handler)]
+			fence(storage, all_pieces, [this, prio = std::move(priorities), h = std::move(handler)]
 				(std::shared_ptr<storage_record> const& rec)
 			{
 				if (rec->removed)
@@ -452,8 +452,8 @@ namespace {
 					return;
 				}
 				m_inner->async_set_file_priority(to_inner(*rec), prio
-					, [this, rec, h](storage_error const& e, aux::vector<download_priority_t, file_index_t> p)
-					{ inner_answered(rec, [h, e, p = std::move(p)] { h(e, p); }); });
+					, [this, rec, h](storage_error const& e, aux::vector<download_priority_t, file_index_t> result)
+					{ inner_answered(rec, [h, e, p = std::move(result)] { h(e, p); }); });
 			});
 		}
 
@@ -741,9 +741,9 @@ namespace {
 		// unless jobs that came before it still wait on the tail of a
 		// transfer of its scope: it then waits for them at the front
 		std::function<void()> parked_fence(std::shared_ptr<storage_record> const& rec
-			, piece_index_t const piece, fence_start start)
+			, piece_index_t const piece, fence_start start_fence)
 		{
-			return [this, w = std::weak_ptr<storage_record>(rec), piece, start = std::move(start)]
+			return [this, w = std::weak_ptr<storage_record>(rec), piece, start = std::move(start_fence)]
 			{
 				std::shared_ptr<storage_record> const r = w.lock();
 				if (!r->removed && tail_blocks(*r, piece))
@@ -978,11 +978,11 @@ namespace {
 		// entries go to the network thread, where they are queued for their
 		// steps. The storage is in the pool: this object and its io_context
 		// exist
-		void post_transfers(std::weak_ptr<storage_record> w
+		void post_transfers(std::weak_ptr<storage_record> record
 			, std::vector<std::shared_ptr<memory_piece_entry>> entries)
 		{
-			std::vector<std::weak_ptr<memory_piece_entry>> weak(entries.begin(), entries.end());
-			post(m_ios, [this, w = std::move(w), weak = std::move(weak)]
+			std::vector<std::weak_ptr<memory_piece_entry>> weak_entries(entries.begin(), entries.end());
+			post(m_ios, [this, w = std::move(record), weak = std::move(weak_entries)]
 			{
 				std::shared_ptr<storage_record> const rec = w.lock();
 				if (!rec || rec->removed || m_abort) return;
@@ -1643,10 +1643,10 @@ namespace {
 	}
 }
 
-	disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool> pool)
+	disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool> shared_pool)
 	{
-		TORRENT_ASSERT(pool);
-		return [pool = std::move(pool)](io_context& ioc, settings_interface const& sett
+		TORRENT_ASSERT(shared_pool);
+		return [pool = std::move(shared_pool)](io_context& ioc, settings_interface const& sett
 			, counters& cnt) -> std::unique_ptr<disk_interface>
 		{
 			return std::make_unique<aux::memory_disk_io>(ioc, sett, cnt, pool);

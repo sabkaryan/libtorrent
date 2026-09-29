@@ -351,7 +351,7 @@ namespace {
 		}
 		// no hashing threads (they were removed while the job waited): hash
 		// on the network thread
-		post(m_ios, [this, j = std::move(j)]() mutable { run(j, true); });
+		post(m_ios, [this, pj = std::move(j)]() mutable { run(pj, true); });
 	}
 
 	void memory_hasher::answer_aborted(job& j)
@@ -449,13 +449,13 @@ namespace {
 				}
 				l.unlock();
 			}
-			post(m_ios, [ref = std::move(j.ref), handler = std::move(j.handler2), piece, result, missing]
+			post(m_ios, [entry_ref = std::move(j.ref), handler = std::move(j.handler2), piece, result, missing]
 			{
 				{
-					std::lock_guard<memory_pool_mutex> ll(ref->pool().mutex);
-					if (ref->storage().is_current(ref->entry()))
-						ref->pool().hash_missing_blocks += missing;
-					ref->release();
+					std::lock_guard<memory_pool_mutex> ll(entry_ref->pool().mutex);
+					if (entry_ref->storage().is_current(entry_ref->entry()))
+						entry_ref->pool().hash_missing_blocks += missing;
+					entry_ref->release();
 				}
 				handler(piece, result, storage_error{});
 			});
@@ -583,20 +583,20 @@ namespace {
 		if (next) kick(std::move(next));
 
 		if (j.kind != job_kind::hash) return;
-		post(m_ios, [ref = std::move(j.ref), handler = std::move(j.handler), piece, v1_hash, missing_count]
+		post(m_ios, [entry_ref = std::move(j.ref), handler = std::move(j.handler), piece, v1_hash, missing_count]
 		{
 			{
-				std::lock_guard<memory_pool_mutex> ll(ref->pool().mutex);
-				memory_piece_entry& entry = ref->entry();
-				if (ref->storage().is_current(entry))
+				std::lock_guard<memory_pool_mutex> ll(entry_ref->pool().mutex);
+				memory_piece_entry& entry = entry_ref->entry();
+				if (entry_ref->storage().is_current(entry))
 				{
 					// the hash of the piece is returned only if no block was
 					// missing: a recheck of a partial piece does not make a
 					// later write start the piece over
 					if (missing_count == 0) entry.hash_returned = true;
-					ref->pool().hash_missing_blocks += missing_count;
+					entry_ref->pool().hash_missing_blocks += missing_count;
 				}
-				ref->release();
+				entry_ref->release();
 			}
 			handler(piece, v1_hash, storage_error{});
 		});
