@@ -1299,6 +1299,9 @@ namespace {
 			bool in_memory = false;
 			storage_error error;
 			disk_buffer_holder buffer;
+			// the buffer of an answer from memory is taken before the pool's
+			// mutex. A read the default backend answers frees it unused
+			read_buffer buf(static_cast<char*>(std::malloc(std::size_t(default_block_size))));
 			{
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage const& s = *rec->storage;
@@ -1307,7 +1310,7 @@ namespace {
 				// there; a partial one's later blocks are in the file
 				in_memory = e && (e->place == piece_place::memory
 					|| (e->place == piece_place::transfer && holds(s, *e, r)));
-				if (in_memory) buffer = read_block(s, *e, r, error);
+				if (in_memory) buffer = read_block(s, *e, r, buf, error);
 			}
 			if (!in_memory)
 			{
@@ -1575,11 +1578,18 @@ namespace {
 			return true;
 		}
 
-		// copies the bytes of r from the entry. A missing block that is not
-		// entirely in pad files is an error (eof, file_read). The caller
-		// holds the pool's mutex
+		// a buffer of default_block_size bytes taken with malloc
+		struct free_buffer
+		{
+			void operator()(char* const b) const { std::free(b); }
+		};
+		using read_buffer = std::unique_ptr<char, free_buffer>;
+
+		// copies the bytes of r from the entry into `buf`, which the answer
+		// takes over. A missing block that is not entirely in pad files is
+		// an error (eof, file_read). The caller holds the pool's mutex
 		disk_buffer_holder read_block(memory_storage const& s, memory_piece_entry const& e
-			, peer_request const& r, storage_error& error)
+			, peer_request const& r, read_buffer& buf, storage_error& error)
 		{
 			int const piece_size = e.hasher->piece_size;
 			if (r.length <= 0 || r.start < 0 || r.length > default_block_size
@@ -1588,13 +1598,13 @@ namespace {
 				error = storage_error(errors::invalid_request, operation_t::file_read);
 				return {};
 			}
-			char* const buf = static_cast<char*>(std::malloc(std::size_t(default_block_size)));
-			if (buf == nullptr)
+			if (!buf)
 			{
 				error = storage_error(errors::no_memory, operation_t::alloc_cache_piece);
 				return {};
 			}
-			disk_buffer_holder ret(m_read_buffers, buf);
+			disk_buffer_holder ret(m_read_buffers, buf.release());
+			char* const out = ret.data();
 			int pos = 0;
 			while (pos < r.length)
 			{
@@ -1604,9 +1614,9 @@ namespace {
 				int const len = std::min(default_block_size - in_block, r.length - pos);
 				char const* const data = s.block_data(e, block);
 				if (data != nullptr)
-					std::memcpy(buf + pos, data + in_block, std::size_t(len));
+					std::memcpy(out + pos, data + in_block, std::size_t(len));
 				else if (s.is_pad_block(e.piece, block))
-					std::memset(buf + pos, 0, std::size_t(len));
+					std::memset(out + pos, 0, std::size_t(len));
 				else
 				{
 					error = storage_error(boost::asio::error::eof, operation_t::file_read);

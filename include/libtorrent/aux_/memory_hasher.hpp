@@ -10,6 +10,7 @@ see LICENSE file.
 #ifndef TORRENT_MEMORY_HASHER_HPP_INCLUDED
 #define TORRENT_MEMORY_HASHER_HPP_INCLUDED
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -110,6 +111,8 @@ namespace libtorrent::aux {
 		memory_hasher& operator=(memory_hasher const&) = delete;
 
 		void set_threads(int threads);
+		// the number of hashing threads asked for. It takes no lock: it is
+		// called with the pool's mutex held
 		int threads() const;
 
 		// a background hash of the entry of ref (a block was written). With
@@ -158,7 +161,8 @@ namespace libtorrent::aux {
 		mutable std::mutex m_mutex;
 		std::condition_variable m_cv;
 		std::deque<job> m_queue;
-		int m_max_threads = 0;
+		// written under m_mutex; threads() reads it without the mutex
+		std::atomic<int> m_max_threads{0};
 		int m_running = 0;
 		bool m_abort = false;
 		struct thread_slot

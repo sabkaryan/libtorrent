@@ -217,8 +217,7 @@ namespace {
 
 	int memory_hasher::threads() const
 	{
-		std::lock_guard<std::mutex> l(m_mutex);
-		return m_max_threads;
+		return m_max_threads.load(std::memory_order_relaxed);
 	}
 
 	void memory_hasher::set_threads(int const threads)
