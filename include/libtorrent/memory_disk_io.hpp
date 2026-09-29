@@ -170,10 +170,9 @@ namespace libtorrent {
 		// before they return, and the moves run on the network thread
 		// without waiting: 0 right after such a call means nothing is to be
 		// moved. Pieces that have not arrived are not counted. The blocks of
-		// a partial piece count until the default backend wrote them, which
-		// for pread_disk_io may wait until the piece completes, its cache
-		// fills or the torrent is paused or stopped: to know that a paused
-		// torrent's bytes are in the file, wait for 0 after pausing it
+		// a partial piece count until the default backend wrote them; the
+		// move flushes them without waiting for a download, a full cache or
+		// a pause
 		std::int64_t pending_persist_bytes(torrent_handle const&) const;
 
 		// the number of moves to the file that failed (a write error, or the

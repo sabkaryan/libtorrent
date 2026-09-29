@@ -1024,7 +1024,10 @@ namespace {
 			// full or a fence comes. A paused or idle torrent brings none of
 			// these, and its moved blocks would wait in the cache. A
 			// release_files fence of the default backend flushes the storage
-			// now, whether or not the torrent downloads
+			// now, whether or not the torrent downloads. The cost: it flushes
+			// every dirty block of the storage, among them the blocks of
+			// pieces still downloading (their hash then reads them back from
+			// the file), closes its files and holds its jobs until it is done
 			if (partial)
 				m_inner->async_release_files(static_cast<storage_index_t>(rec->inner), {});
 			if (issued) m_inner->submit_jobs();
