@@ -30,8 +30,9 @@ TORRENT_TEST(slab_allocate_free)
 	TEST_EQUAL(a.blocks_in_use(), 4);
 }
 
-// a freed block's pages are given back: the next allocation of the same
-// block reads zeroes (MADV_DONTNEED on a private anonymous mapping)
+// a freed block's pages are given back: the next allocation gives the same
+// block. On Linux it reads zeroes (MADV_DONTNEED on a private anonymous
+// mapping); elsewhere the pages may keep their bytes until reused
 TORRENT_TEST(slab_freed_block_reads_zero)
 {
 	memory_slab_allocator a(lt::default_block_size);
@@ -40,7 +41,9 @@ TORRENT_TEST(slab_freed_block_reads_zero)
 	a.free(p);
 	char* q = a.allocate();
 	TEST_CHECK(q == p);
+#if defined TORRENT_LINUX
 	TEST_CHECK(std::all_of(q, q + lt::default_block_size, [](char c) { return c == 0; }));
+#endif
 }
 
 // an empty slab is unmapped, one spare is kept
