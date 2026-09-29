@@ -1562,6 +1562,202 @@ bool blocks_in_file(std::string const& path, std::vector<char> const& content
 		&& std::equal(b.begin() + std::ptrdiff_t(at), b.begin() + std::ptrdiff_t(at + len), piece_ptr(content, p));
 }
 
+// the read into a buffer taken under the pool's mutex. acquire() runs with
+// the mutex held: a pool call from another thread started inside it does
+// not complete while acquire() or release() runs, and completes once the
+// read returned. The bytes are the content's when release() is called,
+// once. A range across a block boundary, the short last piece (the length
+// clamped to it) and a buffer refused by acquire() (nullptr: 0, no
+// release())
+TORRENT_TEST(read_acquires_under_lock)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("read_acquires");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{2};
+		piece_index_t const last{num_pieces - 1};
+		TEST_CHECK(add_pieces(*ses, th, content, {p, last}));
+
+		std::vector<char> buf(std::size_t(piece_size), 'x');
+		int acquired = 0;
+		int released = 0;
+		bool blocked_in_acquire = false;
+		bool blocked_in_release = false;
+		bool copied_before_release = false;
+		std::future<std::int64_t> other;
+		int const r = pool->read(th, p, 0, piece_size
+			, [&]
+			{
+				++acquired;
+				other = std::async(std::launch::async, [&pool] { return pool->held_bytes(); });
+				blocked_in_acquire = other.wait_for(std::chrono::milliseconds(300))
+					== std::future_status::timeout;
+				return buf.data();
+			}
+			, [&]
+			{
+				++released;
+				copied_before_release = std::equal(buf.begin(), buf.end(), piece_ptr(content, p));
+				blocked_in_release = other.valid()
+					&& other.wait_for(std::chrono::milliseconds(0)) == std::future_status::timeout;
+			});
+		TEST_EQUAL(r, piece_size);
+		TEST_EQUAL(acquired, 1);
+		TEST_EQUAL(released, 1);
+		TEST_CHECK(blocked_in_acquire);
+		TEST_CHECK(blocked_in_release);
+		TEST_CHECK(copied_before_release);
+		TEST_CHECK(other.valid());
+		if (other.valid()) TEST_EQUAL(other.get(), pool->held_bytes());
+
+		// a range across the boundary of blocks 1 and 2
+		int const off = 2 * default_block_size - 100;
+		std::vector<char> part(300, 'x');
+		acquired = 0;
+		released = 0;
+		TEST_EQUAL(pool->read(th, p, off, int(part.size())
+			, [&] { ++acquired; return part.data(); }, [&] { ++released; }), int(part.size()));
+		TEST_CHECK(std::equal(part.begin(), part.end(), piece_ptr(content, p) + off));
+		TEST_EQUAL(acquired, 1);
+		TEST_EQUAL(released, 1);
+
+		// the last piece is short: the length is clamped to it
+		int const last_len = piece_len(content, last);
+		TEST_CHECK(last_len < piece_size);
+		std::fill(buf.begin(), buf.end(), 'x');
+		TEST_EQUAL(pool->read(th, last, 0, piece_size
+			, [&] { return buf.data(); }, [] {}), last_len);
+		TEST_CHECK(std::equal(buf.begin(), buf.begin() + last_len, piece_ptr(content, last)));
+		TEST_CHECK(std::all_of(buf.begin() + last_len, buf.end(), [](char const c) { return c == 'x'; }));
+		std::vector<char> tail(100, 'x');
+		TEST_EQUAL(pool->read(th, last, last_len - 10, int(tail.size())
+			, [&] { return tail.data(); }, [] {}), 10);
+		TEST_CHECK(std::equal(tail.begin(), tail.begin() + 10, piece_ptr(content, last) + last_len - 10));
+		TEST_CHECK(std::all_of(tail.begin() + 10, tail.end(), [](char const c) { return c == 'x'; }));
+
+		// acquire() gives no buffer: 0, release() is not called
+		released = 0;
+		TEST_EQUAL(pool->read(th, p, 0, piece_size
+			, []() -> char* { return nullptr; }, [&] { ++released; }), 0);
+		TEST_EQUAL(released, 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// acquire() is not called when nothing is copied: a piece that has not
+// arrived, a piece in the file, a partial piece whose requested range
+// misses a block, an offset out of the piece, len <= 0 and a removed
+// handle. The span read copies nothing of the partial piece either, and
+// both read its present block
+TORRENT_TEST(read_acquire_not_called_when_missing)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("read_not_acquired");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const mem{0};
+		piece_index_t const file_piece{1};
+		piece_index_t const partial{3};
+		piece_index_t const none{4};
+		piece_index_t const to_file[] = {file_piece};
+		pool->persist(th, to_file);
+		TEST_CHECK(add_pieces(*ses, th, content, {mem, file_piece}));
+		TEST_CHECK(write_blocks(*ses, th, content, partial, 0, 1));
+		TEST_CHECK(pool->in_memory(th).complete.get_bit(mem));
+		TEST_CHECK(pool->in_memory(th).partial.get_bit(partial));
+		TEST_CHECK(!pool->in_memory(th).complete.get_bit(file_piece));
+
+		std::vector<char> buf(std::size_t(piece_size), 'x');
+		int acquired = 0;
+		int released = 0;
+		auto const read_into = [&](piece_index_t const p, int const offset, int const len)
+		{
+			return pool->read(th, p, offset, len
+				, [&] { ++acquired; return buf.data(); }, [&] { ++released; });
+		};
+		TEST_EQUAL(read_into(none, 0, piece_size), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(file_piece, 0, piece_size), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(partial, 0, piece_size), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(partial, default_block_size - 10, 20), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(mem, piece_size, 1), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(mem, -1, 1), memory_storage_pool::not_in_memory);
+		TEST_EQUAL(read_into(mem, 0, 0), 0);
+		TEST_EQUAL(read_into(mem, 0, -1), 0);
+		TEST_EQUAL(acquired, 0);
+		TEST_EQUAL(released, 0);
+		TEST_CHECK(std::all_of(buf.begin(), buf.end(), [](char const c) { return c == 'x'; }));
+
+		// the span read: nothing of the present block is copied
+		TEST_EQUAL(pool->read(th, partial, 0, buf), memory_storage_pool::not_in_memory);
+		TEST_CHECK(std::all_of(buf.begin(), buf.end(), [](char const c) { return c == 'x'; }));
+
+		// the present block of the partial piece is read by both
+		TEST_EQUAL(read_into(partial, 0, default_block_size), default_block_size);
+		TEST_EQUAL(acquired, 1);
+		TEST_EQUAL(released, 1);
+		TEST_CHECK(std::equal(buf.begin(), buf.begin() + default_block_size, piece_ptr(content, partial)));
+		std::vector<char> block(std::size_t(default_block_size), 'x');
+		TEST_EQUAL(pool->read(th, partial, 0, block), default_block_size);
+		TEST_CHECK(std::equal(block.begin(), block.end(), piece_ptr(content, partial)));
+
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+		acquired = 0;
+		released = 0;
+		TEST_EQUAL(read_into(mem, 0, piece_size), memory_storage_pool::not_managed);
+		TEST_EQUAL(acquired, 0);
+		TEST_EQUAL(released, 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a block entirely in a pad file is not written: it is read as zeros, by
+// both reads. File a ends inside piece 1 and a pad file fills the piece,
+// so block 3 of piece 1 is all pad
+TORRENT_TEST(read_pad_block_zeros)
+{
+	std::vector<char> content(std::size_t(3 * piece_size));
+	aux::random_bytes(content);
+	int const a_size = 100000;
+	std::fill(content.begin() + a_size, content.begin() + 2 * piece_size, char(0));
+	std::vector<create_file_entry> fs;
+	fs.emplace_back("padded/a", a_size);
+	fs.emplace_back("padded/b", piece_size);
+	lt::create_torrent ct(std::move(fs), piece_size, create_torrent::v1_only | create_torrent::canonical_files);
+	TEST_EQUAL(ct.num_pieces(), 3);
+	for (auto const p : ct.piece_range())
+		ct.set_hash(p, hasher(piece_ptr(content, p), piece_size).final());
+
+	std::string const path = complete("read_pad_block");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, load_torrent_buffer(bencode(ct.generate())), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{1};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		TEST_CHECK(wait_for([&] { return th.have_piece(p); }));
+
+		std::vector<char> buf(std::size_t(piece_size), 'x');
+		TEST_EQUAL(pool->read(th, p, 0, piece_size, [&] { return buf.data(); }, [] {}), piece_size);
+		TEST_CHECK(std::equal(buf.begin(), buf.end(), piece_ptr(content, p)));
+		std::vector<char> pad(std::size_t(default_block_size), 'x');
+		TEST_EQUAL(pool->read(th, p, 3 * default_block_size, pad), default_block_size);
+		TEST_CHECK(std::all_of(pad.begin(), pad.end(), [](char const c) { return c == 0; }));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
 // property 11: a claim for the file moves a partial piece: its blocks in
 // memory are written to the file (and leave memory), and its later blocks
 // go to the file too. Once all are there the piece is "in file".

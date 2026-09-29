@@ -11,6 +11,7 @@ see LICENSE file.
 #define TORRENT_MEMORY_DISK_IO_HPP_INCLUDED
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 #include "libtorrent/config.hpp"
@@ -206,9 +207,23 @@ namespace libtorrent {
 		// again
 		memory_forget_result forget_piece(torrent_handle const&, piece_index_t);
 
-		// copies bytes of a piece held in memory into the buffer. Returns the
-		// number of bytes copied, not_in_memory or not_managed
+		// copies bytes of a piece held in memory into the buffer, at most the
+		// piece size minus offset (pad blocks read as zeros; a piece being
+		// moved to the file is still read from memory). Returns the number of
+		// bytes copied, not_in_memory or not_managed. Nothing is copied
+		// unless every requested byte is in memory
 		int read(torrent_handle const&, piece_index_t, int offset, span<char>) const;
+
+		// as read() above, for a caller whose buffer may only be held while the
+		// bytes are copied. Once the pool's mutex is held and every requested
+		// byte is known to be in memory, acquire() is called and returns the
+		// buffer of at least `len` bytes; the bytes are copied into it and then
+		// release() is called, both with the mutex held. Neither may call the
+		// pool. acquire() is not called when nothing is copied (not_in_memory,
+		// not_managed, len <= 0); if it returns nullptr, release() is not called
+		// and 0 is returned
+		int read(torrent_handle const&, piece_index_t, int offset, int len
+			, std::function<char*()> const& acquire, std::function<void()> const& release) const;
 
 		// the pieces of the torrent held in memory
 		memory_pieces in_memory(torrent_handle const&) const;

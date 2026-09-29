@@ -26,6 +26,8 @@ see LICENSE file.
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <limits>
 
 namespace libtorrent {
 
@@ -454,38 +456,74 @@ namespace {
 		return ret;
 	}
 
-	int memory_storage_pool::read(torrent_handle const& th, piece_index_t const piece
-		, int const offset, span<char> const buf) const
+namespace {
+
+	// both read() calls. Under the pool's mutex: the piece is found, the
+	// length clamped and every block of [offset, offset + len) checked
+	// before the buffer is taken, so nothing is copied partially and the
+	// buffer is held only for the copy
+	template <typename Acquire, typename Release>
+	int read_piece(aux::memory_pool_impl& impl, torrent_handle const& th, piece_index_t const piece
+		, int const offset, int const len, Acquire const& acquire, Release const& release)
 	{
 		std::shared_ptr<aux::torrent> const t = th.native_handle();
-		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
-		std::shared_ptr<aux::memory_storage> const st = m_impl->storage_of(t);
-		if (!st) return not_managed;
+		std::lock_guard<aux::memory_pool_mutex> l(impl.mutex);
+		std::shared_ptr<aux::memory_storage> const st = impl.storage_of(t);
+		if (!st) return memory_storage_pool::not_managed;
 		aux::memory_storage const& s = *st;
-		if (piece < piece_index_t{0} || piece >= s.files().end_piece()) return not_in_memory;
+		if (piece < piece_index_t{0} || piece >= s.files().end_piece())
+			return memory_storage_pool::not_in_memory;
 		auto const e = s.current(piece);
 		// a piece in transfer is read from memory until its blocks are freed
 		if (!e || (e->place != piece_place::memory && e->place != piece_place::transfer))
-			return not_in_memory;
+			return memory_storage_pool::not_in_memory;
 		int const piece_size = e->hasher->piece_size;
-		if (offset < 0 || offset >= piece_size) return not_in_memory;
-		int const len = static_cast<int>(std::min(buf.size(), std::ptrdiff_t(piece_size - offset)));
+		if (offset < 0 || offset >= piece_size) return memory_storage_pool::not_in_memory;
+		if (len <= 0) return 0;
+		int const n = std::min(len, piece_size - offset);
+
+		int const first = offset / default_block_size;
+		int const last = (offset + n - 1) / default_block_size;
+		for (int block = first; block <= last; ++block)
+		{
+			if (s.block_data(*e, block) == nullptr && !s.is_pad_block(piece, block))
+				return memory_storage_pool::not_in_memory;
+		}
+
+		char* const buf = acquire();
+		if (buf == nullptr) return 0;
 		int pos = 0;
-		while (pos < len)
+		while (pos < n)
 		{
 			int const block = (offset + pos) / default_block_size;
 			int const in_block = (offset + pos) % default_block_size;
-			int const n = std::min(default_block_size - in_block, len - pos);
+			int const step = std::min(default_block_size - in_block, n - pos);
 			char const* const data = s.block_data(*e, block);
 			if (data != nullptr)
-				std::memcpy(buf.data() + pos, data + in_block, std::size_t(n));
-			else if (s.is_pad_block(piece, block))
-				std::memset(buf.data() + pos, 0, std::size_t(n));
+				std::memcpy(buf + pos, data + in_block, std::size_t(step));
 			else
-				return not_in_memory;
-			pos += n;
+				std::memset(buf + pos, 0, std::size_t(step));
+			pos += step;
 		}
-		return len;
+		release();
+		return n;
+	}
+}
+
+	int memory_storage_pool::read(torrent_handle const& th, piece_index_t const piece
+		, int const offset, span<char> const buf) const
+	{
+		int const len = static_cast<int>(std::min(buf.size()
+			, std::ptrdiff_t(std::numeric_limits<int>::max())));
+		return read_piece(*m_impl, th, piece, offset, len
+			, [&buf] { return buf.data(); }, [] {});
+	}
+
+	int memory_storage_pool::read(torrent_handle const& th, piece_index_t const piece
+		, int const offset, int const len
+		, std::function<char*()> const& acquire, std::function<void()> const& release) const
+	{
+		return read_piece(*m_impl, th, piece, offset, len, acquire, release);
 	}
 
 	memory_pieces memory_storage_pool::in_memory(torrent_handle const& th) const
