@@ -594,6 +594,56 @@ TORRENT_TEST(hash_incremental)
 	TEST_EQUAL(lt::aux::memory_hasher_tail_blocks_for_test() - tail0, 0);
 }
 
+// blocks written out of order, 1, 2 and 3, then 0: the background hash
+// feeds SHA-1 in block order, from block 0, and once block 0 is there it
+// hashes the blocks that were waiting behind it. async_hash then hashes no
+// block of its own, and its hash is pread_disk_io's. The hybrid torrent's
+// v2 block hashes are computed as the blocks arrive: the background hash
+// of blocks 1 to 3 is done before block 0 is written
+TORRENT_TEST(hash_out_of_order)
+{
+	int const blocks = 4;
+	lt::file_storage const fs = one_piece("out_of_order/file", blocks);
+	lt::piece_index_t const p{0};
+	std::vector<char> const data = piece_data(fs, p, true);
+
+	for (bool const v2 : {false, true})
+	{
+		std::printf("v2: %d\n", int(v2));
+		disk_env mem(lt::memory_disk_io_constructor(memory_pool()), 1);
+		disk_env ref(lt::pread_disk_io_constructor, 1);
+		lt::storage_index_t const ms = mem.add(fs, "out_of_order_memory", true, v2);
+		lt::storage_index_t const rs = ref.add(fs, "out_of_order_pread", true, v2);
+		std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
+
+		mem.write(ms, p, data, {0});
+		TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued; }));
+		if (v2)
+		{
+			TEST_CHECK(mem.run_until([&] {
+				return lt::aux::memory_hasher_background_blocks_for_test() - background0 >= blocks - 1; }));
+		}
+		mem.write(ms, p, data, {1, 2, 3});
+		// every block once for SHA-1, and once for SHA-256 with v2
+		std::int64_t const all = v2 ? 2 * blocks : blocks;
+		TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+			&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == all; }));
+
+		std::int64_t const tail0 = lt::aux::memory_hasher_tail_blocks_for_test();
+		int const v2_blocks = v2 ? blocks : 0;
+		auto const mh = mem.hash(ms, p, true, v2_blocks);
+		TEST_EQUAL(lt::aux::memory_hasher_tail_blocks_for_test() - tail0, 0);
+
+		ref.write(rs, p, data);
+		auto const rh = ref.hash(rs, p, true, v2_blocks);
+		TEST_CHECK(!mh.error);
+		TEST_CHECK(!rh.error);
+		TEST_CHECK(mh.v1 == rh.v1);
+		TEST_CHECK(mh.v1 == sha1(data));
+		TEST_CHECK(mh.v2 == rh.v2);
+	}
+}
+
 // a piece with blocks missing hashes them as zeros, answers without an
 // error and counts them in hash_missing_blocks()
 TORRENT_TEST(missing_block_hashes_as_zero)
@@ -958,9 +1008,9 @@ TORRENT_TEST(delete_and_remove_free_memory)
 namespace {
 
 // issues one of the eight fences of disk_interface on `st`. `done` is called
-// by its handler
-using fence_call = std::function<void(lt::disk_interface&, lt::storage_index_t
-	, std::function<void()> done)>;
+// by its handler, with its error (none for a handler without one)
+using fence_done = std::function<void(lt::storage_error const&)>;
+using fence_call = std::function<void(lt::disk_interface&, lt::storage_index_t, fence_done done)>;
 
 struct fence_case
 {
@@ -968,47 +1018,66 @@ struct fence_case
 	fence_call issue;
 	// the fence is async_clear_piece of the piece the gate holds a hash of
 	bool clears_hashed_piece;
+	// its handler takes an error: on a removed storage it is
+	// operation_aborted
+	bool aborted_when_removed;
+	// the default backend closes the files of the storage for it
+	bool closes_files;
 };
 
 std::vector<fence_case> every_fence(lt::piece_index_t const hashed)
 {
-	using done_t = std::function<void()>;
 	return {
-		{"clear_piece", [hashed](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
-			{ d.async_clear_piece(st, hashed, [done](lt::piece_index_t) { done(); }); }, true},
-		{"move_storage", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+		{"clear_piece", [hashed](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
+			{ d.async_clear_piece(st, hashed, [done](lt::piece_index_t) { done({}); }); }
+			, true, false, false},
+		{"move_storage", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_move_storage(st, "every_fence_moved", lt::move_flags_t::always_replace_files
-					, [done](lt::status_t, std::string const&, lt::storage_error const&) { done(); });
-			}, false},
-		{"release_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
-			{ d.async_release_files(st, [done] { done(); }); }, false},
-		{"stop_torrent", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
-			{ d.async_stop_torrent(st, [done] { done(); }); }, false},
-		{"rename_file", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+					, [done](lt::status_t, std::string const&, lt::storage_error const& e) { done(e); });
+			}, false, true, false},
+		{"release_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
+			{ d.async_release_files(st, [done] { done({}); }); }
+			, false, false, true},
+		{"stop_torrent", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
+			{ d.async_stop_torrent(st, [done] { done({}); }); }
+			, false, false, true},
+		{"rename_file", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_rename_file(st, lt::file_index_t{0}, "every_fence/renamed"
-					, [done](std::string const&, lt::file_index_t, lt::storage_error const&) { done(); });
-			}, false},
-		{"delete_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+					, [done](std::string const&, lt::file_index_t, lt::storage_error const& e) { done(e); });
+			}, false, true, false},
+		{"delete_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_delete_files(st, lt::session_handle::delete_files
-					, [done](lt::storage_error const&) { done(); });
-			}, false},
-		{"set_file_priority", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+					, [done](lt::storage_error const& e) { done(e); });
+			}, false, true, false},
+		{"set_file_priority", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				lt::aux::vector<lt::download_priority_t, lt::file_index_t> prio;
 				prio.push_back(lt::default_priority);
 				d.async_set_file_priority(st, std::move(prio)
-					, [done](lt::storage_error const&, lt::aux::vector<lt::download_priority_t, lt::file_index_t>)
-					{ done(); });
-			}, false},
-		{"check_files", [](lt::disk_interface& d, lt::storage_index_t const st, done_t done)
+					, [done](lt::storage_error const& e, lt::aux::vector<lt::download_priority_t, lt::file_index_t>)
+					{ done(e); });
+			}, false, true, false},
+		{"check_files", [](lt::disk_interface& d, lt::storage_index_t const st, fence_done done)
 			{
 				d.async_check_files(st, nullptr, {}
-					, [done](lt::status_t, lt::storage_error const&) { done(); });
-			}, false},
+					, [done](lt::status_t, lt::storage_error const& e) { done(e); });
+			}, false, true, false},
 	};
+}
+
+// writes the file of a storage made by disk_env::add() of `fs` (one file,
+// under `path`): `bytes` from its start
+void write_file(std::string const& path, lt::file_storage const& fs, std::vector<char> const& bytes)
+{
+	std::string const file = lt::combine_path(path, fs.file_path(lt::file_index_t{0}));
+	lt::error_code ec;
+	lt::create_directories(lt::parent_path(file), ec);
+	TEST_CHECK(!ec);
+	std::ofstream f(file, std::ios::binary);
+	f.write(bytes.data(), std::streamsize(bytes.size()));
 }
 
 } // anonymous namespace
@@ -1019,23 +1088,43 @@ std::vector<fence_case> every_fence(lt::piece_index_t const hashed)
 // (piece 1, whose last block is missing; for async_clear_piece, piece 0
 // itself) and a read of that block. Nothing answers while the gate holds;
 // once released the handlers run hash -> fence -> write -> read, and the read
-// returns the written bytes
+// returns the written bytes.
+//
+// The fences the default backend answers alone (release_files and
+// stop_torrent: their answers carry nothing of it) show that they reach it:
+// a read of piece 2, which is in the file and has no entry, makes the
+// default backend open the file first, and the fence closes it
 TORRENT_TEST(every_fence_parks_jobs)
 {
 	int const blocks = 4;
 	lt::file_storage fs;
 	fs.set_piece_length(blocks * lt::default_block_size);
-	fs.add_file("every_fence/file", 2 * blocks * lt::default_block_size, {});
-	fs.set_num_pieces(2);
+	fs.add_file("every_fence/file", 3 * blocks * lt::default_block_size, {});
+	fs.set_num_pieces(3);
 	lt::piece_index_t const p{0};
 	lt::piece_index_t const q{1};
+	lt::piece_index_t const in_file{2};
 
 	for (fence_case const& fc : every_fence(p))
 	{
 		std::printf("fence: %s\n", fc.name);
 		disk_env mem(lt::memory_disk_io_constructor(memory_pool()), 1);
 		mem.paths.push_back("every_fence_moved");
-		lt::storage_index_t const ms = mem.add(fs, std::string("every_fence_") + fc.name, true, false);
+		std::string const path = std::string("every_fence_") + fc.name;
+		lt::storage_index_t const ms = mem.add(fs, path, true, false);
+		if (fc.closes_files)
+		{
+			std::vector<char> bytes(std::size_t(fs.total_size()), 0);
+			std::vector<char> const third = piece_data(fs, in_file, true);
+			std::copy(third.begin(), third.end(), bytes.begin() + std::ptrdiff_t(2 * fs.piece_length()));
+			write_file(path, fs, bytes);
+			lt::storage_error error;
+			std::vector<char> const b = mem.read(ms, lt::peer_request{in_file, 0, lt::default_block_size}, error);
+			TEST_CHECK(!error);
+			TEST_CHECK(b.size() == std::size_t(lt::default_block_size)
+				&& std::equal(b.begin(), b.end(), third.begin()));
+			TEST_CHECK(!mem.disk->get_status(ms).empty());
+		}
 		std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
 		mem.write(ms, p, piece_data(fs, p, true));
 		mem.write(ms, q, piece_data(fs, q, true), {blocks - 1});
@@ -1049,7 +1138,7 @@ TORRENT_TEST(every_fence_parks_jobs)
 		mem.disk->submit_jobs();
 		TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
 
-		fc.issue(*mem.disk, ms, [&] { order.emplace_back("fence"); });
+		fc.issue(*mem.disk, ms, [&](lt::storage_error const&) { order.emplace_back("fence"); });
 		lt::peer_request const r = fc.clears_hashed_piece
 			? lt::peer_request{p, 0, lt::default_block_size}
 			: lt::peer_request{q, (blocks - 1) * lt::default_block_size, lt::default_block_size};
@@ -1072,6 +1161,8 @@ TORRENT_TEST(every_fence_parks_jobs)
 		TEST_CHECK(mem.run_until([&] { return order.size() == 4; }));
 		TEST_CHECK(order == (std::vector<std::string>{"hash", "fence", "write", "read"}));
 		TEST_CHECK(read_back == fresh);
+		// the default backend closed the file it had open
+		if (fc.closes_files) TEST_CHECK(mem.disk->get_status(ms).empty());
 	}
 }
 
@@ -1151,55 +1242,68 @@ TORRENT_TEST(clear_piece_in_file_goes_to_default_backend)
 #endif
 
 // jobs parked behind a fence of a storage that is removed answer
-// operation_aborted when the fence lowers, and reach no backend; a parked
-// fence answers too. The fence that is up (a clear of a piece in memory)
-// waits for an async_hash the gate holds
+// operation_aborted when the fence lowers, and reach no backend. The fence
+// that is up (a clear of a piece in memory) waits for an async_hash the gate
+// holds. Behind it: a write, a read, a second async_hash, an async_hash2 and
+// a fence, each of the eight in turn. Started on the removed storage, the
+// fence answers without the default backend: with operation_aborted if its
+// handler takes an error
 TORRENT_TEST(parked_jobs_of_removed_storage_answer_aborted)
 {
 	lt::file_storage const fs = one_piece("removed_parked/file", 4);
 	lt::piece_index_t const p{0};
 
-	auto const pool = memory_pool();
-	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
-	lt::storage_index_t const ms = mem.add(fs, "removed_parked", true, false);
-	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
-	mem.write(ms, p, piece_data(fs, p, true));
-	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
-		&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == 4; }));
-
-	memory_hasher_gate gate(p);
-	std::vector<std::string> order;
-	std::vector<std::string> aborted;
-	auto const record = [&](char const* name, lt::storage_error const& e)
+	for (fence_case const& fc : every_fence(p))
 	{
-		order.emplace_back(name);
-		if (e.ec == boost::asio::error::operation_aborted) aborted.emplace_back(name);
-	};
-	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
-		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("hash", e); });
-	mem.disk->submit_jobs();
-	TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
+		std::printf("fence: %s\n", fc.name);
+		auto const pool = memory_pool();
+		disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+		mem.paths.push_back("every_fence_moved");
+		lt::storage_index_t const ms = mem.add(fs, std::string("removed_parked_") + fc.name, true, true);
+		std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
+		mem.write(ms, p, piece_data(fs, p, true));
+		// a v1 and a v2 hash of each block
+		TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued
+			&& lt::aux::memory_hasher_background_blocks_for_test() - background0 == 8; }));
 
-	mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { order.emplace_back("clear"); });
-	std::vector<char> const fresh(std::size_t(lt::default_block_size), 'N');
-	lt::peer_request const r{p, 0, lt::default_block_size};
-	mem.disk->async_write(ms, r, fresh.data(), {}
-		, [&](lt::storage_error const& e) { record("write", e); });
-	mem.disk->async_read(ms, r, [&](lt::disk_buffer_holder, lt::storage_error const& e)
-		{ record("read", e); }, {});
-	mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
-		, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("hash2", e); });
-	mem.disk->async_stop_torrent(ms, [&] { order.emplace_back("stop"); });
-	mem.disk->submit_jobs();
+		memory_hasher_gate gate(p);
+		std::vector<std::string> order;
+		std::vector<std::string> aborted;
+		auto const record = [&](char const* name, lt::storage_error const& e)
+		{
+			order.emplace_back(name);
+			if (e.ec == boost::asio::error::operation_aborted) aborted.emplace_back(name);
+		};
+		mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+			, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("hash", e); });
+		mem.disk->submit_jobs();
+		TEST_CHECK(mem.run_until([] { return memory_hasher_gate::waiting() == 1; }));
 
-	mem.storages.back().reset();
-	gate.release();
-	TEST_CHECK(mem.run_until([&] { return order.size() == 6; }));
-	// nothing answers twice
-	mem.run_for(lt::milliseconds(200));
-	TEST_CHECK(order == (std::vector<std::string>{"hash", "clear", "write", "read", "hash2", "stop"}));
-	TEST_CHECK(aborted == (std::vector<std::string>{"write", "read", "hash2"}));
-	TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
+		mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { order.emplace_back("clear"); });
+		std::vector<char> const fresh(std::size_t(lt::default_block_size), 'N');
+		lt::peer_request const r{p, 0, lt::default_block_size};
+		mem.disk->async_write(ms, r, fresh.data(), {}
+			, [&](lt::storage_error const& e) { record("write", e); });
+		mem.disk->async_read(ms, r, [&](lt::disk_buffer_holder, lt::storage_error const& e)
+			{ record("read", e); }, {});
+		mem.disk->async_hash(ms, p, {}, lt::disk_interface::v1_hash
+			, [&](lt::piece_index_t, lt::sha1_hash const&, lt::storage_error const& e) { record("rehash", e); });
+		mem.disk->async_hash2(ms, p, 0, {}
+			, [&](lt::piece_index_t, lt::sha256_hash const&, lt::storage_error const& e) { record("hash2", e); });
+		fc.issue(*mem.disk, ms, [&](lt::storage_error const& e) { record("fence", e); });
+		mem.disk->submit_jobs();
+
+		mem.storages.back().reset();
+		gate.release();
+		TEST_CHECK(mem.run_until([&] { return order.size() == 7; }));
+		// nothing answers twice
+		mem.run_for(lt::milliseconds(200));
+		TEST_CHECK(order == (std::vector<std::string>{"hash", "clear", "write", "read", "rehash", "hash2", "fence"}));
+		std::vector<std::string> expected{"write", "read", "rehash", "hash2"};
+		if (fc.aborted_when_removed) expected.emplace_back("fence");
+		TEST_CHECK(aborted == expected);
+		TEST_EQUAL(lt::aux::memory_blocks_in_use_for_test(*mem.disk), 0);
+	}
 }
 
 // a storage removed while a hashing thread holds an entry of it is retired,
@@ -1359,8 +1463,15 @@ struct tail_answers
 // only after a fence). The piece is forgotten, and a write, a read, a hash
 // and a block hash of it go to the default backend: they wait on the tail
 // of the transfer. Then `end` runs (it removes the storage or aborts the
-// disk_interface): every one of them answers operation_aborted
-void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)> const& end)
+// disk_interface): every one of them answers operation_aborted.
+//
+// With `fence_behind`, a fence (async_rename_file) issued after them waits
+// behind them, as a fence waits for the jobs on a tail issued before it.
+// The storage is removed: the fence, started on the removed storage,
+// answers operation_aborted once the step of the transfer (one of our jobs)
+// ends
+void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)> const& end
+	, bool const fence_behind)
 {
 	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
 	lt::file_storage fs;
@@ -1370,11 +1481,14 @@ void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)>
 	lt::storage_index_t const st = env.add(fs, "tail_torrent", true, false);
 	lt::piece_index_t const p{0};
 	std::vector<char> const data = piece_data(fs, p, true);
+	std::int64_t const background0 = lt::aux::memory_hasher_background_blocks_for_test();
 	env.write(st, p, data);
 	TEST_CHECK(env.run_until([&] { return env.writes_done == env.writes_issued; }));
 	TEST_CHECK(lt::aux::memory_place_for_test(*env.disk, st, p) == lt::piece_place::memory);
-	// the background hash of the blocks is done
-	env.run_for(lt::milliseconds(200));
+	// the background hash of the blocks is done: the gate below holds the
+	// pool's hash of the move, not a background hash
+	TEST_CHECK(env.run_until([&] {
+		return lt::aux::memory_hasher_background_blocks_for_test() - background0 == 2; }));
 
 	memory_hasher_gate gate(p);
 	lt::piece_index_t const set[] = {p};
@@ -1395,12 +1509,31 @@ void parked_on_tail_answered(std::function<void(disk_env&, lt::storage_index_t)>
 	// the default backend answers the move's writes and hash meanwhile
 	env.run_for(lt::milliseconds(300));
 	TEST_EQUAL(a.answered, 0);
+	TEST_EQUAL(lt::aux::memory_tail_jobs_for_test(*env.disk, st, p), 4);
+	bool fenced = false;
+	if (fence_behind)
+	{
+		env.disk->async_rename_file(st, lt::file_index_t{0}, "tail/renamed"
+			, [&](std::string const&, lt::file_index_t, lt::storage_error const& e)
+			{
+				fenced = true;
+				a(e);
+			});
+		env.disk->submit_jobs();
+	}
 
 	end(env, st);
 	TEST_CHECK(env.run_until([&] { return a.answered == 4; }));
 	TEST_EQUAL(a.aborted, 4);
+	TEST_CHECK(!fenced);
 	gate.release();
+	if (fence_behind)
+	{
+		TEST_CHECK(env.run_until([&] { return fenced; }));
+		TEST_EQUAL(a.aborted, 5);
+	}
 	env.run_for(lt::milliseconds(200));
+	TEST_EQUAL(a.answered, fence_behind ? 5 : 4);
 }
 
 } // anonymous namespace
@@ -1411,7 +1544,7 @@ TORRENT_TEST(transfer_parked_answered_on_remove)
 	{
 		for (auto& h : env.storages)
 			if (static_cast<lt::storage_index_t>(h) == st) h.reset();
-	});
+	}, true);
 }
 
 TORRENT_TEST(transfer_parked_answered_on_abort)
@@ -1419,7 +1552,7 @@ TORRENT_TEST(transfer_parked_answered_on_abort)
 	parked_on_tail_answered([](disk_env& env, lt::storage_index_t)
 	{
 		env.disk->abort(false);
-	});
+	}, false);
 }
 
 namespace {
@@ -1459,7 +1592,7 @@ TORRENT_TEST(partial_transfer_spends_one_shot)
 	lt::piece_index_t const set[] = {p};
 	lt::aux::memory_persist_for_test(*env.disk, st, set);
 	// the step runs on the network thread (here: this io_context)
-	env.run_for(lt::milliseconds(100));
+	TEST_CHECK(env.run_until([&] { return lt::aux::memory_steps_issued_for_test(*env.disk, st) == 1; }));
 	// block 1 goes to the default backend; the piece completes and is
 	// flushed, which answers the move's write
 	env.write(st, p, data, {0});
@@ -1480,7 +1613,9 @@ TORRENT_TEST(partial_transfer_spends_one_shot)
 // removed while its writes are in the default backend (held here at the
 // write gate). The default backend's storage stays until the step is
 // answered, then goes: no job of the default backend outlives its storage,
-// and the transfer's entry is freed
+// and the transfer's entry is freed. The storage is drained from the
+// removal until the step is answered (finish_step() lets it go, not the
+// destructor of the disk_interface)
 TORRENT_TEST(transfer_keeps_inner_after_remove)
 {
 	disk_env env(lt::memory_disk_io_constructor(memory_pool()), 1);
@@ -1495,15 +1630,19 @@ TORRENT_TEST(transfer_keeps_inner_after_remove)
 	lt::piece_index_t const set[] = {p};
 	lt::aux::memory_set_persist_for_test(*env.disk, st, set);
 	TEST_CHECK(env.run_until([] { return held_writes() > 0; }));
+	TEST_EQUAL(lt::aux::memory_draining_for_test(*env.disk), 0);
 
 	for (auto& h : env.storages)
 		if (static_cast<lt::storage_index_t>(h) == st) h.reset();
+	TEST_EQUAL(lt::aux::memory_draining_for_test(*env.disk), 1);
 	env.run_for(lt::milliseconds(200));
 	// the retired entry is pinned by the step
 	TEST_CHECK(lt::aux::memory_blocks_in_use_for_test(*env.disk) > 0);
+	TEST_EQUAL(lt::aux::memory_draining_for_test(*env.disk), 1);
 
 	set_hold_writes(false);
-	TEST_CHECK(env.run_until([&] { return lt::aux::memory_blocks_in_use_for_test(*env.disk) == 0; }));
+	TEST_CHECK(env.run_until([&] { return lt::aux::memory_blocks_in_use_for_test(*env.disk) == 0
+		&& lt::aux::memory_draining_for_test(*env.disk) == 0; }));
 	env.run_for(lt::milliseconds(200));
 }
 #endif

@@ -614,6 +614,25 @@ namespace {
 			s.set_in_file(piece, false);
 		}
 
+		int fence_jobs(storage_index_t const storage) const
+		{
+			return int(m_torrents[storage]->fence.parked.size());
+		}
+
+		int tail_jobs(storage_index_t const storage, piece_index_t const piece) const
+		{
+			auto const& tails = m_torrents[storage]->tails;
+			auto const it = tails.find(piece);
+			return it == tails.end() ? 0 : int(it->second.parked.size());
+		}
+
+		int steps_issued(storage_index_t const storage) const
+		{
+			return m_torrents[storage]->steps_issued;
+		}
+
+		int draining() const { return int(m_draining.size()); }
+
 	private:
 
 		// the fences of one storage. Used on the network thread only
@@ -684,6 +703,8 @@ namespace {
 			// backend's storage stays (in `inner`) until they are 0, even
 			// after remove_torrent(): its jobs refer to it
 			int steps = 0;
+			// steps issued since the storage was added (a test hook)
+			int steps_issued = 0;
 		};
 
 		// wakes the transfers of a storage when the default backend's queue
@@ -1092,6 +1113,7 @@ namespace {
 				e->transfer_started = true;
 				e->partial_transfer = e->missing_blocks > 0;
 				++rec->steps;
+				++rec->steps_issued;
 				step->piece = piece;
 				step->partial = e->partial_transfer;
 				v1 = s.v1();
@@ -1666,6 +1688,31 @@ namespace {
 		, piece_index_t const piece)
 	{
 		if (auto* const m = memory_disk_io_for_test(disk)) m->forget(storage, piece);
+	}
+
+	int memory_fence_jobs_for_test(disk_interface& disk, storage_index_t const storage)
+	{
+		auto* const m = memory_disk_io_for_test(disk);
+		return m ? m->fence_jobs(storage) : 0;
+	}
+
+	int memory_tail_jobs_for_test(disk_interface& disk, storage_index_t const storage
+		, piece_index_t const piece)
+	{
+		auto* const m = memory_disk_io_for_test(disk);
+		return m ? m->tail_jobs(storage, piece) : 0;
+	}
+
+	int memory_steps_issued_for_test(disk_interface& disk, storage_index_t const storage)
+	{
+		auto* const m = memory_disk_io_for_test(disk);
+		return m ? m->steps_issued(storage) : 0;
+	}
+
+	int memory_draining_for_test(disk_interface& disk)
+	{
+		auto* const m = memory_disk_io_for_test(disk);
+		return m ? m->draining() : 0;
 	}
 }
 

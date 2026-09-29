@@ -292,6 +292,19 @@ namespace libtorrent::aux {
 		, storage_index_t storage, span<piece_index_t const> pieces);
 	TORRENT_EXTRA_EXPORT void memory_forget_for_test(disk_interface& disk
 		, storage_index_t storage, piece_index_t piece);
+	// test hooks of the fences and transfers of ``disk``, called on its
+	// network thread: the jobs of the storage parked behind a fence now;
+	// the jobs of the piece bound for the default backend that wait on the
+	// tail of a transfer of the piece now; the steps of transfers issued for
+	// the storage since it was added; the removed storages whose default
+	// backend storage is kept until their steps are answered
+	TORRENT_EXTRA_EXPORT int memory_fence_jobs_for_test(disk_interface& disk
+		, storage_index_t storage);
+	TORRENT_EXTRA_EXPORT int memory_tail_jobs_for_test(disk_interface& disk
+		, storage_index_t storage, piece_index_t piece);
+	TORRENT_EXTRA_EXPORT int memory_steps_issued_for_test(disk_interface& disk
+		, storage_index_t storage);
+	TORRENT_EXTRA_EXPORT int memory_draining_for_test(disk_interface& disk);
 }
 
 #endif
