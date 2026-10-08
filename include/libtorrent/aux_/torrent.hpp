@@ -1400,6 +1400,18 @@ namespace libtorrent::aux {
 #endif
 		}
 
+		bool is_time_critical(piece_index_t const piece) const
+		{
+#ifndef TORRENT_DISABLE_STREAMING
+			return std::any_of(m_time_critical_pieces.begin(),
+				m_time_critical_pieces.end(),
+				[piece](time_critical_piece const& p) { return p.piece == piece; });
+#else
+			TORRENT_UNUSED(piece);
+			return false;
+#endif
+		}
+
 		int get_suggest_pieces(std::vector<piece_index_t>& p
 			, typed_bitfield<piece_index_t> const& bits
 			, int const n)

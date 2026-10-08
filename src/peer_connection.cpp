@@ -5196,6 +5196,41 @@ namespace {
 
 		TORRENT_ASSERT(!m_download_queue.empty());
 
+		// blocks of time-critical pieces are the ones holding up the deadlines,
+		// and they are rarely the last request in the queue. Time all of them
+		// out, even if their pieces still have free blocks: the time-critical
+		// logic requests those anyway, and the piece can't complete without
+		// this block. Being snubbed, this peer won't be asked for them again.
+		bool timed_out_critical = false;
+		if (t->num_time_critical_pieces() > 0)
+		{
+			for (pending_block& qe : m_download_queue)
+			{
+				if (qe.timed_out || qe.not_wanted)
+					continue;
+				if (!t->is_time_critical(qe.block.piece_index))
+					continue;
+
+				if (t->alerts().should_post<block_timeout_alert>())
+				{
+					t->alerts().emplace_alert<block_timeout_alert>(t->get_handle(),
+						remote(),
+						pid(),
+						qe.block.block_index,
+						qe.block.piece_index);
+				}
+				qe.timed_out = true;
+				picker.abort_download(qe.block, peer_info_struct());
+				timed_out_critical = true;
+			}
+		}
+
+		if (timed_out_critical)
+		{
+			send_block_requests();
+			return;
+		}
+
 		// time out the last request eligible
 		// block in the queue
 		int i = int(m_download_queue.size()) - 1;

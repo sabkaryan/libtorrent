@@ -7,6 +7,7 @@ You may use, distribute and modify this code under the terms of the BSD license,
 see LICENSE file.
 */
 
+#include <algorithm>
 #include <array>
 #include <functional>
 #include <string>
@@ -19,6 +20,9 @@ see LICENSE file.
 #include "libtorrent/alert_types.hpp"
 #include "libtorrent/disabled_disk_io.hpp"
 #include "libtorrent/aux_/random.hpp"
+#include "libtorrent/aux_/has_block.hpp"
+#include "libtorrent/aux_/peer_connection.hpp"
+#include "libtorrent/aux_/torrent.hpp"
 #include "libtorrent/torrent_flags.hpp"
 #include "libtorrent/create_torrent.hpp"
 #include "libtorrent/load_torrent.hpp"
@@ -497,4 +501,130 @@ TORRENT_TEST(hybrid_honest_v2_claim_hash_request_not_rejected)
 {
 	// an unrecognized file-root gets a hash_reject reply, not a disconnect
 	run_metadata_edge_case(true, v2_claim_reserved, 21, true, false);
+}
+
+// A peer that stops sending is snubbed. Its requests for blocks of
+// time-critical pieces must all be timed out at once, even though the last
+// request in its queue is in a piece with free blocks, so that another peer
+// can be asked for them.
+TORRENT_TEST(snub_times_out_time_critical_blocks)
+{
+	using namespace lt;
+	using namespace lt::aux;
+
+	sim::default_config cfg;
+	sim::simulation sim{cfg};
+	sim::asio::io_context ios{sim, make_address_v4("50.0.0.1")};
+	lt::session_proxy zombie;
+
+	lt::session_params sp;
+	sp.settings = settings();
+	sp.settings.set_int(settings_pack::alert_mask, alert_category::all & ~alert_category::stats);
+	// the shortest timeout there is, used until a peer has sent any blocks
+	sp.settings.set_int(settings_pack::request_timeout, 2);
+	sp.disk_io_constructor = lt::disabled_disk_io_constructor;
+	auto ses = std::make_shared<lt::session>(sp, ios);
+	fake_peer stalled(sim, "60.0.0.1");
+	fake_peer other(sim, "60.0.0.2");
+
+	// 4 blocks per piece
+	auto params = ::create_torrent(nullptr, "temp", 0x10000, 8, false);
+	params.save_path = ".";
+	params.flags &= ~(torrent_flags::auto_managed | torrent_flags::paused);
+	auto const ih = params.ti->info_hash();
+
+	torrent_handle h;
+	auto find_peer = [&](char const* ip) -> peer_connection* {
+		auto const tor = h.native_handle();
+		for (auto i = tor->begin(); i != tor->end(); ++i)
+			if ((*i)->remote().address() == make_address_v4(ip))
+				return *i;
+		return nullptr;
+	};
+
+	bool snubbed = false;
+	print_alerts(*ses, [&](lt::session&, lt::alert const* a) {
+		if (auto const* at = alert_cast<add_torrent_alert>(a))
+		{
+			h = at->handle;
+			// Both peers keep us choked for now, so the pickers do not request
+			// anything by themselves.
+			stalled.connect_to(ep("50.0.0.1", 6881), ih);
+			stalled.send_have_all();
+			other.connect_to(ep("50.0.0.1", 6881), ih);
+			std::vector<bool> pieces(8, false);
+			pieces[0] = true;
+			other.send_bitfield(pieces);
+		}
+		if (alert_cast<peer_snubbed_alert>(a) && !snubbed)
+		{
+			snubbed = true;
+			auto* p = find_peer("60.0.0.1");
+			TEST_CHECK(p != nullptr);
+			if (!p)
+				return;
+			auto const& dq = p->download_queue();
+			TEST_EQUAL(int(dq.size()), 4);
+			for (auto const& b : dq)
+			{
+				bool const critical = b.block.piece_index != piece_index_t(1);
+				TEST_EQUAL(bool(b.timed_out), critical);
+			}
+		}
+	});
+	ses->async_add_torrent(std::move(params));
+
+	sim::timer t1(sim, seconds(1), [&](error_code const&) {
+		auto const tor = h.native_handle();
+		tor->set_piece_deadline(piece_index_t(0), 0, {});
+		tor->set_piece_deadline(piece_index_t(2), 0, {});
+	});
+
+	sim::timer t2(sim, milliseconds(1500), [&](error_code const&) {
+		auto* p = find_peer("60.0.0.1");
+		TEST_CHECK(p != nullptr);
+		if (!p)
+			return;
+		// requests like the regular piece picker makes them; the last one is
+		// in a piece with free blocks
+		TEST_CHECK(p->add_request(piece_block(piece_index_t(0), 0)));
+		TEST_CHECK(p->add_request(piece_block(piece_index_t(0), 1)));
+		TEST_CHECK(p->add_request(piece_block(piece_index_t(2), 0)));
+		TEST_CHECK(p->add_request(piece_block(piece_index_t(1), 0)));
+		p->send_block_requests();
+	});
+
+	// the other peer has only the time-critical piece 0, and unchokes us
+	// after the stalled peer has been snubbed
+	sim::timer t3(sim, milliseconds(5500), [&](error_code const&) {
+		TEST_CHECK(snubbed);
+		other.send_message(1);
+		other.flush_send_buffer();
+	});
+
+	bool checked = false;
+	sim::timer t4(sim, milliseconds(8500), [&](error_code const&) {
+		auto* p = find_peer("60.0.0.2");
+		TEST_CHECK(p != nullptr);
+		if (!p)
+			return;
+		auto requested = [p](int const block) {
+			piece_block const b(piece_index_t(0), block);
+			auto const& dq = p->download_queue();
+			auto const& rq = p->request_queue();
+			return std::find_if(dq.begin(), dq.end(), has_block(b)) != dq.end()
+				|| std::find_if(rq.begin(), rq.end(), has_block(b)) != rq.end();
+		};
+		// the blocks the stalled peer was holding are requested from this one
+		TEST_CHECK(requested(0));
+		TEST_CHECK(requested(1));
+		checked = true;
+	});
+
+	sim::timer t5(sim, seconds(9), [&](error_code const&) {
+		zombie = ses->abort();
+		ses.reset();
+	});
+	sim.run();
+	TEST_CHECK(checked);
 }
