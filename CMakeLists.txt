@@ -204,6 +204,7 @@ set(libtorrent_aux_include_files
 	ip_notifier.hpp
 	ip_voter.hpp
 	keepalive.hpp
+	late_blocks.hpp
 	link.hpp
 	listen_socket_handle.hpp
 	lsd.hpp

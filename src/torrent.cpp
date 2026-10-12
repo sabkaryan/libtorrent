@@ -90,6 +90,7 @@ see LICENSE file.
 #include "libtorrent/aux_/resolve_duplicate_filenames.hpp"
 #include "libtorrent/aux_/file_progress.hpp"
 #include "libtorrent/aux_/has_block.hpp"
+#include "libtorrent/aux_/late_blocks.hpp"
 #include "libtorrent/aux_/alert_manager.hpp"
 #include "libtorrent/disk_interface.hpp"
 #include "libtorrent/aux_/ip_helpers.hpp" // for is_ip_address
@@ -11679,6 +11680,12 @@ namespace {
 
 		time_point const now = clock_type::now();
 
+		std::vector<piece_index_t> time_critical;
+		time_critical.reserve(m_time_critical_pieces.size());
+		for (auto const& i : m_time_critical_pieces) time_critical.push_back(i.piece);
+		std::sort(time_critical.begin(), time_critical.end());
+		auto const held = held_blocks(m_connections, time_critical, block_size());
+
 		// now, iterate over all time critical pieces, in order of importance, and
 		// request them from the peers, in order of responsiveness. i.e. request
 		// the most time critical pieces from the fastest peers.
@@ -11714,6 +11721,15 @@ namespace {
 				break;
 			}
 			first_piece = false;
+
+			late_requests const late = request_late_blocks(i.deadline
+				, held_blocks_of(held, i.piece), peers, peers_with_requests, now, block_size());
+			if (late.copies + late.moves > 0)
+			{
+				std::sort(peers.begin(), peers.end()
+					, [] (peer_connection const* lhs, peer_connection const* rhs)
+					{ return lhs->download_queue_time(16*1024) < rhs->download_queue_time(16*1024); });
+			}
 
 			piece_picker::downloading_piece pi;
 			m_picker->piece_info(i.piece, pi);

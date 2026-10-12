@@ -130,6 +130,7 @@ run test_dht.cpp
 	<crypto>openssl:<library>/torrent//crypto ;
 
 run test_add_torrent.cpp ;
+run test_late_blocks.cpp ;
 run test_forget_piece.cpp : : : <target-os>linux:<linkflags>-ldl ;
 run test_piece_flushed_alert.cpp : : : <target-os>linux:<linkflags>-ldl ;
 run test_info_hash.cpp ;
@@ -298,6 +299,7 @@ alias deterministic-tests :
 	test_io
 	test_ip_filter
 	test_ip_voter
+	test_late_blocks
 	test_listen_socket
 	test_magnet
 	test_merge_block_requests

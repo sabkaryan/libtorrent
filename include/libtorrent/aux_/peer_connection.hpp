@@ -421,6 +421,14 @@ namespace libtorrent::aux {
 		// bytes as if they've been requested
 		time_duration download_queue_time(int extra_bytes = 0) const;
 
+		// the download rate, in bytes per second, download_queue_time()
+		// assumes for this peer
+		int download_rate_estimate() const;
+
+		// the number of time-critical requests at the front of the request
+		// queue, not sent yet
+		int num_queued_time_critical() const { return m_queued_time_critical; }
+
 		bool is_interesting() const { return m_interesting; }
 		bool is_choked() const override { return m_choked; }
 
@@ -650,6 +658,8 @@ namespace libtorrent::aux {
 
 		int outstanding_bytes() const { return m_outstanding_bytes; }
 
+		bool is_snubbed() const { return m_snubbed; }
+
 		int send_buffer_size() const
 		{ return m_send_buffer.size(); }
 
@@ -674,6 +684,10 @@ namespace libtorrent::aux {
 		// the time we last unchoked this peer
 		time_point time_of_last_unchoke() const
 		{ return m_last_unchoke.get(m_connect); }
+
+		// the time this peer last unchoked us
+		time_point time_of_last_unchoked() const
+		{ return m_last_unchoked.get(m_connect); }
 
 		// called when the disk write buffer is drained again, and we can
 		// start downloading payload again

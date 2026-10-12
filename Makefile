@@ -620,6 +620,7 @@ HEADERS = \
   aux_/ip_notifier.hpp              \
   aux_/ip_voter.hpp                 \
   aux_/keepalive.hpp                \
+  aux_/late_blocks.hpp              \
   aux_/link.hpp                     \
   aux_/listen_socket_handle.hpp     \
   aux_/lsd.hpp                      \
@@ -844,6 +845,7 @@ SIM_SOURCES = \
   test_super_seeding.cpp \
   test_swarm.cpp \
   test_thread_pool.cpp \
+  test_time_critical.cpp \
   test_torrent_status.cpp \
   test_tracker.cpp \
   test_transfer.cpp \
@@ -965,6 +967,7 @@ TEST_SOURCES = \
   test_io.cpp \
   test_ip_filter.cpp \
   test_ip_voter.cpp \
+  test_late_blocks.cpp \
   test_listen_socket.cpp \
   test_lsd.cpp \
   test_magnet.cpp \
