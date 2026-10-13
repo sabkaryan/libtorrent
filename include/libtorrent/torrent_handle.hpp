@@ -332,6 +332,8 @@ namespace aux {
 		// Stop considering ``piece`` as downloaded, so it is picked and
 		// downloaded again, without disconnecting peers or re-checking the
 		// torrent. Pending requests for the piece from peers are rejected.
+		// Our requests to peers for blocks of the piece that are still
+		// outstanding stay, and count for its new download.
 		// The data on disk is not touched; the caller may release its bytes
 		// (e.g. punch a hole in the file) once this call has returned.
 		// This is a synchronous call. It returns:

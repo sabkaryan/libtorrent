@@ -4744,10 +4744,31 @@ namespace {
 
 		bool const was_finished = is_finished();
 
-		// mirror of the two internal call sites (resume data with
-		// unfinished pieces, and v2 hash failure): drop the piece from the
-		// picker and update the gauge state
+		// drop the piece from the picker, as resume data with unfinished
+		// pieces and a v2 hash failure do
 		m_picker->we_dont_have(index);
+		// a peer may still wait for a block of the piece: one also requested
+		// from another peer, which delivered it first. mark_as_writing() took
+		// the block out of the requested state, so cancel_request() left this
+		// request wanted. Now that the block is wanted again, give the picker
+		// back these requests, as on_piece_sync() does after a failed hash
+		for (auto* p : m_connections)
+		{
+			TORRENT_INCREMENT(m_iterating_connections);
+			for (auto const& b : p->download_queue())
+			{
+				if (b.timed_out || b.not_wanted) continue;
+				if (b.block.piece_index != index) continue;
+				m_picker->mark_as_downloading(b.block, p->peer_info_struct()
+					, p->picker_options());
+			}
+			for (auto const& b : p->request_queue())
+			{
+				if (b.block.piece_index != index) continue;
+				m_picker->mark_as_downloading(b.block, p->peer_info_struct()
+					, p->picker_options());
+			}
+		}
 		// reads of this piece still in flight may read bytes the caller is now
 		// free to release; their completion must not send them, even once the
 		// piece has been downloaded again
