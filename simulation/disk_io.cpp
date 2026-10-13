@@ -441,6 +441,20 @@ struct test_disk_io final : lt::disk_interface
 		TORRENT_ASSERT(r.length == std::min(lt::default_block_size
 			, effective_piece_size - r.start));
 
+		if (r.piece == m_state.fail_piece && m_state.fail_writes_left > 0)
+		{
+			--m_state.fail_writes_left;
+			auto const ec = m_state.fail_errc;
+			queue_event(lt::milliseconds(1), [this,ec,h=std::move(handler)] () mutable {
+				post(m_ioc, [ec,h=std::move(h)]
+				{
+					h(lt::storage_error(lt::error_code(ec, lt::generic_category())
+						, lt::operation_t::file_write));
+				});
+				});
+			return false;
+		}
+
 		if (m_state.space_left < lt::default_block_size)
 		{
 			queue_event(lt::milliseconds(1), [this,h=std::move(handler)] () mutable {

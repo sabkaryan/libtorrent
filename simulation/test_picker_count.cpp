@@ -542,3 +542,140 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	std::fflush(stdout);
 	std::_Exit(stage == 3 && mismatches == 0 ? 0 : 1);
 }
+
+// As forget_after_busy_duplicate, but the piece is restored by a failed write
+// instead of a forget: a slow peer holds requests for blocks of a piece, a
+// deadline makes a fast peer fetch the same blocks (busy requests), and the
+// first write of a block of the piece fails (by default with ENOMEM, as when
+// a disk backend cannot allocate the block). The failure path restores the
+// piece (write_failed(), async_clear_piece(), on_piece_fail_sync()); the
+// slow peer's requests stay in its queues. Once the piece is downloading
+// again, compare its requests with the picker's counts.
+// PC_ERR: the errno of the failure (default ENOMEM).
+TORRENT_TEST(write_fail_after_busy_duplicate)
+{
+	using namespace lt;
+
+	dsl_config network_cfg(100000, 1000000, lt::milliseconds(10));
+	sim::simulation sim{network_cfg};
+
+	int const num_pieces = 8;
+	lt::add_torrent_params atp = ::create_test_torrent(16 * 0x4000, num_pieces, {});
+	atp.save_path = ".";
+	atp.flags &= ~(lt::torrent_flags::auto_managed | lt::torrent_flags::paused);
+	piece_index_t const piece{0};
+
+	std::vector<std::unique_ptr<sim::asio::io_context>> ios;
+	std::vector<std::shared_ptr<lt::session>> seeds;
+	char const* ips[] = {"60.0.0.1", "60.0.0.2"}; // slow, fast
+	int const rates[] = {2, 1000}; // KiB/s
+	for (int i = 0; i < 2; ++i)
+	{
+		ios.push_back(std::make_unique<sim::asio::io_context>(sim, make_address_v4(ips[i])));
+		lt::session_params sp;
+		sp.settings = settings();
+		sp.settings.set_str(settings_pack::listen_interfaces, std::string(ips[i]) + ":6881");
+		sp.settings.set_int(settings_pack::upload_rate_limit, rates[i] * 1024);
+		sp.settings.set_bool(settings_pack::close_redundant_connections, false);
+		sp.disk_io_constructor = test_disk().set_seed(true);
+		seeds.push_back(std::make_shared<lt::session>(sp, *ios.back()));
+		auto seed_atp = atp;
+		seed_atp.flags |= lt::torrent_flags::seed_mode;
+		seeds.back()->async_add_torrent(seed_atp);
+	}
+
+	sim::asio::io_context dl_ios(sim, make_address_v4("50.0.0.1"));
+	lt::session_params dp;
+	dp.settings = settings();
+	dp.settings.set_str(settings_pack::listen_interfaces, "50.0.0.1:6881");
+	dp.settings.set_bool(settings_pack::close_redundant_connections, false);
+	auto const err = static_cast<boost::system::errc::errc_t>(
+		env_int("PC_ERR", int(boost::system::errc::not_enough_memory)));
+	dp.disk_io_constructor = test_disk().fail_writes(piece, 1, err);
+	auto ses = std::make_shared<lt::session>(dp, dl_ios);
+
+	lt::torrent_handle h;
+	bool failed = false;
+	ses->set_alert_notify([&] {
+		post(ses->get_context(), [&] {
+			std::vector<lt::alert*> alerts;
+			ses->pop_alerts(&alerts);
+			for (lt::alert* a : alerts)
+			{
+				if (auto const* at = alert_cast<add_torrent_alert>(a))
+				{
+					h = at->handle;
+					std::vector<download_priority_t> prio(std::size_t(num_pieces), dont_download);
+					prio[0] = top_priority;
+					h.prioritize_pieces(prio);
+					h.connect_peer(tcp::endpoint(make_address_v4(ips[0]), 6881));
+				}
+				else if (alert_cast<file_error_alert>(a))
+				{
+					failed = true;
+				}
+			}
+		});
+	});
+	ses->async_add_torrent(atp);
+
+	// 0: the slow peer gets requests; 1: the fast peer and the deadline;
+	// 2: the write failed, wait for the piece to be downloading again;
+	// 3: compare
+	int stage = 0;
+	int stale_sent = -1;
+	int stale_unsent = -1;
+	int failed_at = -1;
+	bool restored_downloading = false;
+	int mismatches = 0;
+	int ticks = 0;
+	sim::asio::high_resolution_timer timer(dl_ios);
+	std::function<void(boost::system::error_code const&)> on_tick;
+	on_tick = [&](boost::system::error_code const&) {
+		++ticks;
+		auto tor = h.is_valid() ? h.native_handle() : nullptr;
+		if (tor && stage == 0 && ticks >= 20)
+		{
+			h.connect_peer(tcp::endpoint(make_address_v4(ips[1]), 6881));
+			h.set_piece_deadline(piece, 0);
+			stage = 1;
+		}
+		else if (tor && stage == 1 && failed && failed_at < 0)
+		{
+			failed_at = ticks;
+		}
+		else if (tor && stage == 1 && failed_at >= 0 && ticks >= failed_at + 5
+			&& tor->has_picker())
+		{
+			// async_clear_piece() and on_piece_fail_sync() ran: requests still
+			// queued for the piece are stale unless the picker counts them
+			restored_downloading = tor->picker().is_downloading(piece);
+			stale_sent = wanted_requests(*tor, piece, true);
+			stale_unsent = wanted_requests(*tor, piece, false);
+			// the fast peer was disconnected by an ENOMEM failure
+			h.connect_peer(tcp::endpoint(make_address_v4(ips[1]), 6881));
+			stage = 2;
+		}
+		else if (tor && stage == 2 && tor->has_picker() && tor->picker().is_downloading(piece))
+		{
+			mismatches = count_mismatches(*tor);
+			stage = 3;
+		}
+		if (stage == 3 || ticks > 600) { sim.stop(); return; }
+		timer.expires_after(lt::milliseconds(100));
+		timer.async_wait(on_tick);
+	};
+	timer.expires_after(lt::milliseconds(100));
+	timer.async_wait(on_tick);
+	sim.run();
+
+	std::printf("RESULT stage=%d failed=%d stale_sent=%d stale_unsent=%d"
+		" restored_downloading=%d mismatches=%d\n"
+		, stage, int(failed), stale_sent, stale_unsent, int(restored_downloading), mismatches);
+	// the scenario happened: the write failed and the piece was downloaded
+	// again
+	TEST_EQUAL(stage, 3);
+	TEST_EQUAL(mismatches, 0);
+	std::fflush(stdout);
+	std::_Exit(stage == 3 && mismatches == 0 ? 0 : 1);
+}
