@@ -259,7 +259,6 @@ namespace {
 				s.mark_removed();
 				m_pool->spilled_of_removed += s.spilled_pieces();
 				m_pool->declined_of_removed += s.declined_pieces();
-				s.reset_declined();
 				if (s.pinned())
 				{
 					m_pool->retired.push_back({rec->storage, torrent, &m_ios});
@@ -387,12 +386,6 @@ namespace {
 				{
 					answer_now(*rec, [h] { h(disk_status::fatal_disk_error, aborted()); });
 					return;
-				}
-				// a check starts the torrent's picker over: the declined pieces
-				// are not restored one by one any more
-				{
-					std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
-					rec->storage->reset_declined();
 				}
 				// the pieces the resume data names: "in file" once the check
 				// accepted it

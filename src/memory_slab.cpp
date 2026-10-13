@@ -104,7 +104,8 @@ namespace {
 
 	char* memory_slab_allocator::allocate()
 	{
-		if (m_fail_allocations > 0)
+		if (m_skip_allocations > 0) --m_skip_allocations;
+		else if (m_fail_allocations > 0)
 		{
 			--m_fail_allocations;
 			return nullptr;

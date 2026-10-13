@@ -40,6 +40,10 @@ see LICENSE file.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include "libtorrent/aux_/disable_warnings_push.hpp"
+#include <boost/asio/post.hpp>
+#include "libtorrent/aux_/disable_warnings_pop.hpp"
+
 #include <fstream>
 #include <functional>
 #include <limits>
@@ -927,6 +931,64 @@ TORRENT_TEST(clear_piece_new_entry)
 		TEST_CHECK(passed.v1 == sha1(data));
 		TEST_EQUAL(pool->held_bytes(), blocks * lt::default_block_size);
 	}
+}
+
+// memory_only at the limit: block 0 is declined, and its handler asks for a
+// clear (as the torrent does). The tombstone stands until that clear is
+// answered: block 1, written after the handler and before the answer, is
+// declined although the limit was raised. Once both are answered the piece
+// is stored again
+TORRENT_TEST(declined_tombstone_lifted_after_its_clear)
+{
+	int const blocks = 2;
+	lt::file_storage const fs = one_piece("declined_lift/file", blocks);
+	lt::piece_index_t const p{0};
+	std::vector<char> const data = piece_data(fs, p, true);
+	auto const pool = std::make_shared<lt::memory_storage_pool>();
+	pool->set_default_policy(lt::memory_policy::memory_only);
+	pool->set_limit(0);
+	disk_env mem(lt::memory_disk_io_constructor(pool), 0);
+	lt::storage_index_t const ms = mem.add(fs, "declined_lift", true, false);
+
+	auto write_block = [&](int const b, std::function<void(lt::storage_error const&)> h)
+	{
+		lt::peer_request const r{p, b * lt::default_block_size, lt::default_block_size};
+		mem.disk->async_write(ms, r, data.data() + b * lt::default_block_size, {}, std::move(h)
+			, lt::disk_job_flags_t{});
+		mem.disk->submit_jobs();
+	};
+	lt::error_code block0;
+	lt::error_code block1;
+	bool block1_done = false;
+	bool cleared = false;
+	write_block(0, [&](lt::storage_error const& e)
+	{
+		block0 = e.ec;
+		pool->set_limit(std::numeric_limits<std::int64_t>::max());
+		// runs after this handler, before the answer of the clear below
+		boost::asio::post(mem.ios, [&]
+		{
+			write_block(1, [&](lt::storage_error const& e1)
+			{
+				block1 = e1.ec;
+				block1_done = true;
+			});
+		});
+		mem.disk->async_clear_piece(ms, p, [&](lt::piece_index_t) { cleared = true; });
+		mem.disk->submit_jobs();
+	});
+	TEST_CHECK(mem.run_until([&] { return cleared && block1_done; }));
+	TEST_CHECK(block0 == lt::errors::write_declined);
+	TEST_CHECK(block1 == lt::errors::write_declined);
+	TEST_EQUAL(pool->held_bytes(), 0);
+	TEST_EQUAL(pool->declined_pieces(), 1);
+
+	// block 1's handler ran without a clear: nothing is pending, the piece
+	// is stored
+	mem.write(ms, p, data);
+	TEST_CHECK(mem.run_until([&] { return mem.writes_done == mem.writes_issued; }));
+	TEST_EQUAL(pool->held_bytes(), blocks * lt::default_block_size);
+	TEST_EQUAL(pool->declined_pieces(), 1);
 }
 
 // async_delete_files and remove_torrent free the memory of the torrent. An

@@ -271,8 +271,8 @@ namespace libtorrent::aux {
 		static int pending_claims(memory_storage_pool const& pool);
 		// removed storages the pool keeps for filter_resume()
 		static int residues(memory_storage_pool const& pool);
-		// the next n block allocations of the pool fail
-		static void fail_allocations(memory_storage_pool const& pool, int n);
+		// after `skip` more block allocations of the pool, the next n fail
+		static void fail_allocations(memory_storage_pool const& pool, int n, int skip = 0);
 	};
 
 	// test hook: the place of the current entry of a piece of a storage of

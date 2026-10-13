@@ -978,9 +978,10 @@ TORRENT_TEST(memory_only_alloc_failure_declines)
 		auto ses = make_session(pool);
 		torrent_handle const th = add(*ses, atp, path);
 		TEST_CHECK(wait_state(th, torrent_status::downloading));
-		// the first block of piece 2 cannot be allocated: the piece is declined
+		// block 1 of piece 2 cannot be allocated: the piece is declined, and
+		// its block 0, already held, is dropped with it
 		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}}));
-		access::fail_allocations(*pool, 1);
+		access::fail_allocations(*pool, 1, 1);
 		TEST_CHECK(declined(*pool, th, content, {piece_index_t{2}}, 1));
 		TEST_EQUAL(pool->held_bytes(), piece_size);
 		TEST_CHECK(healthy(th));

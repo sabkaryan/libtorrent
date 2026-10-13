@@ -271,10 +271,11 @@ namespace {
 		return pool.m_impl->alloc.blocks_in_use();
 	}
 
-	void memory_pool_test_access::fail_allocations(memory_storage_pool const& pool, int const n)
+	void memory_pool_test_access::fail_allocations(memory_storage_pool const& pool, int const n
+		, int const skip)
 	{
 		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
-		pool.m_impl->alloc.fail_allocations(n);
+		pool.m_impl->alloc.fail_allocations(n, skip);
 	}
 
 	int memory_pool_test_access::retired_storages(memory_storage_pool const& pool)

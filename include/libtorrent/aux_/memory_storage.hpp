@@ -250,7 +250,13 @@ namespace libtorrent::aux {
 		// write, and its handler restores the piece in the picker. The
 		// tombstone is lifted on the network thread, in the step where no
 		// declined write is unanswered and no clear of it is pending, so a
-		// write cannot come between the lift and the last restore
+		// write cannot come between the lift and the last restore. One
+		// window is left: a declined write parked behind a fence over the
+		// whole storage (release_files, as torrent::finished() issues) after
+		// a clear of the piece parked there too has its handler run after
+		// that clear's restore, and write_failed() then meets the piece's
+		// next download (a lost request count until its own clear restores
+		// the piece again)
 		bool declined(piece_index_t piece) const;
 		void decline(piece_index_t piece);
 		// the handler of a declined write of the piece ran
@@ -261,8 +267,6 @@ namespace libtorrent::aux {
 		void declined_clear_answered(piece_index_t piece);
 		// lifts the tombstone if nothing is pending; true if it is gone
 		bool lift_declined(piece_index_t piece);
-		// drops every tombstone (a check of the files, a removal)
-		void reset_declined() { m_declined.clear(); }
 		// pieces declined so far (a piece counts once per tombstone)
 		int declined_pieces() const { return m_declined_pieces; }
 
