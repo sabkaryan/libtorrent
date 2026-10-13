@@ -63,6 +63,17 @@ struct test_disk
 		ret.recover_full_disk = true;
 		return ret;
 	}
+	// the first `writes` writes of blocks of `piece` fail with `ec`, as a disk
+	// backend that refuses a block does (e.g. out of memory)
+	test_disk fail_writes(lt::piece_index_t const piece, int const writes
+		, boost::system::errc::errc_t const ec) const
+	{
+		auto ret = *this;
+		ret.fail_piece = piece;
+		ret.fail_writes_left = writes;
+		ret.fail_errc = ec;
+		return ret;
+	}
 	test_disk send_corrupt_data(int const blocks) const
 	{
 		auto ret = *this;
@@ -103,6 +114,11 @@ struct test_disk
 
 	// after having written this many bytes, fail with disk-full
 	int space_left = std::numeric_limits<int>::max();
+
+	// see fail_writes()
+	lt::piece_index_t fail_piece{-1};
+	int fail_writes_left = 0;
+	boost::system::errc::errc_t fail_errc = boost::system::errc::not_enough_memory;
 };
 
 std::ostream& operator<<(std::ostream& os, existing_files_mode const mode);
