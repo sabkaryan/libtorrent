@@ -141,19 +141,33 @@ namespace {
 		return it == storages.end() ? nullptr : it->storage;
 	}
 
+namespace {
+	// a registration matching the torrent's v1 or v2 info-hash, or `best`
+	// by the registration's v1 or truncated v2
+	bool registration_matches(info_hash_t const& reg, info_hash_t const& ih, sha1_hash const& best)
+	{
+		if (reg.has_v1() && ih.has_v1() && reg.v1 == ih.v1) return true;
+		if (reg.has_v2() && ih.has_v2() && reg.v2 == ih.v2) return true;
+		if (reg.has_v1() && reg.v1 == best) return true;
+		return reg.has_v2() && reg.get(protocol_version::V2) == best;
+	}
+}
+
 	memory_policy memory_pool_impl::policy_for(info_hash_t const& ih, sha1_hash const& best) const
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
-		auto const matches = [&ih, &best](info_hash_t const& reg)
-		{
-			if (reg.has_v1() && ih.has_v1() && reg.v1 == ih.v1) return true;
-			if (reg.has_v2() && ih.has_v2() && reg.v2 == ih.v2) return true;
-			if (reg.has_v1() && reg.v1 == best) return true;
-			return reg.has_v2() && reg.get(protocol_version::V2) == best;
-		};
 		for (auto const& r : registrations)
-			if (matches(r.first)) return r.second;
+			if (registration_matches(r.first, ih, best)) return r.second;
 		return default_policy;
+	}
+
+	void memory_pool_impl::consume_registration(info_hash_t const& ih, sha1_hash const& best)
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		auto const it = std::find_if(registrations.begin(), registrations.end()
+			, [&](std::pair<info_hash_t, memory_policy> const& r)
+			{ return registration_matches(r.first, ih, best); });
+		if (it != registrations.end()) registrations.erase(it);
 	}
 
 	void memory_pool_impl::add_pending(std::weak_ptr<void> torrent
@@ -257,6 +271,12 @@ namespace {
 		return pool.m_impl->alloc.blocks_in_use();
 	}
 
+	void memory_pool_test_access::fail_allocations(memory_storage_pool const& pool, int const n)
+	{
+		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
+		pool.m_impl->alloc.fail_allocations(n);
+	}
+
 	int memory_pool_test_access::retired_storages(memory_storage_pool const& pool)
 	{
 		std::lock_guard<memory_pool_mutex> l(pool.m_impl->mutex);
@@ -345,6 +365,11 @@ namespace {
 	{
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		m_impl->limit = bytes;
+	}
+
+	void memory_storage_pool::set_limit(torrent_handle const& th, std::int64_t const bytes)
+	{
+		claim(*m_impl, th, [bytes](aux::memory_storage& s) { s.set_limit(bytes); }, moves::no);
 	}
 
 	void memory_storage_pool::persist(torrent_handle const& th, span<piece_index_t const> const pieces)
@@ -574,6 +599,15 @@ namespace {
 		std::int64_t ret = m_impl->spilled_of_removed;
 		for (auto const& r : m_impl->storages)
 			ret += r.storage->spilled_pieces();
+		return ret;
+	}
+
+	std::int64_t memory_storage_pool::declined_pieces() const
+	{
+		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+		std::int64_t ret = m_impl->declined_of_removed;
+		for (auto const& r : m_impl->storages)
+			ret += r.storage->declined_pieces();
 		return ret;
 	}
 

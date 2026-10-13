@@ -36,7 +36,26 @@ namespace libtorrent {
 		// pieces are written to files by the regular disk backend
 		file,
 		// pieces are kept in the memory pool
-		memory
+		memory,
+		// pieces are kept in the memory pool only. A piece that the limit
+		// (of the pool or of the torrent) would send to the file is declined
+		// instead: its blocks are not stored anywhere, the write handler gets
+		// errors::write_declined, and the torrent downloads the piece again
+		// later, without a disk error and without blaming the peers that
+		// sent it. A block that cannot be allocated declines its piece the
+		// same way. declined_pieces() counts the declined pieces.
+		//
+		// It applies to pieces that start after it: a piece already started
+		// in the file is finished there, so set it before the torrent is
+		// added (set_policy() by info-hash). Explicit claims are stronger: a
+		// persist or a file claim sends the piece to the file, and a memory
+		// claim makes it a plain memory piece (which spills to the file at
+		// the limit). The policy does not stop the default backend from
+		// touching the files on its own: raising the priority of a file from
+		// 0 makes it create the file and move the file's pieces out of the
+		// part file. A client that wants nothing written leaves the file
+		// priorities alone and works with piece priorities
+		memory_only
 	};
 
 	// where the current bytes of one piece live in the in-memory disk
@@ -131,7 +150,10 @@ namespace libtorrent {
 		void set_default_policy(memory_policy);
 
 		// registers the policy of a torrent before it is added. It matches by
-		// the v1 info-hash or by the truncated v2 info-hash
+		// the v1 info-hash or by the truncated v2 info-hash. A registration is
+		// used once: the first storage it applies to takes it, and a later
+		// addition of the same torrent gets the default policy unless it is
+		// registered again
 		void set_policy(info_hash_t const&, memory_policy);
 
 		// the claim of one owner on a torrent, or on the given files of it
@@ -149,6 +171,14 @@ namespace libtorrent {
 		// bytes of retired entries still in use by disk jobs
 		// (retired_bytes()) are not counted against it
 		void set_limit(std::int64_t bytes);
+
+		// the number of bytes one torrent may hold, -1 (the default) for no
+		// limit of its own. A piece of the torrent starts in memory only
+		// while both the pool holds less than its limit and the torrent less
+		// than this one; it is checked when a piece starts, as the pool's
+		// limit. At the limit a piece goes to the file, or is declined under
+		// memory_policy::memory_only
+		void set_limit(torrent_handle const&, std::int64_t bytes);
 
 		// a one-shot request to store the given pieces in the file: a piece
 		// held in memory is moved there, a piece that has not started starts
@@ -243,6 +273,11 @@ namespace libtorrent {
 		// pieces that were bound for memory and went to the file because the
 		// pool was at its limit, of removed torrents too
 		std::int64_t spilled_pieces() const;
+
+		// pieces declined under memory_policy::memory_only, of removed
+		// torrents too. A piece counts once per decline: from the first
+		// declined block until the torrent has restored the piece
+		std::int64_t declined_pieces() const;
 
 		// blocks that were missing when a piece held in memory was hashed
 		std::int64_t hash_missing_blocks() const;

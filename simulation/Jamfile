@@ -71,3 +71,4 @@ run test_peer_connection.cpp ;
 run test_allow_multiple_connections_per_pid.cpp ;
 
 run test_time_critical.cpp ;
+run test_memory_only.cpp ;

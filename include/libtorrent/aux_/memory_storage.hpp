@@ -216,16 +216,55 @@ namespace libtorrent::aux {
 		void set_torrent_policy(memory_policy policy);
 		memory_policy torrent_policy() const { return m_torrent_policy; }
 		// rules 1-5: persist (one-shot or of any owner) -> file; a file
-		// claim covers it -> file; at_limit (the pool holds >= its limit)
-		// -> file; a memory claim covers it -> memory; otherwise the torrent
-		// policy. It changes no claim: a one-shot persist piece stays in its
-		// set until start() starts it in the file. A piece that rule 3 sends
-		// to the file counts in spilled_pieces() only if rules 4-5 would have
-		// sent it to memory
+		// claim covers it -> file; at the limit (at_limit: the pool holds >=
+		// its limit, or the storage holds >= its own limit) -> file, or
+		// none for a strict piece; a memory or memory_only claim covers it
+		// -> memory; otherwise the torrent policy (memory and memory_only
+		// -> memory). It changes no claim: a one-shot persist piece stays in
+		// its set until start() starts it in the file. A piece that rule 3
+		// sends to the file counts in spilled_pieces() only if rules 4-5
+		// would have sent it to memory. none means the piece is declined: the
+		// caller starts no entry and calls decline()
 		piece_place decide(piece_index_t piece, bool at_limit);
 		// the place rules 1, 2, 4 and 5 give the piece, the limit aside. A
 		// piece held in memory whose wanted place is the file is moved there
 		piece_place wanted_place(piece_index_t piece) const;
+		// the piece goes to memory by rules 4-5 under memory_only: a memory_only
+		// claim covers it, or no memory claim does and the torrent policy is
+		// memory_only. Such a piece is never sent to the file by the limit
+		bool strict(piece_index_t piece) const;
+
+		// the bytes this storage may hold, -1 for no limit of its own
+		void set_limit(std::int64_t bytes) { m_limit = bytes; }
+		std::int64_t limit() const { return m_limit; }
+		// the storage holds at least its own limit
+		bool at_own_limit() const
+		{ return m_limit >= 0 && m_held_complete + m_held_partial >= m_limit; }
+
+		// declined pieces. A strict piece that cannot be stored is declined:
+		// decline() starts its tombstone (the piece then has no entry: one
+		// held is retired) and counts one declined write. While the
+		// tombstone stands, every write of the piece is declined and its
+		// hash answers write_declined. The torrent answers each declined
+		// write by restoring the piece: one async_clear_piece() per declined
+		// write, and its handler restores the piece in the picker. The
+		// tombstone is lifted on the network thread, in the step where no
+		// declined write is unanswered and no clear of it is pending, so a
+		// write cannot come between the lift and the last restore
+		bool declined(piece_index_t piece) const;
+		void decline(piece_index_t piece);
+		// the handler of a declined write of the piece ran
+		void declined_write_answered(piece_index_t piece);
+		// an async_clear_piece() of the piece was issued while its tombstone
+		// stood, and was answered
+		void declined_clear_issued(piece_index_t piece);
+		void declined_clear_answered(piece_index_t piece);
+		// lifts the tombstone if nothing is pending; true if it is gone
+		bool lift_declined(piece_index_t piece);
+		// drops every tombstone (a check of the files, a removal)
+		void reset_declined() { m_declined.clear(); }
+		// pieces declined so far (a piece counts once per tombstone)
+		int declined_pieces() const { return m_declined_pieces; }
 
 		// bytes of the blocks of current entries whose every non-pad block
 		// is present, and of the other current entries
@@ -289,6 +328,14 @@ namespace libtorrent::aux {
 		void account(memory_piece_entry const& e, int sign);
 		bool covered_by(piece_index_t piece, memory_policy policy) const;
 
+		struct tombstone
+		{
+			// declined writes whose handler has not run
+			int unanswered = 0;
+			// clears of the piece issued under the tombstone, not answered
+			int clears = 0;
+		};
+
 		file_storage const& m_files;
 		bool const m_v1;
 		bool const m_v2;
@@ -310,7 +357,10 @@ namespace libtorrent::aux {
 		std::int64_t m_held_partial = 0;
 		std::int64_t m_retired_bytes = 0;
 		int m_spilled_pieces = 0;
+		int m_declined_pieces = 0;
 		int m_persist_failures = 0;
+		std::int64_t m_limit = -1;
+		std::map<piece_index_t, tombstone> m_declined;
 		aux::vector<std::uint32_t, piece_index_t> m_retire_count;
 		bool m_removed = false;
 	};

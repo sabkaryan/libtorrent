@@ -466,6 +466,9 @@ namespace errors {
 		// the directory structure of files in the torrent exceeds the
 		// configured maximum depth (see load_torrent_limits)
 		torrent_directory_too_deep,
+		// the disk backend declined to store a block (see
+		// memory_policy::memory_only). The piece is downloaded again
+		write_declined,
 
 		// the number of error codes
 		error_code_max

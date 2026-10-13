@@ -201,6 +201,9 @@ namespace {
 				// that session's files, and stays. Last, as it cannot be
 				// undone: it does not throw (an erase from a vector)
 				m_pool->drop_own_residues(ih, m_backend);
+				// a registration is used once; an erase from a vector does not
+				// throw either
+				m_pool->consume_registration(ih, params.info_hash);
 				pool_guard.disarm();
 			}
 			slot_guard.disarm();
@@ -255,6 +258,8 @@ namespace {
 				s.retire_all();
 				s.mark_removed();
 				m_pool->spilled_of_removed += s.spilled_pieces();
+				m_pool->declined_of_removed += s.declined_pieces();
+				s.reset_declined();
 				if (s.pinned())
 				{
 					m_pool->retired.push_back({rec->storage, torrent, &m_ios});
@@ -383,6 +388,12 @@ namespace {
 					answer_now(*rec, [h] { h(disk_status::fatal_disk_error, aborted()); });
 					return;
 				}
+				// a check starts the torrent's picker over: the declined pieces
+				// are not restored one by one any more
+				{
+					std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+					rec->storage->reset_declined();
+				}
 				// the pieces the resume data names: "in file" once the check
 				// accepted it
 				typed_bitfield<piece_index_t> resume_have;
@@ -482,11 +493,40 @@ namespace {
 		void async_clear_piece(storage_index_t const storage, piece_index_t const index
 			, std::function<void(piece_index_t)> handler) override
 		{
-			fence(storage, index, [this, index, h = std::move(handler)](std::shared_ptr<storage_record> const& rec)
+			// a clear of a declined piece (the torrent restores it after a
+			// declined write): counted now, so the tombstone stays until its
+			// answer, which lifts it on the network thread right before the
+			// handler restores the piece
+			bool tombstone = false;
+			{
+				std::shared_ptr<storage_record> const& r = m_torrents[storage];
+				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+				if (!r->removed && r->storage->declined(index))
+				{
+					r->storage->declined_clear_issued(index);
+					tombstone = true;
+				}
+			}
+			fence(storage, index, [this, index, tombstone, h = std::move(handler)](std::shared_ptr<storage_record> const& rec)
 			{
 				if (rec->removed)
 				{
 					answer_now(*rec, [h, index] { h(index); });
+					return;
+				}
+				if (tombstone)
+				{
+					// the piece holds nothing, and the tombstone is not retired
+					// here: a write before the answer is declined too
+					answer_now(*rec, [this, rec, h, index]
+					{
+						{
+							std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+							rec->storage->declined_clear_answered(index);
+							rec->storage->lift_declined(index);
+						}
+						h(index);
+					});
 					return;
 				}
 				piece_place place = piece_place::none;
@@ -748,6 +788,17 @@ namespace {
 		static storage_error aborted()
 		{
 			return storage_error(boost::asio::error::operation_aborted);
+		}
+
+		static storage_error declined_error()
+		{
+			return storage_error(errors::write_declined, operation_t::file_read);
+		}
+
+		bool piece_declined(storage_record const& rec, piece_index_t const piece) const
+		{
+			std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+			return rec.storage->declined(piece);
 		}
 
 		// true while the jobs of the storage are held back: a fence is up,
@@ -1336,7 +1387,9 @@ namespace {
 		// blocks already held, so different bytes cost one failed hash and a
 		// new download of the piece; and if the stored bytes are corrupt and
 		// the new ones right, the piece fails its hash with the block
-		// attributed to the peer that sent it again, whom smart_ban may ban
+		// attributed to the peer that sent it again, whom smart_ban may ban.
+		// A strict piece (memory_only) that cannot be stored, at the limit or
+		// for want of a block, is declined instead (memory_storage::decline())
 		bool do_write(std::shared_ptr<storage_record> const& rec, peer_request const& r
 			, char const* buf, std::shared_ptr<disk_observer> o
 			, std::function<void(storage_error const&)> handler
@@ -1353,6 +1406,8 @@ namespace {
 			std::shared_ptr<memory_entry_ref> kick;
 			storage_error error;
 			bool in_memory = false;
+			// a strict piece that cannot be stored (memory_only)
+			bool declined = false;
 			// place file: the entry, when this is the first hand-over of the
 			// block (its write is counted when the default backend answers)
 			std::weak_ptr<memory_piece_entry> counted;
@@ -1361,47 +1416,88 @@ namespace {
 				std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
 				memory_storage& s = *rec->storage;
 				std::shared_ptr<memory_piece_entry> e = s.current(r.piece);
-				if (!e || restarts(*e))
+				if (s.declined(r.piece))
+				{
+					s.decline(r.piece);
+					declined = true;
+				}
+				else if (!e || restarts(*e))
 				{
 					// the limit is soft: it is checked only here
 					bool const at_limit = m_pool->held_bytes() >= m_pool->limit;
-					e = s.start(r.piece, s.decide(r.piece, at_limit));
-					if (e->place == piece_place::memory) s.set_in_file(r.piece, false);
-				}
-				// a piece in transfer takes writes into memory until its step
-				// is issued; after the step of a partial one, they go to the
-				// default backend, and a block the step handed over is there
-				bool const to_inner = e->place == piece_place::file
-					|| (e->place == piece_place::transfer && e->partial_transfer);
-				bool const handed = e->place == piece_place::transfer && e->partial_transfer
-					&& memory_storage::handed_to_inner(*e, block);
-				in_memory = !to_inner || handed;
-				if (to_inner && !handed && s.hand_to_inner(*e, block))
-				{
-					counted = e;
-					count_write = true;
-				}
-				if (handed || (in_memory && s.block_data(*e, block) != nullptr))
-				{
-					// already held, or handed over: keep the stored bytes
-				}
-				else if (in_memory)
-				{
-					if (!s.write_block(*e, block, {buf, r.length}))
+					piece_place const place = s.decide(r.piece, at_limit);
+					if (place == piece_place::none)
 					{
-						error = storage_error(boost::system::errc::make_error_code(
-							boost::system::errc::not_enough_memory), operation_t::alloc_cache_piece);
+						s.decline(r.piece);
+						declined = true;
 					}
-					else if (!e->hasher->busy && !e->hasher->kick_queued && m_hasher.threads() > 0)
+					else
 					{
-						// the block may extend the hashed prefix. A thread
-						// holding the entry (busy) looks for it before it
-						// lets go. A background hash is not a job a fence
-						// waits for
-						e->hasher->kick_queued = true;
-						kick = std::make_shared<memory_entry_ref>(m_pool, rec->storage, e);
+						e = s.start(r.piece, place);
+						if (e->place == piece_place::memory) s.set_in_file(r.piece, false);
 					}
 				}
+				if (!declined)
+				{
+					// a piece in transfer takes writes into memory until its step
+					// is issued; after the step of a partial one, they go to the
+					// default backend, and a block the step handed over is there
+					bool const to_inner = e->place == piece_place::file
+						|| (e->place == piece_place::transfer && e->partial_transfer);
+					bool const handed = e->place == piece_place::transfer && e->partial_transfer
+						&& memory_storage::handed_to_inner(*e, block);
+					in_memory = !to_inner || handed;
+					if (to_inner && !handed && s.hand_to_inner(*e, block))
+					{
+						counted = e;
+						count_write = true;
+					}
+					if (handed || (in_memory && s.block_data(*e, block) != nullptr))
+					{
+						// already held, or handed over: keep the stored bytes
+					}
+					else if (in_memory)
+					{
+						if (!s.write_block(*e, block, {buf, r.length}))
+						{
+							// a strict piece is declined rather than failing with
+							// ENOMEM, which disconnects the peer
+							if (s.strict(r.piece))
+							{
+								s.decline(r.piece);
+								declined = true;
+							}
+							else
+							{
+								error = storage_error(boost::system::errc::make_error_code(
+									boost::system::errc::not_enough_memory), operation_t::alloc_cache_piece);
+							}
+						}
+						else if (!e->hasher->busy && !e->hasher->kick_queued && m_hasher.threads() > 0)
+						{
+							// the block may extend the hashed prefix. A thread
+							// holding the entry (busy) looks for it before it
+							// lets go. A background hash is not a job a fence
+							// waits for
+							e->hasher->kick_queued = true;
+							kick = std::make_shared<memory_entry_ref>(m_pool, rec->storage, e);
+						}
+					}
+				}
+			}
+			if (declined)
+			{
+				post(m_ios, [this, rec, piece = r.piece, h = std::move(handler)]
+				{
+					h(storage_error(errors::write_declined, operation_t::file_write));
+					// the handler restores the piece (an async_clear_piece()
+					// counted under the tombstone, or nothing if the torrent
+					// went away); with nothing pending the tombstone is lifted
+					std::lock_guard<memory_pool_mutex> l(m_pool->mutex);
+					rec->storage->declined_write_answered(piece);
+					rec->storage->lift_declined(piece);
+				});
+				return false;
 			}
 			if (!in_memory)
 			{
@@ -1428,6 +1524,13 @@ namespace {
 			if (rec->removed)
 			{
 				post(m_ios, [h = std::move(handler), piece] { h(piece, sha1_hash(), aborted()); });
+				return;
+			}
+			// a declined piece holds nothing: its hash is not the default
+			// backend's either (the piece is not in the file)
+			if (piece_declined(*rec, piece))
+			{
+				post(m_ios, [h = std::move(handler), piece] { h(piece, sha1_hash(), declined_error()); });
 				return;
 			}
 			if (auto ref = memory_entry(*rec, piece))
@@ -1523,6 +1626,11 @@ namespace {
 			if (rec->removed)
 			{
 				post(m_ios, [h = std::move(handler), piece] { h(piece, sha256_hash(), aborted()); });
+				return;
+			}
+			if (piece_declined(*rec, piece))
+			{
+				post(m_ios, [h = std::move(handler), piece] { h(piece, sha256_hash(), declined_error()); });
 				return;
 			}
 			if (auto ref = memory_entry(*rec, piece))

@@ -538,11 +538,14 @@ namespace {
 		if (!valid(piece)) return piece_place::file;
 
 		piece_place const unlimited = wanted_place(piece);
-		// rule 3: the pool is at its limit. Only a piece bound for memory is
-		// a spill; one bound for the file would have gone there anyway
-		if (at_limit)
+		// rule 3: the pool, or the storage, is at its limit. Only a piece
+		// bound for memory is a spill; one bound for the file would have
+		// gone there anyway. A strict one is declined instead
+		if (at_limit || at_own_limit())
 		{
-			if (unlimited == piece_place::memory) ++m_spilled_pieces; // spill
+			if (unlimited != piece_place::memory) return piece_place::file;
+			if (strict(piece)) return piece_place::none;
+			++m_spilled_pieces; // spill
 			return piece_place::file;
 		}
 		return unlimited;
@@ -567,7 +570,72 @@ namespace {
 		// rules 4 and 5: where the piece goes without the limit. A memory
 		// claim covers it, otherwise the torrent policy
 		bool const bound_for_memory = covered_by(piece, memory_policy::memory) // rule 4
-			|| m_torrent_policy == memory_policy::memory; // rule 5
+			|| covered_by(piece, memory_policy::memory_only)
+			|| m_torrent_policy == memory_policy::memory // rule 5
+			|| m_torrent_policy == memory_policy::memory_only;
 		return bound_for_memory ? piece_place::memory : piece_place::file;
+	}
+
+	bool memory_storage::strict(piece_index_t const piece) const
+	{
+		TORRENT_ASSERT(valid(piece));
+		if (!valid(piece)) return false;
+		if (wanted_place(piece) != piece_place::memory) return false;
+		if (covered_by(piece, memory_policy::memory_only)) return true;
+		return !covered_by(piece, memory_policy::memory)
+			&& m_torrent_policy == memory_policy::memory_only;
+	}
+
+	bool memory_storage::declined(piece_index_t const piece) const
+	{
+		return m_declined.count(piece) > 0;
+	}
+
+	void memory_storage::decline(piece_index_t const piece)
+	{
+		TORRENT_ASSERT(valid(piece));
+		if (!valid(piece)) return;
+		auto const it = m_declined.find(piece);
+		if (it == m_declined.end())
+		{
+			// the piece holds nothing while it is declined
+			if (m_pieces[piece].current) retire(piece);
+			++m_declined_pieces;
+			m_declined[piece].unanswered = 1;
+			return;
+		}
+		++it->second.unanswered;
+	}
+
+	void memory_storage::declined_write_answered(piece_index_t const piece)
+	{
+		auto const it = m_declined.find(piece);
+		if (it == m_declined.end()) return;
+		TORRENT_ASSERT(it->second.unanswered > 0);
+		if (it->second.unanswered > 0) --it->second.unanswered;
+	}
+
+	void memory_storage::declined_clear_issued(piece_index_t const piece)
+	{
+		auto const it = m_declined.find(piece);
+		if (it == m_declined.end()) return;
+		++it->second.clears;
+	}
+
+	void memory_storage::declined_clear_answered(piece_index_t const piece)
+	{
+		auto const it = m_declined.find(piece);
+		if (it == m_declined.end()) return;
+		TORRENT_ASSERT(it->second.clears > 0);
+		if (it->second.clears > 0) --it->second.clears;
+	}
+
+	bool memory_storage::lift_declined(piece_index_t const piece)
+	{
+		auto const it = m_declined.find(piece);
+		if (it == m_declined.end()) return true;
+		if (it->second.unanswered > 0 || it->second.clears > 0) return false;
+		m_declined.erase(it);
+		return true;
 	}
 }

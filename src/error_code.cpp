@@ -281,7 +281,8 @@ namespace libtorrent {
 			 "a v2 file entry has no root hash",
 			 "v1 and v2 hashes do not describe the same data",
 			 "a file in the v2 metadata has the pad attribute set",
-			 "directory structure in torrent file exceeds depth limit"}
+			 "directory structure in torrent file exceeds depth limit",
+			 "the disk backend declined to store the block"}
 		};
 		// clang-format on
 		if (ev < 0 || ev >= msgs.end_index())

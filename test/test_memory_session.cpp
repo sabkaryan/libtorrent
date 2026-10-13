@@ -750,6 +750,259 @@ TORRENT_TEST(limit_lowered_below_held)
 	remove_all(path, ec);
 }
 
+namespace {
+
+// neither file of make_torrent() exists under save_path
+bool no_files(std::string const& save_path)
+{
+	struct ::stat st{};
+	return ::stat(combine_path(save_path, combine_path("unregistered", "a")).c_str(), &st) != 0
+		&& ::stat(combine_path(save_path, combine_path("unregistered", "b")).c_str(), &st) != 0;
+}
+
+// the torrent has no download of the piece: it was restored (or never
+// started)
+bool not_downloading(torrent_handle const& th, piece_index_t const p)
+{
+	std::vector<partial_piece_info> const q = th.get_download_queue();
+	return std::none_of(q.begin(), q.end(), [p](partial_piece_info const& i) { return i.piece_index == p; });
+}
+
+// pops every alert; true if one is a file or torrent error
+bool error_alerts(lt::session& ses)
+{
+	bool ret = false;
+	std::vector<alert*> alerts;
+	ses.pop_alerts(&alerts);
+	for (alert* a : alerts)
+	{
+		if (alert_cast<file_error_alert>(a) || alert_cast<torrent_error_alert>(a))
+		{
+			std::printf("error alert: %s\n", a->message().c_str());
+			ret = true;
+		}
+	}
+	return ret;
+}
+
+// the torrent is not in an error state, not paused and not in upload mode
+bool healthy(torrent_handle const& th)
+{
+	torrent_status const st = th.status();
+	return !st.errc && !(st.flags & torrent_flags::paused) && !(st.flags & torrent_flags::upload_mode);
+}
+
+// declines the pieces (added with add_piece()) and waits until the
+// torrent restored them
+bool declined(memory_storage_pool const& pool, torrent_handle const& th
+	, std::vector<char> const& content, std::vector<piece_index_t> const& pieces
+	, std::int64_t const expected)
+{
+	for (auto const p : pieces) th.add_piece(p, piece_ptr(content, p));
+	return wait_for([&]
+	{
+		if (pool.declined_pieces() != expected) return false;
+		return std::all_of(pieces.begin(), pieces.end()
+			, [&th](piece_index_t const p) { return not_downloading(th, p) && !th.have_piece(p); });
+	});
+}
+
+} // anonymous namespace
+
+// memory_only: a piece that starts while the pool holds its limit is
+// declined, not spilled. The piece over the boundary of the two files and
+// a piece of the second file alike: nothing goes to the files, the torrent
+// is restored without an error, and the pieces are added again once the
+// limit allows it
+TORRENT_TEST(memory_only_declines_at_limit)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_only_declines");
+	auto const pool = make_pool(memory_policy::file);
+	pool->set_limit(piece_size);
+	add_torrent_params const atp = make_torrent(content);
+	pool->set_policy(atp.ti->info_hashes(), memory_policy::memory_only);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}}));
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+
+		TEST_CHECK(declined(*pool, th, content, {piece_index_t{1}, piece_index_t{3}}, 2));
+		TEST_EQUAL(pool->spilled_pieces(), 0);
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+		TEST_EQUAL(read_code(*pool, th, piece_index_t{1}), memory_storage_pool::not_in_memory);
+		TEST_CHECK(no_files(path));
+		TEST_CHECK(healthy(th));
+		TEST_CHECK(!error_alerts(*ses));
+
+		// added again, they are stored
+		pool->set_limit(std::numeric_limits<std::int64_t>::max());
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{1}, piece_index_t{3}}));
+		TEST_CHECK(reads(*pool, th, content, piece_index_t{1}));
+		TEST_CHECK(reads(*pool, th, content, piece_index_t{3}));
+		TEST_CHECK(th.have_piece(piece_index_t{1}));
+		TEST_EQUAL(pool->declined_pieces(), 2);
+		TEST_CHECK(no_files(path));
+		TEST_CHECK(healthy(th));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a registration is used by one storage: the torrent added again after
+// its removal gets the default policy
+TORRENT_TEST(memory_only_registration_used_once)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_only_once");
+	auto const pool = make_pool(memory_policy::file);
+	pool->set_limit(0);
+	add_torrent_params const atp = make_torrent(content);
+	pool->set_policy(atp.ti->info_hashes(), memory_policy::memory_only);
+	{
+		auto ses = make_session(pool);
+		torrent_handle th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(declined(*pool, th, content, {piece_index_t{0}}, 1));
+		TEST_CHECK(no_files(path));
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+
+		th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}}));
+		TEST_EQUAL(pool->declined_pieces(), 1);
+		TEST_EQUAL(pool->spilled_pieces(), 0);
+		TEST_CHECK(!no_files(path));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// the limit of a torrent: a piece starts while the torrent holds less than
+// it. With exactly three pieces, pieces 0-2 start and the rest are declined
+TORRENT_TEST(memory_only_torrent_limit)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_only_torrent_limit");
+	auto const pool = make_pool(memory_policy::file);
+	add_torrent_params const atp = make_torrent(content);
+	pool->set_policy(atp.ti->info_hashes(), memory_policy::memory_only);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		pool->set_limit(th, 3 * piece_size);
+		for (int i = 0; i < 3; ++i) TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{i}}));
+		TEST_EQUAL(pool->held_bytes(), 3 * piece_size);
+		for (int i = 3; i < num_pieces; ++i)
+			TEST_CHECK(declined(*pool, th, content, {piece_index_t{i}}, i - 2));
+		TEST_EQUAL(pool->held_bytes(), 3 * piece_size);
+		TEST_EQUAL(pool->declined_pieces(), num_pieces - 3);
+
+		// -1: no limit of its own
+		pool->set_limit(th, -1);
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{3}}));
+		TEST_EQUAL(pool->held_bytes(), 4 * piece_size);
+		TEST_CHECK(no_files(path));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a memory_only claim: claims that move pieces to the file (another
+// owner's memory claim, a persist of another piece) leave its pieces in
+// memory, and they are declined at the limit
+TORRENT_TEST(memory_only_not_moved_by_claims)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_only_claims");
+	auto const pool = make_pool(memory_policy::file);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		pool->set_policy(th, 3, memory_policy::memory_only);
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}, piece_index_t{2}}));
+		pool->set_policy(th, 7, memory_policy::memory, std::vector<file_index_t>{file_index_t{0}});
+		std::vector<piece_index_t> const p5{piece_index_t{5}};
+		pool->persist(th, p5);
+		TEST_EQUAL(pool->pending_persist_bytes(th), 0);
+		TEST_EQUAL(pool->held_bytes(), 2 * piece_size);
+		TEST_CHECK(reads(*pool, th, content, piece_index_t{2}));
+		pool->set_limit(0);
+		TEST_CHECK(declined(*pool, th, content, {piece_index_t{4}}, 1));
+		TEST_CHECK(no_files(path));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a memory claim makes the pieces it covers plain memory pieces: at the
+// limit they spill to the file instead of being declined
+TORRENT_TEST(memory_claim_relaxes_memory_only)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_claim_relaxes");
+	auto const pool = make_pool(memory_policy::file);
+	pool->set_limit(0);
+	add_torrent_params const atp = make_torrent(content);
+	pool->set_policy(atp.ti->info_hashes(), memory_policy::memory_only);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		pool->set_policy(th, 1, memory_policy::memory, std::vector<file_index_t>{file_index_t{1}});
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{4}}));
+		TEST_EQUAL(pool->spilled_pieces(), 1);
+		TEST_EQUAL(pool->declined_pieces(), 0);
+		// piece 0 lies in file a only: still memory_only
+		TEST_CHECK(declined(*pool, th, content, {piece_index_t{0}}, 1));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a block of a memory_only piece that cannot be allocated declines the
+// piece; a plain memory piece fails with ENOMEM as before
+TORRENT_TEST(memory_only_alloc_failure_declines)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("memory_only_alloc");
+	auto const pool = make_pool(memory_policy::file);
+	add_torrent_params const atp = make_torrent(content);
+	pool->set_policy(atp.ti->info_hashes(), memory_policy::memory_only);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, atp, path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		// the first block of piece 2 cannot be allocated: the piece is declined
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}}));
+		access::fail_allocations(*pool, 1);
+		TEST_CHECK(declined(*pool, th, content, {piece_index_t{2}}, 1));
+		TEST_EQUAL(pool->held_bytes(), piece_size);
+		TEST_CHECK(healthy(th));
+		TEST_CHECK(!error_alerts(*ses));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{2}}));
+		TEST_CHECK(reads(*pool, th, content, piece_index_t{2}));
+	}
+	{
+		auto const plain = make_pool(memory_policy::memory);
+		auto ses = make_session(plain);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		access::fail_allocations(*plain, 1);
+		th.add_piece(piece_index_t{2}, piece_ptr(content, piece_index_t{2}));
+		TEST_CHECK(wait_alert<file_error_alert>(*ses, [](file_error_alert const& a)
+			{ return a.error == boost::system::errc::not_enough_memory; }));
+		TEST_EQUAL(plain->declined_pieces(), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
 // a hybrid torrent added from a magnet link with its v1 info-hash gets its
 // metadata later; its storage (keyed by the truncated v2 info-hash) still
 // matches the registration by v1

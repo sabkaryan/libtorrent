@@ -175,6 +175,8 @@ namespace libtorrent::aux {
 		std::int64_t storages_retired_pinned = 0;
 		// the spilled pieces of removed storages
 		std::int64_t spilled_of_removed = 0;
+		// the declined pieces of removed storages
+		std::int64_t declined_of_removed = 0;
 
 		// claims made by torrent_handle for a torrent that has no storage
 		// yet (no metadata), applied in order by its new_torrent(). Keyed
@@ -222,6 +224,9 @@ namespace libtorrent::aux {
 		// by the registration's v1 or truncated v2; otherwise the default.
 		// The caller holds mutex
 		memory_policy policy_for(info_hash_t const& ih, sha1_hash const& best) const;
+		// drops the registration policy_for() found, if any: a registration
+		// is used by one storage. The caller holds mutex
+		void consume_registration(info_hash_t const& ih, sha1_hash const& best);
 		// queues a claim for a torrent that has no storage yet. The caller
 		// holds mutex
 		void add_pending(std::weak_ptr<void> torrent, std::function<void(memory_storage&)> op);
@@ -266,6 +271,8 @@ namespace libtorrent::aux {
 		static int pending_claims(memory_storage_pool const& pool);
 		// removed storages the pool keeps for filter_resume()
 		static int residues(memory_storage_pool const& pool);
+		// the next n block allocations of the pool fail
+		static void fail_allocations(memory_storage_pool const& pool, int n);
 	};
 
 	// test hook: the place of the current entry of a piece of a storage of

@@ -44,6 +44,8 @@ namespace libtorrent::aux {
 		// test hook: number of madvise/decommit calls the most recent free()
 		// call issued, after cutting the coalesced ranges at slab boundaries
 		int last_free_decommit_calls() const { return m_last_free_decommit_calls; }
+		// test hook: the next n calls of allocate() fail (return nullptr)
+		void fail_allocations(int const n) { m_fail_allocations = n; }
 
 	private:
 
@@ -68,6 +70,7 @@ namespace libtorrent::aux {
 		int const m_blocks_per_slab;
 		int m_blocks_in_use = 0;
 		int m_last_free_decommit_calls = 0;
+		int m_fail_allocations = 0;
 		// slabs kept ordered by base address, so a batch of blocks (already
 		// sorted by address for madvise coalescing) can be matched to their
 		// owning slabs in one merge pass instead of a linear scan per block

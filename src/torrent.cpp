@@ -1161,6 +1161,11 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		}
 #endif
 
+		// the disk backend declined to store a block: the piece is
+		// restored and downloaded again, nothing is wrong with the disk or
+		// the peer
+		if (error.ec == errors::write_declined) return;
+
 		if (error.ec == boost::system::errc::not_enough_memory)
 		{
 			if (alerts().should_post<file_error_alert>())
@@ -1600,6 +1605,28 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// discarded.
 		if (picker_gen != m_picker_generation)
 			return;
+
+		if (error.ec == errors::write_declined && has_picker())
+		{
+			// as a peer's declined block (peer_connection): the piece is
+			// cleared and restored, instead of leaving the block in the
+			// writing state
+			cancel_block(block_finished);
+			m_picker->write_failed(block_finished);
+			if (has_storage())
+			{
+				m_ses.disk_thread().async_clear_piece(m_storage, p.piece
+					, [self = shared_from_this(), block_finished](piece_index_t const pi)
+					{ self->wrap(&torrent::on_piece_fail_sync, pi, block_finished); });
+				m_ses.deferred_submit_jobs();
+			}
+			else
+			{
+				on_piece_fail_sync(p.piece, block_finished);
+			}
+			update_gauge();
+			return;
+		}
 
 		if (error)
 		{

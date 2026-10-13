@@ -104,6 +104,11 @@ namespace {
 
 	char* memory_slab_allocator::allocate()
 	{
+		if (m_fail_allocations > 0)
+		{
+			--m_fail_allocations;
+			return nullptr;
+		}
 		if (!m_slabs_with_free.empty())
 		{
 			char* const base = *m_slabs_with_free.begin();
