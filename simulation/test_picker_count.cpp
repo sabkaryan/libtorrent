@@ -394,12 +394,13 @@ int count_mismatches(lt::aux::torrent const& t)
 	return ret;
 }
 
-// wanted (not cancelled, not timed out) requests for blocks of piece p, all peers
-int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p)
+// wanted (not cancelled, not timed out) requests for blocks of piece p, all
+// peers: sent (download queue) or still queued to be sent (request queue)
+int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p, bool const sent)
 {
 	int ret = 0;
 	for (auto const* pc : t)
-		for (auto const& b : pc->download_queue())
+		for (auto const& b : sent ? pc->download_queue() : pc->request_queue())
 			if (b.block.piece_index == p && !b.not_wanted && !b.timed_out) ++ret;
 	return ret;
 }
@@ -410,6 +411,8 @@ int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p)
 // peer fetch the same blocks (busy requests). The piece passes while the slow
 // peer still has its requests queued, then it is forgotten and downloaded
 // again: the slow peer's requests count in its queue but not in the picker.
+// One more block waits in the slow peer's request queue, unsent while its
+// download queue is full (as when its desired queue size shrinks).
 TORRENT_TEST(forget_after_busy_duplicate)
 {
 	using namespace lt;
@@ -481,6 +484,7 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	// 2: the piece passed, forget it; 3: downloading again, compare
 	int stage = 0;
 	int stale_at_forget = -1;
+	int stale_unsent = -1;
 	int forget_result = -1;
 	int refused = 0;
 	int mismatches = 0;
@@ -490,6 +494,11 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	on_tick = [&](boost::system::error_code const&) {
 		++ticks;
 		auto tor = h.is_valid() ? h.native_handle() : nullptr;
+		// after the deadline, which makes queued requests time critical
+		if (tor && stage == 1 && ticks == 30)
+			for (auto* pc : *tor)
+				if (pc->remote().address() == make_address_v4(ips[0]))
+					pc->add_request(piece_block(piece, 15), {});
 		if (tor && stage == 0 && ticks >= 20)
 		{
 			h.connect_peer(tcp::endpoint(make_address_v4(ips[1]), 6881));
@@ -498,7 +507,11 @@ TORRENT_TEST(forget_after_busy_duplicate)
 		}
 		else if (tor && stage == 1 && passed)
 		{
-			if (stale_at_forget < 0) stale_at_forget = wanted_requests(*tor, piece);
+			if (stale_at_forget < 0)
+			{
+				stale_at_forget = wanted_requests(*tor, piece, true);
+				stale_unsent = wanted_requests(*tor, piece, false);
+			}
 			forget_result = tor->forget_piece(piece);
 			if (forget_result == 3) ++refused;
 			else stage = 2;
@@ -516,8 +529,8 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	timer.async_wait(on_tick);
 	sim.run();
 
-	std::printf("RESULT stage=%d stale_at_forget=%d forget=%d refused=%d mismatches=%d\n"
-		, stage, stale_at_forget, forget_result, refused, mismatches);
+	std::printf("RESULT stage=%d stale_at_forget=%d stale_unsent=%d forget=%d refused=%d mismatches=%d\n"
+		, stage, stale_at_forget, stale_unsent, forget_result, refused, mismatches);
 	// the scenario happened: the piece was downloaded again after the forget
 	TEST_EQUAL(stage, 3);
 	TEST_EQUAL(mismatches, 0);
