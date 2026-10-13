@@ -551,7 +551,8 @@ TORRENT_TEST(forget_after_busy_duplicate)
 // piece (write_failed(), async_clear_piece(), on_piece_fail_sync()); the
 // slow peer's requests stay in its queues. Once the piece is downloading
 // again, compare its requests with the picker's counts.
-// PC_ERR: the errno of the failure (default ENOMEM).
+// PC_ERR: the errno of the failure (default ENOMEM); PC_FAILS: the number of
+// failed writes (default 1).
 TORRENT_TEST(write_fail_after_busy_duplicate)
 {
 	using namespace lt;
@@ -591,7 +592,8 @@ TORRENT_TEST(write_fail_after_busy_duplicate)
 	dp.settings.set_bool(settings_pack::close_redundant_connections, false);
 	auto const err = static_cast<boost::system::errc::errc_t>(
 		env_int("PC_ERR", int(boost::system::errc::not_enough_memory)));
-	dp.disk_io_constructor = test_disk().fail_writes(piece, 1, err);
+	// PC_FAILS: how many writes of the piece fail (16: every block once)
+	dp.disk_io_constructor = test_disk().fail_writes(piece, env_int("PC_FAILS", 1), err);
 	auto ses = std::make_shared<lt::session>(dp, dl_ios);
 
 	lt::torrent_handle h;
