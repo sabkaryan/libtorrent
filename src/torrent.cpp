@@ -1235,6 +1235,30 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			// unlock the piece and restore it, as if no block was
 			// ever downloaded for it.
 			m_picker->restore_piece(piece);
+			// a peer may still wait for a block of the piece: one also
+			// requested from another peer, which delivered it first.
+			// mark_as_writing() took the block out of the requested state, so
+			// cancel_request() left this request wanted, and restore_piece()
+			// dropped the requests the picker counted. Give the picker back
+			// the requests peers still wait for, as on_piece_sync() does
+			// after a failed hash
+			for (auto* p : m_connections)
+			{
+				TORRENT_INCREMENT(m_iterating_connections);
+				for (auto const& b : p->download_queue())
+				{
+					if (b.timed_out || b.not_wanted) continue;
+					if (b.block.piece_index != piece) continue;
+					m_picker->mark_as_downloading(b.block, p->peer_info_struct()
+						, p->picker_options());
+				}
+				for (auto const& b : p->request_queue())
+				{
+					if (b.block.piece_index != piece) continue;
+					m_picker->mark_as_downloading(b.block, p->peer_info_struct()
+						, p->picker_options());
+				}
+			}
 		}
 
 		update_gauge();
