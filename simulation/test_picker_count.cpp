@@ -413,6 +413,8 @@ int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p, bool c
 // again: the slow peer's requests count in its queue but not in the picker.
 // One more block waits in the slow peer's request queue, unsent while its
 // download queue is full (as when its desired queue size shrinks).
+// PC_P0=1: the piece is set to dont_download before it is forgotten, as a
+// reader does with a piece it has passed.
 TORRENT_TEST(forget_after_busy_duplicate)
 {
 	using namespace lt;
@@ -485,6 +487,7 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	int stage = 0;
 	int stale_at_forget = -1;
 	int stale_unsent = -1;
+	bool const p0 = env_int("PC_P0", 0) != 0;
 	int forget_result = -1;
 	int refused = 0;
 	int mismatches = 0;
@@ -512,6 +515,7 @@ TORRENT_TEST(forget_after_busy_duplicate)
 				stale_at_forget = wanted_requests(*tor, piece, true);
 				stale_unsent = wanted_requests(*tor, piece, false);
 			}
+			if (p0) tor->set_piece_priority(piece, dont_download);
 			forget_result = tor->forget_piece(piece);
 			if (forget_result == 3) ++refused;
 			else stage = 2;

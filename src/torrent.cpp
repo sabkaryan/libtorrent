@@ -4750,8 +4750,9 @@ namespace {
 		// a peer may still wait for a block of the piece: one also requested
 		// from another peer, which delivered it first. mark_as_writing() took
 		// the block out of the requested state, so cancel_request() left this
-		// request wanted. Now that the block is wanted again, give the picker
-		// back these requests, as on_piece_sync() does after a failed hash
+		// request wanted. The piece is not had anymore, whatever its priority,
+		// so the block is accepted again when it arrives: give the picker back
+		// these requests, as on_piece_sync() does after a failed hash
 		for (auto* p : m_connections)
 		{
 			TORRENT_INCREMENT(m_iterating_connections);
