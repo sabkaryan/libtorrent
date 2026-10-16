@@ -4798,29 +4798,6 @@ namespace {
 		// drop the piece from the picker, as resume data with unfinished
 		// pieces and a v2 hash failure do
 		m_picker->we_dont_have(index);
-		// a peer may still wait for a block of the piece: one also requested
-		// from another peer, which delivered it first. mark_as_writing() took
-		// the block out of the requested state, so cancel_request() left this
-		// request wanted. The piece is not had anymore, whatever its priority,
-		// so the block is accepted again when it arrives: give the picker back
-		// these requests, as on_piece_sync() does after a failed hash
-		for (auto* p : m_connections)
-		{
-			TORRENT_INCREMENT(m_iterating_connections);
-			for (auto const& b : p->download_queue())
-			{
-				if (b.timed_out || b.not_wanted) continue;
-				if (b.block.piece_index != index) continue;
-				m_picker->mark_as_downloading(b.block, p->peer_info_struct()
-					, p->picker_options());
-			}
-			for (auto const& b : p->request_queue())
-			{
-				if (b.block.piece_index != index) continue;
-				m_picker->mark_as_downloading(b.block, p->peer_info_struct()
-					, p->picker_options());
-			}
-		}
 		// reads of this piece still in flight may read bytes the caller is now
 		// free to release; their completion must not send them, even once the
 		// piece has been downloaded again
@@ -4836,7 +4813,15 @@ namespace {
 		if (m_state == torrent_status::seeding) set_state(torrent_status::finished);
 		update_gauge();
 
-		// we may have announced HAVE for this piece. Reject any pending
+		// a peer may still wait for a block of the piece: one also requested
+		// from another peer, which delivered it first. mark_as_writing() took
+		// the block out of the requested state, so cancel_request() left this
+		// request wanted, and the picker, which no longer downloads the
+		// piece, does not count it. Cancel these requests: a late block
+		// written after the forget would start the piece again, even one set
+		// to dont_download, whose other blocks are never picked. A wanted
+		// piece is picked again from scratch.
+		// we may also have announced HAVE for this piece. Reject any pending
 		// requests for it and let peers that support it know we don't
 		// have it anymore (the same as piece_failed() does for predictive
 		// pieces). Peers may disconnect while iterating.
@@ -4844,6 +4829,8 @@ namespace {
 		{
 			peer_connection* p = *i;
 			++i;
+			p->cancel_piece_requests(index);
+			if (p->is_disconnecting()) continue;
 			p->reject_piece(index);
 			if (p->is_disconnecting()) continue;
 			p->write_dont_have(index);

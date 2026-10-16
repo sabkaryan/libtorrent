@@ -625,6 +625,11 @@ namespace libtorrent::aux {
 		// if force is true, the blocks is also freed from the piece
 		// picker, allowing another peer to request it immediately
 		void cancel_request(piece_block const& b, bool force = false);
+
+		// cancels the requests for the blocks of a piece the piece picker
+		// does not count them for (torrent::forget_piece()). Requests not sent
+		// yet are dropped, sent ones are flagged not_wanted and cancelled
+		void cancel_piece_requests(piece_index_t piece);
 		void send_block_requests();
 		void send_block_requests_impl();
 

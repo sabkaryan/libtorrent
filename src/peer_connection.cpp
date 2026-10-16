@@ -2938,8 +2938,14 @@ namespace {
 		TORRENT_ASSERT_VAL(m_received_in_piece == p.length, m_received_in_piece);
 		m_received_in_piece = 0;
 #endif
-		// if the block we got is already finished, then ignore it
-		if (picker.is_downloaded(block_finished))
+		// if the block we got is already finished, then ignore it. So is a
+		// block we cancelled for a piece we don't want and don't download:
+		// writing it would start the piece again, and nothing picks the rest
+		// of a piece set to dont_download (see cancel_piece_requests())
+		if (picker.is_downloaded(block_finished)
+			|| (b->not_wanted
+				&& !picker.is_downloading(block_finished.piece_index)
+				&& picker.piece_priority(block_finished.piece_index) == dont_download))
 		{
 			aux::waste_reason const reason
 				= (b->timed_out) ? aux::waste_reason::piece_timed_out
@@ -3826,6 +3832,52 @@ namespace {
 				, static_cast<int>(r.piece), r.start, r.length, block.block_index);
 #endif
 		write_cancel(r);
+	}
+
+	void peer_connection::cancel_piece_requests(piece_index_t const piece)
+	{
+		TORRENT_ASSERT(is_single_thread());
+
+		auto t = m_torrent.lock();
+		// this peer might be disconnecting
+		if (!t) return;
+
+		for (auto i = m_request_queue.begin(); i != m_request_queue.end();)
+		{
+			if (i->block.piece_index != piece)
+			{
+				++i;
+				continue;
+			}
+			if (i - m_request_queue.begin() < m_queued_time_critical)
+				--m_queued_time_critical;
+			// not sent yet, so we don't have to send a cancel
+			i = m_request_queue.erase(i);
+		}
+
+		// write_cancel() removes the request from the download queue for
+		// peers that don't support the FAST extensions, so flag every request
+		// before the first cancel is sent
+		std::vector<peer_request> cancels;
+		for (auto& pb : m_download_queue)
+		{
+			if (pb.block.piece_index != piece || pb.not_wanted) continue;
+			pb.not_wanted = true;
+			// we can't cancel the block if we've started receiving it
+			if (m_receiving_block == pb.block) continue;
+			cancels.push_back(t->to_req(pb.block));
+		}
+
+		for (auto const& r : cancels)
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			peer_log(peer_log_alert::outgoing_message, peer_log_alert::cancel
+				, "piece: %d s: %d l: %d b: %d"
+				, static_cast<int>(r.piece), r.start, r.length, r.start / t->block_size());
+#endif
+			write_cancel(r);
+			if (is_disconnecting()) return;
+		}
 	}
 
 	bool peer_connection::send_choke()
