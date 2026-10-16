@@ -31,6 +31,9 @@ Output: action lines on stderr with PC_LOG=1, one RESULT line on stdout.
 #include "libtorrent/aux_/torrent.hpp"
 #include "libtorrent/aux_/piece_picker.hpp"
 #include "libtorrent/aux_/peer_connection.hpp"
+#include "libtorrent/aux_/session_interface.hpp"
+#include "libtorrent/performance_counters.hpp"
+#include "libtorrent/torrent_status.hpp"
 #include "libtorrent/torrent_flags.hpp"
 #include "simulator/simulator.hpp"
 #include "simulator/utils.hpp"
@@ -409,12 +412,15 @@ int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p, bool c
 
 // A slow peer holds requests for blocks of a piece; a deadline makes a fast
 // peer fetch the same blocks (busy requests). The piece passes while the slow
-// peer still has its requests queued, then it is forgotten and downloaded
-// again: the slow peer's requests count in its queue but not in the picker.
+// peer still has its requests queued, then it is forgotten: the slow peer's
+// requests must be cancelled (none left wanted), and once the piece is
+// downloaded again its requests count in the queues as in the picker.
 // One more block waits in the slow peer's request queue, unsent while its
 // download queue is full (as when its desired queue size shrinks).
 // PC_P0=1: the piece is set to dont_download before it is forgotten, as a
-// reader does with a piece it has passed.
+// reader does with a piece it has passed. The slow peer's blocks still
+// arrive (its seed has already read them when the cancels come) and must be
+// discarded: the piece is never downloading again, the blocks are redundant.
 TORRENT_TEST(forget_after_busy_duplicate)
 {
 	using namespace lt;
@@ -492,6 +498,37 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	int refused = 0;
 	int mismatches = 0;
 	int ticks = 0;
+	// after the forget: requests for the piece still wanted, cancels sent (a
+	// block being received is not cancelled), redundant bytes, ticks the
+	// piece was downloading (PC_P0=1)
+	int wanted_after = -1;
+	std::int64_t cancels = -1;
+	std::int64_t redundant = -1;
+	int restarted = 0;
+	int forget_tick = 0;
+	std::int64_t cancels0 = 0;
+	std::int64_t redundant0 = 0;
+	auto const redundant_bytes = [](lt::aux::torrent& t) {
+		lt::torrent_status st;
+		t.status(&st, {});
+		return st.total_redundant_bytes;
+	};
+	auto const outgoing_cancels = [](lt::aux::torrent& t) {
+		return t.session().stats_counters()[lt::counters::num_outgoing_cancel];
+	};
+	// requests for blocks of the piece in the slow peer's queues, any state
+	auto const slow_queued = [&](lt::aux::torrent const& t) {
+		int ret = 0;
+		for (auto const* pc : t)
+		{
+			if (pc->remote().address() != make_address_v4(ips[0])) continue;
+			for (auto const& b : pc->download_queue())
+				if (b.block.piece_index == piece) ++ret;
+			for (auto const& b : pc->request_queue())
+				if (b.block.piece_index == piece) ++ret;
+		}
+		return ret;
+	};
 	sim::asio::high_resolution_timer timer(dl_ios);
 	std::function<void(boost::system::error_code const&)> on_tick;
 	on_tick = [&](boost::system::error_code const&) {
@@ -516,16 +553,36 @@ TORRENT_TEST(forget_after_busy_duplicate)
 				stale_unsent = wanted_requests(*tor, piece, false);
 			}
 			if (p0) tor->set_piece_priority(piece, dont_download);
+			cancels0 = outgoing_cancels(*tor);
+			redundant0 = redundant_bytes(*tor);
 			forget_result = tor->forget_piece(piece);
 			if (forget_result == 3) ++refused;
-			else stage = 2;
+			else
+			{
+				stage = 2;
+				forget_tick = ticks;
+				wanted_after = wanted_requests(*tor, piece, true)
+					+ wanted_requests(*tor, piece, false);
+				cancels = outgoing_cancels(*tor) - cancels0;
+			}
 		}
-		else if (tor && stage == 2 && tor->has_picker() && tor->picker().is_downloading(piece))
+		else if (tor && stage == 2 && !p0 && tor->has_picker() && tor->picker().is_downloading(piece))
 		{
 			mismatches = count_mismatches(*tor);
 			stage = 3;
 		}
-		if (stage == 3 || ticks > 600) { sim.stop(); return; }
+		else if (tor && stage == 2 && p0)
+		{
+			if (tor->has_picker() && tor->picker().is_downloading(piece)) ++restarted;
+			// every request answered (block or reject), or 60 s
+			if (slow_queued(*tor) == 0 || ticks - forget_tick > 600)
+			{
+				redundant = redundant_bytes(*tor) - redundant0;
+				mismatches = count_mismatches(*tor);
+				stage = 3;
+			}
+		}
+		if (stage == 3 || ticks > 1300) { sim.stop(); return; }
 		timer.expires_after(lt::milliseconds(100));
 		timer.async_wait(on_tick);
 	};
@@ -533,14 +590,20 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	timer.async_wait(on_tick);
 	sim.run();
 
-	std::printf("RESULT stage=%d stale_at_forget=%d stale_unsent=%d forget=%d refused=%d mismatches=%d\n"
-		, stage, stale_at_forget, stale_unsent, forget_result, refused, mismatches);
-	// the scenario happened: the piece was downloaded again after the forget
-	TEST_EQUAL(stage, 3);
-	TEST_EQUAL(mismatches, 0);
+	std::printf("RESULT stage=%d stale_at_forget=%d stale_unsent=%d forget=%d refused=%d mismatches=%d"
+		" wanted_after=%d cancels=%d redundant=%d restarted=%d\n"
+		, stage, stale_at_forget, stale_unsent, forget_result, refused, mismatches
+		, wanted_after, int(cancels), int(redundant), restarted);
+	// the scenario happened: requests were stale at the forget, and the piece
+	// was downloaded again (or, set to dont_download, a block came back and
+	// was discarded)
+	bool const ok = stage == 3 && stale_at_forget > 0 && stale_unsent > 0
+		&& mismatches == 0 && wanted_after == 0 && cancels > 0
+		&& (!p0 || (restarted == 0 && redundant >= 0x4000));
+	TEST_CHECK(ok);
 	// tearing the simulation down aborts; the result is already known
 	std::fflush(stdout);
-	std::_Exit(stage == 3 && mismatches == 0 ? 0 : 1);
+	std::_Exit(ok ? 0 : 1);
 }
 
 // As forget_after_busy_duplicate, but the piece is restored by a failed write
