@@ -552,7 +552,8 @@ TORRENT_TEST(forget_after_busy_duplicate)
 	on_tick = [&](boost::system::error_code const&) {
 		++ticks;
 		auto tor = h.is_valid() ? h.native_handle() : nullptr;
-		// after the deadline, which makes queued requests time critical
+		// after the deadline; the unsent request is added time critical, so
+		// dropping it must lower m_queued_time_critical
 		if (tor && stage == 1 && ticks == 30)
 			for (auto* pc : *tor)
 			{
@@ -649,18 +650,19 @@ TORRENT_TEST(forget_after_busy_duplicate)
 		, stage, stale_at_forget, stale_unsent, forget_result, refused, mismatches
 		, wanted_after, int(cancels), int(redundant), restarted);
 	std::printf("RESULT2 re=%d passed_after=%d hash_fails=%d ticks=%d\n", re, passed_after, hash_fails, ticks);
-	// the scenario happened: requests were stale at the forget, and the piece
-	// was downloaded again (or, set to dont_download, a block came back and
-	// was discarded)
-	bool const ok = stage == 3 && stale_at_forget > 0 && stale_unsent > 0
-		&& mismatches == 0 && wanted_after == 0 && cancels > 0
-		&& (!p0 || (restarted == 0 && redundant >= 0x4000));
-	bool const ok_re = re == 0 ? ok : (stage == 3 && mismatches == 0 && passed_after > 0
-		&& hash_fails == 0 && wanted_after == 0);
-	TEST_CHECK(ok_re);
+	// the scenario happened (requests, sent and unsent, were stale at the
+	// forget) and they were cancelled. Then the piece was downloaded again,
+	// or, set to dont_download (PC_P0=1), a block came back and was
+	// discarded, or, wanted again (PC_RE), it passed without a hash failure
+	bool const happened = stage == 3 && stale_at_forget > 0 && stale_unsent > 0;
+	bool const cancelled = mismatches == 0 && wanted_after == 0 && cancels > 0;
+	bool const ok = happened && cancelled && (re == 0
+		? (!p0 || (restarted == 0 && redundant >= 0x4000))
+		: (passed_after > 0 && hash_fails == 0));
+	TEST_CHECK(ok);
 	// tearing the simulation down aborts; the result is already known
 	std::fflush(stdout);
-	std::_Exit(ok_re ? 0 : 1);
+	std::_Exit(ok ? 0 : 1);
 }
 
 // As forget_after_busy_duplicate, but the piece is restored by a failed write
