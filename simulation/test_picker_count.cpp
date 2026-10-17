@@ -421,6 +421,14 @@ int wanted_requests(lt::aux::torrent const& t, lt::piece_index_t const p, bool c
 // reader does with a piece it has passed. The slow peer's blocks still
 // arrive (its seed has already read them when the cancels come) and must be
 // discarded: the piece is never downloading again, the blocks are redundant.
+// The unsent request is time critical (m_queued_time_critical).
+// PC_TWO=1: a second slow peer also holds requests for the piece and one
+// unsent; with invariant-checks=full every peer's check counts the requests
+// of all peers, also while forget_piece() cancels them peer by peer.
+// PC_RE: the piece is wanted again and must pass, without a hash failure:
+// 1 = top priority right after the forget (with PC_P0=1), 2 = once the late
+// blocks were discarded (with PC_P0=1), 3 = the piece stays wanted (without
+// PC_P0) and the test waits for it to pass and the slow peer to answer.
 TORRENT_TEST(forget_after_busy_duplicate)
 {
 	using namespace lt;
@@ -436,9 +444,10 @@ TORRENT_TEST(forget_after_busy_duplicate)
 
 	std::vector<std::unique_ptr<sim::asio::io_context>> ios;
 	std::vector<std::shared_ptr<lt::session>> seeds;
-	char const* ips[] = {"60.0.0.1", "60.0.0.2"}; // slow, fast
-	int const rates[] = {2, 1000}; // KiB/s
-	for (int i = 0; i < 2; ++i)
+	char const* ips[] = {"60.0.0.1", "60.0.0.2", "60.0.0.3"}; // slow, fast, second slow (PC_TWO=1)
+	int const rates[] = {2, 1000, 2}; // KiB/s
+	bool const two = env_int("PC_TWO", 0) != 0;
+	for (int i = 0; i < (two ? 3 : 2); ++i)
 	{
 		ios.push_back(std::make_unique<sim::asio::io_context>(sim, make_address_v4(ips[i])));
 		lt::session_params sp;
@@ -465,6 +474,10 @@ TORRENT_TEST(forget_after_busy_duplicate)
 
 	lt::torrent_handle h;
 	bool passed = false;
+	bool forgot = false;
+	int passed_after = 0;
+	int hash_fails = 0;
+	int const re = env_int("PC_RE", 0);
 	ses->set_alert_notify([&] {
 		post(ses->get_context(), [&] {
 			std::vector<lt::alert*> alerts;
@@ -478,10 +491,15 @@ TORRENT_TEST(forget_after_busy_duplicate)
 					prio[0] = top_priority;
 					h.prioritize_pieces(prio);
 					h.connect_peer(tcp::endpoint(make_address_v4(ips[0]), 6881));
+					if (two) h.connect_peer(tcp::endpoint(make_address_v4(ips[2]), 6881));
 				}
 				else if (auto const* pf = alert_cast<piece_finished_alert>(a))
 				{
-					if (pf->piece_index == piece) passed = true;
+					if (pf->piece_index == piece) { passed = true; if (forgot) ++passed_after; }
+				}
+				else if (auto const* hf = alert_cast<hash_failed_alert>(a))
+				{
+					if (hf->piece_index == piece) ++hash_fails;
 				}
 			}
 		});
@@ -537,8 +555,23 @@ TORRENT_TEST(forget_after_busy_duplicate)
 		// after the deadline, which makes queued requests time critical
 		if (tor && stage == 1 && ticks == 30)
 			for (auto* pc : *tor)
+			{
 				if (pc->remote().address() == make_address_v4(ips[0]))
-					pc->add_request(piece_block(piece, 15), {});
+					pc->add_request(piece_block(piece, 15), lt::aux::peer_connection::time_critical);
+				else if (two && pc->remote().address() == make_address_v4(ips[2]))
+				{
+					for (int bi = 14; bi >= 0; --bi)
+					{
+						piece_block const pb(piece, bi);
+						auto const has = [&](std::vector<lt::aux::pending_block> const& q) {
+							return std::any_of(q.begin(), q.end(), [&](lt::aux::pending_block const& x) { return x.block == pb; }); };
+						if (has(pc->download_queue()) || has(pc->request_queue())) continue;
+						if (tor->picker().is_downloaded(pb)) continue;
+						pc->add_request(pb, {});
+						break;
+					}
+				}
+			}
 		if (tor && stage == 0 && ticks >= 20)
 		{
 			h.connect_peer(tcp::endpoint(make_address_v4(ips[1]), 6881));
@@ -560,16 +593,27 @@ TORRENT_TEST(forget_after_busy_duplicate)
 			else
 			{
 				stage = 2;
+				forgot = true;
 				forget_tick = ticks;
 				wanted_after = wanted_requests(*tor, piece, true)
 					+ wanted_requests(*tor, piece, false);
 				cancels = outgoing_cancels(*tor) - cancels0;
+				if (re == 1) tor->set_piece_priority(piece, top_priority);
 			}
 		}
 		else if (tor && stage == 2 && !p0 && tor->has_picker() && tor->picker().is_downloading(piece))
 		{
 			mismatches = count_mismatches(*tor);
-			stage = 3;
+			stage = re == 3 ? 5 : 3;
+		}
+		else if (tor && stage == 5)
+		{
+			mismatches += count_mismatches(*tor);
+			if ((slow_queued(*tor) == 0 && passed_after > 0) || ticks > 2500)
+			{
+				redundant = redundant_bytes(*tor) - redundant0;
+				stage = 3;
+			}
 		}
 		else if (tor && stage == 2 && p0)
 		{
@@ -580,9 +624,19 @@ TORRENT_TEST(forget_after_busy_duplicate)
 				redundant = redundant_bytes(*tor) - redundant0;
 				mismatches = count_mismatches(*tor);
 				stage = 3;
+				if (re == 2) { tor->set_piece_priority(piece, top_priority); stage = 4; }
+				if (re == 1) stage = 4;
 			}
 		}
-		if (stage == 3 || ticks > 1300) { sim.stop(); return; }
+		else if (tor && stage == 4)
+		{
+			mismatches += count_mismatches(*tor);
+			if (passed_after > 0 || ticks > 2500)
+			{
+				stage = 3;
+			}
+		}
+		if (stage == 3 || (re == 0 && ticks > 1300) || ticks > 2600) { sim.stop(); return; }
 		timer.expires_after(lt::milliseconds(100));
 		timer.async_wait(on_tick);
 	};
@@ -594,16 +648,19 @@ TORRENT_TEST(forget_after_busy_duplicate)
 		" wanted_after=%d cancels=%d redundant=%d restarted=%d\n"
 		, stage, stale_at_forget, stale_unsent, forget_result, refused, mismatches
 		, wanted_after, int(cancels), int(redundant), restarted);
+	std::printf("RESULT2 re=%d passed_after=%d hash_fails=%d ticks=%d\n", re, passed_after, hash_fails, ticks);
 	// the scenario happened: requests were stale at the forget, and the piece
 	// was downloaded again (or, set to dont_download, a block came back and
 	// was discarded)
 	bool const ok = stage == 3 && stale_at_forget > 0 && stale_unsent > 0
 		&& mismatches == 0 && wanted_after == 0 && cancels > 0
 		&& (!p0 || (restarted == 0 && redundant >= 0x4000));
-	TEST_CHECK(ok);
+	bool const ok_re = re == 0 ? ok : (stage == 3 && mismatches == 0 && passed_after > 0
+		&& hash_fails == 0 && wanted_after == 0);
+	TEST_CHECK(ok_re);
 	// tearing the simulation down aborts; the result is already known
 	std::fflush(stdout);
-	std::_Exit(ok ? 0 : 1);
+	std::_Exit(ok_re ? 0 : 1);
 }
 
 // As forget_after_busy_duplicate, but the piece is restored by a failed write

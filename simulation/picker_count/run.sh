@@ -1,14 +1,14 @@
 #!/bin/bash
 # run.sh <tree> <out dir> <first seed> <last seed> [ENV=VAL ...]
 # builds simulation/test_picker_count of <tree> (as on disk) in docker as the
-# checked config (release, asserts=on, invariant-checks=on) and runs every seed
+# checked config (release, asserts=on, invariant-checks=full) and runs every seed
 # in [first, last], nproc at a time, with ASLR off (setarch -R; the order of
 # peers follows their addresses). Per seed: <out>/s<seed>.out, <out>/s<seed>.err
 # (stderr: the dump and, with PC_LOG=1, the actions). Summary: <out>/driver.log.
 # env: DEPS (tree with deps/, simulation/libsimulator), BOOST, IMG (image with
 #      gcc, b2), CPUS (default 0-5), MUT (sed script), MUTFILE (src/torrent.cpp),
 #      VOL (volume for objects, one per variant), B2X (extra b2 args), INV
-#      (invariant-checks, on), ASSERTS (asserts, on), TN (picker_count or forget_after_busy_duplicate)
+#      (invariant-checks, full as in the Jamfile), ASSERTS (asserts, on), TN (picker_count or forget_after_busy_duplicate)
 set -u
 W=$1; O=$2; S0=$3; S1=$4; shift 4
 DEPS=${DEPS:?a tree with deps/ and simulation/libsimulator}
@@ -24,7 +24,7 @@ if [ -n "${MUT:-}" ]; then
 fi
 git -C "$W" log -1 --format='%h %s' > "$O/commit.txt"; git -C "$W" status --short >> "$O/commit.txt"
 printf '%s\n' "$@" > "$O/env.txt"
-docker run --rm --security-opt seccomp=unconfined --cpuset-cpus=${CPUS:-0-5} -e S0="$S0" -e S1="$S1" -e B2X="${B2X:-}" -e INV="${INV:-on}" -e ASSERTS="${ASSERTS:-on}" -e TN="${TN:-picker_count}" -v "$T":/src:ro -v "$O":/out -v "${VOL:-picker-count}":/w \
+docker run --rm --security-opt seccomp=unconfined --cpuset-cpus=${CPUS:-0-5} -e S0="$S0" -e S1="$S1" -e B2X="${B2X:-}" -e INV="${INV:-full}" -e ASSERTS="${ASSERTS:-on}" -e TN="${TN:-picker_count}" -v "$T":/src:ro -v "$O":/out -v "${VOL:-picker-count}":/w \
   -v "${BOOST:?boost source tree}":/usr/local/opt/boost/include:ro "${IMG:?docker image}" bash -c '
 (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libssl-dev) > /out/apt.log 2>&1 || exit 1
 echo "using gcc ;" > /tmp/uc.jam
@@ -32,7 +32,7 @@ echo "using gcc ;" > /tmp/uc.jam
 # mutation run carries an older mtime than its object, and b2 would keep it
 (cd /src && find . -type f) | while read -r f; do cmp -s "/src/$f" "/w/$f" || { mkdir -p "$(dirname "/w/$f")"; cp "/src/$f" "/w/$f"; touch "/w/$f"; }; done
 cd /w/simulation
-b2 -j$(nproc) --user-config=/tmp/uc.jam toolset=gcc variant=release asserts=${ASSERTS:-on} invariant-checks=${INV:-on} $B2X \
+b2 -j$(nproc) --user-config=/tmp/uc.jam toolset=gcc variant=release asserts=${ASSERTS:-on} invariant-checks=${INV:-full} $B2X \
   debug-iterators=off webtorrent=off link=static testing.execute=off test_picker_count > /out/b2.log 2>&1
 echo "b2 exit=$? errors=$(grep -c " error:" /out/b2.log)"
 B=$(find /w/simulation/bin -name test_picker_count -type f -perm -u+x | xargs ls -t | head -1)
