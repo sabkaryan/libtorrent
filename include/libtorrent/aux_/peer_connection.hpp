@@ -626,10 +626,13 @@ namespace libtorrent::aux {
 		// picker, allowing another peer to request it immediately
 		void cancel_request(piece_block const& b, bool force = false);
 
-		// cancels the requests for the blocks of a piece the piece picker
-		// does not count them for (torrent::forget_piece()). Requests not sent
-		// yet are dropped, sent ones are flagged not_wanted and cancelled
-		void cancel_piece_requests(piece_index_t piece);
+		// for the requests for blocks of a piece the piece picker does not
+		// count them for (torrent::forget_piece()): drops the ones not sent
+		// yet and flags the sent ones not_wanted, without sending anything.
+		// Returns the cancels to send with send_cancels(): one per flagged
+		// request, except for the block being received, which is only flagged
+		std::vector<peer_request> drop_piece_requests(piece_index_t piece);
+		void send_cancels(std::vector<peer_request> const& cancels);
 		void send_block_requests();
 		void send_block_requests_impl();
 

@@ -2939,9 +2939,9 @@ namespace {
 		m_received_in_piece = 0;
 #endif
 		// if the block we got is already finished, then ignore it. So is a
-		// block we cancelled for a piece we don't want and don't download:
-		// writing it would start the piece again, and nothing picks the rest
-		// of a piece set to dont_download (see cancel_piece_requests())
+		// block we flagged not_wanted (cancelled, or sent without a request)
+		// of a piece set to dont_download that is not downloading: writing it
+		// would start the piece again, and nothing picks the rest of it
 		if (picker.is_downloaded(block_finished)
 			|| (b->not_wanted
 				&& !picker.is_downloading(block_finished.piece_index)
@@ -3834,13 +3834,13 @@ namespace {
 		write_cancel(r);
 	}
 
-	void peer_connection::cancel_piece_requests(piece_index_t const piece)
+	std::vector<peer_request> peer_connection::drop_piece_requests(piece_index_t const piece)
 	{
 		TORRENT_ASSERT(is_single_thread());
 
 		auto t = m_torrent.lock();
 		// this peer might be disconnecting
-		if (!t) return;
+		if (!t) return {};
 
 		for (auto i = m_request_queue.begin(); i != m_request_queue.end();)
 		{
@@ -3867,7 +3867,15 @@ namespace {
 			if (m_receiving_block == pb.block) continue;
 			cancels.push_back(t->to_req(pb.block));
 		}
+		return cancels;
+	}
 
+	void peer_connection::send_cancels(std::vector<peer_request> const& cancels)
+	{
+		TORRENT_ASSERT(is_single_thread());
+
+		auto t = m_torrent.lock();
+		if (!t) return;
 		for (auto const& r : cancels)
 		{
 #ifndef TORRENT_DISABLE_LOGGING

@@ -4821,6 +4821,21 @@ namespace {
 		// written after the forget would start the piece again, even one set
 		// to dont_download, whose other blocks are never picked. A wanted
 		// piece is picked again from scratch.
+		// Every peer's requests are dropped or flagged before the first
+		// cancel goes out: sending one runs the peer's invariant check, which
+		// counts the requests of all peers against the picker, and a peer
+		// without the FAST extensions takes the cancel as a reject and may
+		// pick new blocks right away
+		std::vector<std::pair<std::shared_ptr<peer_connection>, std::vector<peer_request>>> cancels;
+		for (auto* p : m_connections)
+		{
+			TORRENT_INCREMENT(m_iterating_connections);
+			auto r = p->drop_piece_requests(index);
+			if (!r.empty()) cancels.emplace_back(p->self(), std::move(r));
+		}
+		for (auto const& c : cancels)
+			if (!c.first->is_disconnecting()) c.first->send_cancels(c.second);
+
 		// we may also have announced HAVE for this piece. Reject any pending
 		// requests for it and let peers that support it know we don't
 		// have it anymore (the same as piece_failed() does for predictive
@@ -4829,8 +4844,6 @@ namespace {
 		{
 			peer_connection* p = *i;
 			++i;
-			p->cancel_piece_requests(index);
-			if (p->is_disconnecting()) continue;
 			p->reject_piece(index);
 			if (p->is_disconnecting()) continue;
 			p->write_dont_have(index);
