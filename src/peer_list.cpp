@@ -155,6 +155,13 @@ namespace libtorrent::aux {
 		recalculate_connect_candidates(state);
 	}
 
+	void peer_list::sync_finished(torrent_state* state)
+	{
+		TORRENT_ASSERT(is_single_thread());
+		if (bool(m_finished) == state->is_finished) return;
+		recalculate_connect_candidates(state);
+	}
+
 	// disconnects and removes all peers that are now filtered fills in 'erased'
 	// with torrent_peer pointers that were removed from the peer list. Any
 	// references to these peers must be cleared immediately after this call

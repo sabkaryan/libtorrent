@@ -181,6 +181,14 @@ namespace libtorrent::aux {
 
 		void set_max_failcount(torrent_state* st);
 
+		// the peer list keeps its own copy of whether the torrent is finished
+		// (seeds are not connect candidates then) and otherwise refreshes it
+		// only on its way to connect a peer. The torrent does not try that
+		// while the count of candidates is 0, so it calls this whenever it
+		// re-evaluates whether it wants peers
+		void sync_finished(torrent_state* state);
+		bool is_finished() const { return m_finished; }
+
 	private:
 
 		void recalculate_connect_candidates(torrent_state* state);
