@@ -17,8 +17,10 @@ see LICENSE file.
 #include "libtorrent/torrent_flags.hpp"
 #include "libtorrent/settings_pack.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <vector>
 
 #include "simulator/simulator.hpp"
 #include "simulator/utils.hpp"
@@ -106,15 +108,27 @@ struct reconnect_times
 	int num_pieces = -1;
 };
 
+// how the connection to the seed is closed once the downloader is finished
+enum class drop_by : std::uint8_t
+{
+	// the downloader closes it (close_redundant_connections)
+	close_redundant,
+	// close_redundant_connections is off, and the client pauses the torrent
+	// and resumes it at once, still finished
+	pause
+};
+
 // One seed and one downloader that at first wants only half of the pieces.
-// The downloader finishes, and with close_redundant_connections drops the
-// seed. `resume_delay` seconds after that, `resume` makes it want the other
-// pieces: it must connect to the seed it knows again and complete. Nothing
-// else tells it about the seed (no tracker, DHT or incoming connection), and
-// adding the same address again would not change the peer list either
+// The downloader finishes and the connection to the seed is closed (`drop`).
+// `resume_delay` seconds after that, `resume` makes it want more pieces: it
+// must connect to the seed it knows again and finish again. That is one
+// cycle; `cycles` of them run one after the other. Nothing else tells it
+// about the seed (no tracker, DHT or incoming connection), and adding the
+// same address again would not change the peer list either
 template <typename Resume>
-reconnect_times run_finished_reconnect(int const min_reconnect_time
-	, int const resume_delay, int const window, Resume const& resume)
+std::vector<reconnect_times> run_finished_reconnect(int const min_reconnect_time
+	, int const resume_delay, int const window, Resume const& resume
+	, drop_by const drop = drop_by::close_redundant, int const cycles = 1)
 {
 	sim::default_config network_cfg;
 	sim::simulation sim{network_cfg};
@@ -146,7 +160,8 @@ reconnect_times run_finished_reconnect(int const min_reconnect_time
 
 	lt::session_params dp;
 	dp.settings = pack("50.0.0.1:6881");
-	dp.settings.set_bool(lt::settings_pack::close_redundant_connections, true);
+	dp.settings.set_bool(lt::settings_pack::close_redundant_connections
+		, drop == drop_by::close_redundant);
 	dp.settings.set_int(lt::settings_pack::min_reconnect_time, min_reconnect_time);
 	dp.disk_io_constructor = test_disk();
 	auto ses = std::make_shared<lt::session>(dp, dl_ios);
@@ -165,8 +180,10 @@ reconnect_times run_finished_reconnect(int const min_reconnect_time
 	});
 	ses->async_add_torrent(atp);
 
-	reconnect_times r;
-	r.num_pieces = num_pieces;
+	std::vector<reconnect_times> rs(1);
+	rs.back().num_pieces = num_pieces;
+	// drop_by::pause: the torrent of this cycle was paused
+	bool paused = false;
 	lt::time_point const start = lt::clock_type::now();
 	auto const seconds = [&] {
 		return lt::duration_cast<lt::milliseconds>(lt::clock_type::now() - start).count() / 1000.0;
@@ -175,14 +192,32 @@ reconnect_times run_finished_reconnect(int const min_reconnect_time
 	std::function<void(boost::system::error_code const&)> on_tick;
 	on_tick = [&](boost::system::error_code const&) {
 		double const now = seconds();
+		if (rs.back().complete >= 0 && int(rs.size()) < cycles)
+		{
+			rs.emplace_back();
+			rs.back().num_pieces = num_pieces;
+			rs.back().finished = now;
+			paused = false;
+		}
+		reconnect_times& r = rs.back();
 		if (h.is_valid())
 		{
 			lt::torrent_status const st = h.status();
 			if (r.finished < 0 && st.is_finished) r.finished = now;
-			if (r.finished >= 0 && r.dropped < 0 && st.num_peers == 0) r.dropped = now;
+			if (drop == drop_by::pause && r.finished >= 0 && !paused && st.num_peers > 0)
+			{
+				h.pause();
+				paused = true;
+			}
+			if (r.finished >= 0 && r.dropped < 0 && st.num_peers == 0
+				&& (drop != drop_by::pause || paused))
+			{
+				r.dropped = now;
+				if (drop == drop_by::pause) h.resume();
+			}
 			if (r.dropped >= 0 && r.resumed < 0 && now - r.dropped >= resume_delay)
 			{
-				resume(h, num_pieces);
+				resume(h, num_pieces, int(rs.size()) - 1);
 				r.resumed = now;
 				lt::torrent_status const after = h.status();
 				r.candidates = after.connect_candidates;
@@ -198,7 +233,8 @@ reconnect_times run_finished_reconnect(int const min_reconnect_time
 				}
 			}
 		}
-		if (r.complete >= 0 || (r.resumed >= 0 && now - r.resumed > window) || now > 600)
+		if ((r.complete >= 0 && int(rs.size()) == cycles)
+			|| (r.resumed >= 0 && now - r.resumed > window) || now > 600)
 		{
 			zombie[0] = ses->abort();
 			zombie[1] = seed->abort();
@@ -214,13 +250,19 @@ reconnect_times run_finished_reconnect(int const min_reconnect_time
 	sim.run();
 
 	// on stderr: the series scripts read it from there
-	std::fprintf(stderr, "RESULT finished=%.1f dropped=%.1f resumed=%.1f candidates=%d"
-		" list_peers=%d reconnected=%.1f complete=%.1f pieces=%d/%d\n", r.finished, r.dropped
-		, r.resumed, r.candidates, r.list_peers, r.reconnected, r.complete, r.pieces, r.num_pieces);
-	return r;
+	for (std::size_t i = 0; i < rs.size(); ++i)
+	{
+		reconnect_times const& r = rs[i];
+		std::fprintf(stderr, "RESULT cycle=%d finished=%.1f dropped=%.1f resumed=%.1f candidates=%d"
+			" list_peers=%d reconnected=%.1f complete=%.1f pieces=%d/%d\n", int(i), r.finished
+			, r.dropped, r.resumed, r.candidates, r.list_peers, r.reconnected, r.complete, r.pieces
+			, r.num_pieces);
+	}
+	rs.resize(std::size_t(cycles));
+	return rs;
 }
 
-void resume_by_priority(torrent_handle const& h, int const num_pieces)
+void resume_by_priority(torrent_handle const& h, int const num_pieces, int)
 {
 	h.prioritize_pieces(std::vector<download_priority_t>(std::size_t(num_pieces)
 		, lt::default_priority));
@@ -269,7 +311,7 @@ TORRENT_TEST(set_file_priority_disk_error)
 // at all, so the count was never updated
 TORRENT_TEST(finished_reconnect_after_priority)
 {
-	reconnect_times const r = run_finished_reconnect(1, 5, 30, &resume_by_priority);
+	reconnect_times const r = run_finished_reconnect(1, 5, 30, &resume_by_priority).front();
 	TEST_CHECK(r.finished >= 0);
 	TEST_CHECK(r.dropped >= 0);
 	TEST_CHECK(r.resumed >= 0);
@@ -287,7 +329,7 @@ TORRENT_TEST(finished_reconnect_after_forget_piece)
 {
 	int forgot = -1;
 	reconnect_times const r = run_finished_reconnect(1, 5, 30
-		, [&](torrent_handle const& h, int) { forgot = h.forget_piece(piece_index_t(0)); });
+		, [&](torrent_handle const& h, int, int) { forgot = h.forget_piece(piece_index_t(0)); }).front();
 	TEST_EQUAL(forgot, 0);
 	TEST_CHECK(r.resumed >= 0);
 	TEST_EQUAL(r.list_peers, 1);
@@ -303,7 +345,7 @@ TORRENT_TEST(finished_reconnect_after_forget_piece)
 // passed since it was dropped, finished or not
 TORRENT_TEST(finished_reconnect_waits_min_reconnect_time)
 {
-	reconnect_times const r = run_finished_reconnect(60, 5, 90, &resume_by_priority);
+	reconnect_times const r = run_finished_reconnect(60, 5, 90, &resume_by_priority).front();
 	TEST_CHECK(r.resumed >= 0);
 	TEST_EQUAL(r.candidates, 1);
 	TEST_CHECK(r.reconnected >= 0);
@@ -319,7 +361,7 @@ TORRENT_TEST(finished_reconnect_waits_min_reconnect_time)
 TORRENT_TEST(finished_reconnect_after_recheck)
 {
 	reconnect_times const r = run_finished_reconnect(1, 5, 30
-		, [](torrent_handle const& h, int) { h.force_recheck(); });
+		, [](torrent_handle const& h, int, int) { h.force_recheck(); }).front();
 	TEST_CHECK(r.resumed >= 0);
 	TEST_EQUAL(r.list_peers, 1);
 	TEST_CHECK(r.reconnected >= 0);
@@ -327,4 +369,30 @@ TORRENT_TEST(finished_reconnect_after_recheck)
 	// it downloads the wanted half again
 	TEST_CHECK(r.complete >= 0);
 	TEST_EQUAL(r.pieces, r.num_pieces / 2);
+}
+
+// three cycles in a row with a seed that has every piece from the start,
+// and a downloader that does not close redundant connections. Each cycle
+// the finished torrent is paused and resumed, which closes the connection,
+// then forgets one more of the pieces it has and finishes again
+TORRENT_TEST(finished_reconnect_after_pause_three_cycles)
+{
+	std::vector<int> forgot;
+	std::vector<reconnect_times> const rs = run_finished_reconnect(1, 5, 30
+		, [&](torrent_handle const& h, int, int const cycle) {
+			forgot.push_back(h.forget_piece(piece_index_t(cycle)));
+		}, drop_by::pause, 3);
+	TEST_EQUAL(int(forgot.size()), 3);
+	for (int const f : forgot) TEST_EQUAL(f, 0);
+	for (reconnect_times const& r : rs)
+	{
+		TEST_CHECK(r.dropped >= 0);
+		TEST_CHECK(r.resumed >= 0);
+		TEST_EQUAL(r.list_peers, 1);
+		TEST_EQUAL(r.candidates, 1);
+		TEST_CHECK(r.reconnected >= 0);
+		TEST_CHECK(r.reconnected - r.resumed <= 3);
+		TEST_CHECK(r.complete >= 0);
+		TEST_EQUAL(r.pieces, r.num_pieces / 2);
+	}
 }
