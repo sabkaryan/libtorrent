@@ -8971,6 +8971,16 @@ namespace {
 
 	void torrent::update_want_peers()
 	{
+		// want_peers() reads the peer list's count of connect candidates,
+		// which depends on whether the torrent is finished. A torrent that
+		// stops being finished (a piece or file wanted again) would otherwise
+		// keep the count of a finished one, with no seed in it, and not try
+		// to connect to the seeds it dropped when it finished
+		if (m_peer_list && m_peer_list->is_finished() != is_finished())
+		{
+			torrent_state st = get_peer_list_state();
+			m_peer_list->sync_finished(&st);
+		}
 		update_list(aux::session_interface::torrent_want_peers_download, want_peers_download());
 		update_list(aux::session_interface::torrent_want_peers_finished, want_peers_finished());
 	}
