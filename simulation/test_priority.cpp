@@ -312,3 +312,19 @@ TORRENT_TEST(finished_reconnect_waits_min_reconnect_time)
 	TEST_CHECK(r.complete >= 0);
 	TEST_EQUAL(r.pieces, r.num_pieces);
 }
+
+// the same, when the torrent leaves the finished state on its way through a
+// check of its files (here the disk has none of them), not through
+// resume_download()
+TORRENT_TEST(finished_reconnect_after_recheck)
+{
+	reconnect_times const r = run_finished_reconnect(1, 5, 30
+		, [](torrent_handle const& h, int) { h.force_recheck(); });
+	TEST_CHECK(r.resumed >= 0);
+	TEST_EQUAL(r.list_peers, 1);
+	TEST_CHECK(r.reconnected >= 0);
+	TEST_CHECK(r.reconnected - r.resumed <= 3);
+	// it downloads the wanted half again
+	TEST_CHECK(r.complete >= 0);
+	TEST_EQUAL(r.pieces, r.num_pieces / 2);
+}
