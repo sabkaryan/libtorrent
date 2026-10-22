@@ -1416,8 +1416,10 @@ namespace {
 				}
 				else if (!e || restarts(*e))
 				{
-					// the limit is soft: it is checked only here
-					bool const at_limit = m_pool->held_bytes() >= m_pool->limit;
+					if (e)
+						s.retire(r.piece);
+					std::int64_t const reserved = m_pool->reserved_bytes();
+					bool const at_limit = s.reservation_size(r.piece) > m_pool->limit - reserved;
 					piece_place const place = s.decide(r.piece, at_limit);
 					if (place == piece_place::none)
 					{

@@ -139,7 +139,12 @@ namespace {
 		e->generation = slot.generation;
 		e->place = place;
 		e->missing_blocks = required_blocks(piece);
-		if (place == piece_place::memory) e->hasher = make_hasher(piece);
+		if (place == piece_place::memory)
+		{
+			e->hasher = make_hasher(piece);
+			e->reserved_bytes = reservation_size(piece);
+			m_reserved_bytes += e->reserved_bytes;
+		}
 		slot.current = e;
 		// the one-shot persist is spent once the piece is in the file
 		if (place == piece_place::file) m_one_shot.clear_bit(piece);
@@ -234,6 +239,8 @@ namespace {
 		{
 			// blocks dropped while the entry was pinned
 			free_dropped(*e);
+			if (e->place == piece_place::file && e->num_blocks == 0)
+				release_reservation(*e);
 			return;
 		}
 		auto const it = std::find(m_retired.begin(), m_retired.end(), e);
@@ -265,6 +272,16 @@ namespace {
 		e.blocks.shrink_to_fit();
 		e.num_blocks = 0;
 		free_dropped(e);
+		release_reservation(e);
+	}
+
+	void memory_storage::release_reservation(memory_piece_entry& e)
+	{
+		TORRENT_ASSERT(locked());
+		TORRENT_ASSERT(e.num_blocks == 0 && e.dropped.empty());
+		m_reserved_bytes -= e.reserved_bytes;
+		e.reserved_bytes = 0;
+		TORRENT_ASSERT(m_reserved_bytes >= 0);
 	}
 
 	void memory_storage::free_dropped(memory_piece_entry& e)
@@ -312,6 +329,8 @@ namespace {
 	void memory_storage::drop_blocks(memory_piece_entry& e)
 	{
 		for (int b = 0; b < e.blocks.end_index(); ++b) drop_block(e, b);
+		if (e.place == piece_place::file && e.num_blocks == 0 && e.dropped.empty())
+			release_reservation(e);
 	}
 
 	void memory_storage::transfer_done(memory_piece_entry& e)
@@ -541,7 +560,7 @@ namespace {
 		// rule 3: the pool, or the storage, is at its limit. Only a piece
 		// bound for memory is a spill; one bound for the file would have
 		// gone there anyway. A strict one is declined instead
-		if (at_limit || at_own_limit())
+		if (at_limit || at_own_limit(piece))
 		{
 			if (unlimited != piece_place::memory) return piece_place::file;
 			if (strict(piece)) return piece_place::none;

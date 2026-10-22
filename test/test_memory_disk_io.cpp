@@ -366,6 +366,204 @@ lt::file_storage one_piece(char const* name, int const blocks)
 
 } // anonymous namespace
 
+TORRENT_TEST(memory_only_declines_a_partial_that_cannot_reserve_full_piece)
+{
+	lt::file_storage fs;
+	fs.set_piece_length(4 * lt::default_block_size);
+	fs.add_file("strict_slot/file", 2 * fs.piece_length(), {});
+	fs.set_num_pieces(2);
+	auto const pool = memory_pool();
+	pool->set_default_policy(lt::memory_policy::memory_only);
+	pool->set_limit(fs.piece_length() + lt::default_block_size);
+	disk_env mem(lt::memory_disk_io_constructor(pool), 0);
+	auto const storage = mem.add(fs, "strict_slot", true, false);
+	auto const first = piece_data(fs, lt::piece_index_t{0}, true);
+	auto const second = piece_data(fs, lt::piece_index_t{1}, true);
+	mem.write(storage, lt::piece_index_t{0}, first, {1, 2, 3});
+	bool answered = false;
+	mem.disk->async_write(storage,
+		lt::peer_request{lt::piece_index_t{1}, 0, lt::default_block_size},
+		second.data(),
+		{},
+		[&](lt::storage_error const& error) {
+			TEST_CHECK(error.ec == lt::errors::write_declined);
+			answered = true;
+		},
+		{});
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([&] { return answered; }));
+	TEST_EQUAL(pool->reserved_bytes(), fs.piece_length());
+	TEST_EQUAL(pool->spilled_pieces(), 0);
+	TEST_CHECK(!lt::aux::memory_in_file_for_test(*mem.disk, storage, lt::piece_index_t{1}));
+	pool->set_limit(0);
+	mem.write(storage, lt::piece_index_t{0}, first, {0});
+	TEST_CHECK(mem.hash(storage, lt::piece_index_t{0}, true, 0).v1 == sha1(first));
+	TEST_EQUAL(pool->held_bytes(), fs.piece_length());
+}
+
+TORRENT_TEST(short_final_block_requires_its_whole_allocated_slot)
+{
+	lt::file_storage fs;
+	fs.set_piece_length(4 * lt::default_block_size);
+	fs.add_file("short_slot/file", lt::default_block_size + 100, {});
+	fs.set_num_pieces(1);
+	auto const pool = memory_pool();
+	pool->set_limit(2 * lt::default_block_size - 1);
+	disk_env mem(lt::memory_disk_io_constructor(pool), 0);
+	auto const storage = mem.add(fs, "short_slot", true, false);
+	lt::piece_index_t const p{0};
+	auto const data = piece_data(fs, p, true);
+	mem.write(storage, p, data);
+	TEST_CHECK(mem.hash(storage, p, true, 0).v1 == sha1(data));
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, storage, p) == lt::piece_place::file);
+	TEST_CHECK(lt::aux::memory_in_file_for_test(*mem.disk, storage, p));
+	TEST_EQUAL(pool->reserved_bytes(), 0);
+	TEST_EQUAL(pool->held_bytes(), 0);
+}
+
+TORRENT_TEST(removed_storage_reservation_blocks_other_torrent)
+{
+	lt::file_storage const fs = one_piece("removed_slot/file", 4);
+	lt::piece_index_t const p{0};
+	auto const data = piece_data(fs, p, true);
+	auto const pool = memory_pool();
+	pool->set_limit(fs.piece_length());
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	auto const first = mem.add(fs, "removed_slot_first", true, false);
+	memory_hasher_gate gate(p);
+	mem.write(first, p, data, {3});
+	TEST_CHECK(mem.run_until([&] {
+		return mem.writes_done == mem.writes_issued && memory_hasher_gate::waiting() == 1;
+	}));
+	mem.storages.front().reset();
+	TEST_EQUAL(pool->held_bytes(), 0);
+	TEST_EQUAL(pool->reserved_bytes(), fs.piece_length());
+	auto const second = mem.add(fs, "removed_slot_second", true, false);
+	mem.write(second, p, data);
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, second, p) == lt::piece_place::file);
+	gate.release();
+	auto const h = mem.hash(second, p, true, 0);
+	TEST_CHECK(!h.error);
+	TEST_CHECK(h.v1 == sha1(data));
+	TEST_CHECK(mem.run_until([&] { return pool->reserved_bytes() == 0; }));
+	TEST_CHECK(lt::aux::memory_in_file_for_test(*mem.disk, second, p));
+}
+
+TORRENT_TEST(replacing_unpinned_generation_reuses_the_full_slot)
+{
+	lt::file_storage const fs = one_piece("reused_slot/file", 4);
+	lt::piece_index_t const p{0};
+	auto data = piece_data(fs, p, true);
+	auto const pool = memory_pool();
+	pool->set_limit(fs.piece_length());
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	auto const storage = mem.add(fs, "reused_slot", true, false);
+	mem.write(storage, p, data);
+	TEST_CHECK(mem.hash(storage, p, true, 0).v1 == sha1(data));
+	data.front() ^= 0x55;
+	mem.write(storage, p, data);
+	TEST_CHECK(mem.hash(storage, p, true, 0).v1 == sha1(data));
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, storage, p) == lt::piece_place::memory);
+	TEST_EQUAL(pool->held_bytes(), fs.piece_length());
+	TEST_EQUAL(pool->reserved_bytes(), fs.piece_length());
+}
+
+TORRENT_TEST(partial_slots_of_another_torrent_block_new_memory_piece)
+{
+	lt::file_storage const fs = one_piece("shared_slots/file", 4);
+	int const piece_bytes = fs.piece_length();
+	lt::piece_index_t const p{0};
+	auto const data = piece_data(fs, p, true);
+	auto const pool = memory_pool();
+	pool->set_limit(piece_bytes + lt::default_block_size);
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	auto const first = mem.add(fs, "shared_slots_first", true, false);
+	auto const second = mem.add(fs, "shared_slots_second", true, false);
+	mem.write(first, p, data, {1, 2, 3});
+	mem.write(second, p, data, {1, 2, 3});
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, first, p) == lt::piece_place::memory);
+	TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, second, p) == lt::piece_place::file);
+	mem.write(first, p, data, {0});
+	mem.write(second, p, data, {0});
+	int hashed = 0;
+	for (auto const storage : {first, second})
+		mem.disk->async_hash(storage,
+			p,
+			{},
+			lt::disk_interface::v1_hash | lt::disk_interface::flush_piece,
+			[&](lt::piece_index_t, lt::sha1_hash const& h, lt::storage_error const& error) {
+				TEST_CHECK(!error);
+				TEST_CHECK(h == sha1(data));
+				++hashed;
+			});
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([&] { return hashed == 2 && mem.writes_done == mem.writes_issued; }));
+	TEST_EQUAL(pool->held_bytes(), piece_bytes);
+	TEST_CHECK(lt::aux::memory_in_file_for_test(*mem.disk, second, p));
+	lt::storage_error error;
+	auto const bytes = mem.read(second, lt::peer_request{p, 0, lt::default_block_size}, error);
+	TEST_CHECK(!error);
+	TEST_CHECK(bytes == std::vector<char>(data.begin(), data.begin() + lt::default_block_size));
+}
+
+TORRENT_TEST(partial_piece_admission_keeps_full_slots_and_file_bytes)
+{
+	int const piece_bytes = 4 * lt::default_block_size;
+	lt::file_storage fs;
+	fs.set_piece_length(piece_bytes);
+	fs.add_file("full_slot/file", 4 * piece_bytes, {});
+	fs.set_num_pieces(4);
+	auto const pool = memory_pool();
+	pool->set_limit(2 * piece_bytes + lt::default_block_size);
+	disk_env mem(lt::memory_disk_io_constructor(pool), 1);
+	lt::storage_index_t const ms = mem.add(fs, "full_slot", true, false);
+	std::vector<std::vector<char>> data;
+	for (int i = 0; i < 4; ++i)
+	{
+		lt::piece_index_t const p{i};
+		data.push_back(piece_data(fs, p, true));
+		mem.write(ms, p, data.back(), {1, 2, 3});
+		auto const expected = i < 2 ? lt::piece_place::memory : lt::piece_place::file;
+		TEST_CHECK(lt::aux::memory_place_for_test(*mem.disk, ms, p) == expected);
+	}
+	std::vector<lt::sha1_hash> hashes(4);
+	int hashed = 0;
+	for (int i = 0; i < 4; ++i)
+	{
+		lt::piece_index_t const p{i};
+		mem.write(ms, p, data[std::size_t(i)], {0});
+		mem.disk->async_hash(ms,
+			p,
+			{},
+			lt::disk_interface::v1_hash | lt::disk_interface::flush_piece,
+			[&, i](lt::piece_index_t, lt::sha1_hash const& hash, lt::storage_error const& error) {
+				TEST_CHECK(!error);
+				hashes[std::size_t(i)] = hash;
+				++hashed;
+			});
+	}
+	mem.disk->submit_jobs();
+	TEST_CHECK(mem.run_until([&] { return hashed == 4 && mem.writes_done == mem.writes_issued; }));
+	TEST_EQUAL(pool->held_bytes(), 2 * piece_bytes);
+	TEST_EQUAL(pool->spilled_pieces(), 2);
+	for (int i = 0; i < 4; ++i)
+	{
+		lt::piece_index_t const p{i};
+		TEST_CHECK(hashes[std::size_t(i)] == sha1(data[std::size_t(i)]));
+		TEST_EQUAL(lt::aux::memory_in_file_for_test(*mem.disk, ms, p), i >= 2);
+		for (int off = 0; off < piece_bytes; off += lt::default_block_size)
+		{
+			lt::storage_error error;
+			auto const bytes =
+				mem.read(ms, lt::peer_request{p, off, lt::default_block_size}, error);
+			TEST_CHECK(!error);
+			std::vector<char> const expected(data[std::size_t(i)].begin() + off,
+				data[std::size_t(i)].begin() + off + lt::default_block_size);
+			TEST_CHECK(bytes == expected);
+		}
+	}
+}
+
 // the reference: pread_disk_io itself wakes the observer
 TORRENT_TEST(observer_woken_after_back_pressure_pread)
 {

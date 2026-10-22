@@ -212,6 +212,9 @@ namespace libtorrent::aux {
 		// the bytes held by the current entries of every storage. The
 		// caller holds mutex
 		std::int64_t held_bytes() const;
+		// the whole-piece reservations of live and removed storages. The
+		// caller holds mutex
+		std::int64_t reserved_bytes() const;
 		// the bytes of retired entries, of live and of removed storages.
 		// The caller holds mutex
 		std::int64_t retired_bytes() const;

@@ -419,3 +419,82 @@ TORRENT_TEST(storage_block_written_once)
 	}
 }
 #endif
+
+TORRENT_TEST(storage_partial_slot_survives_retirement_until_last_reader)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * piece_bytes);
+	memory_storage st(fs, true, false, alloc);
+	st.set_torrent_policy(memory_policy::memory);
+	st.set_limit(piece_bytes + bs);
+	auto const first = st.start(piece_index_t{0}, piece_place::memory);
+	TEST_CHECK(st.write_block(*first, 0, block_of('r')));
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	first->pins = 2;
+	st.retire(piece_index_t{0});
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	st.unpin(first);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	TEST_CHECK(st.block_data(*first, 0) != nullptr);
+	if (st.block_data(*first, 0) != nullptr)
+		TEST_EQUAL(st.block_data(*first, 0)[bs - 1], 'r');
+	st.unpin(first);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::memory);
+	TEST_EQUAL(alloc.blocks_in_use(), 0);
+}
+
+TORRENT_TEST(storage_transfer_slot_waits_for_held_block_release)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * piece_bytes);
+	memory_storage st(fs, true, false, alloc);
+	st.set_torrent_policy(memory_policy::memory);
+	st.set_limit(piece_bytes);
+	auto const first = st.start(piece_index_t{0}, piece_place::memory);
+	TEST_CHECK(st.write_block(*first, 0, block_of('t')));
+	first->place = piece_place::transfer;
+	first->pins = 1;
+	st.partial_transfer_done(*first, false);
+	TEST_CHECK(first->place == piece_place::file);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	TEST_EQUAL(alloc.blocks_in_use(), 1);
+	st.unpin(first);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::memory);
+	TEST_EQUAL(alloc.blocks_in_use(), 0);
+}
+
+TORRENT_TEST(unpinned_transfer_returns_the_slot)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * piece_bytes);
+	memory_storage st(fs, true, false, alloc);
+	st.set_torrent_policy(memory_policy::memory);
+	st.set_limit(piece_bytes);
+	auto const first = st.start(piece_index_t{0}, piece_place::memory);
+	TEST_CHECK(st.write_block(*first, 0, block_of('u')));
+	TEST_CHECK(st.write_block(*first, 1, block_of('v')));
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	first->place = piece_place::transfer;
+	st.transfer_done(*first);
+	TEST_EQUAL(alloc.blocks_in_use(), 0);
+	TEST_EQUAL(st.reserved_bytes(), 0);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::memory);
+}
+
+TORRENT_TEST(unpinned_failed_partial_transfer_returns_the_slot)
+{
+	lt::file_storage const fs = two_files();
+	memory_slab_allocator alloc(4 * piece_bytes);
+	memory_storage st(fs, true, false, alloc);
+	st.set_torrent_policy(memory_policy::memory);
+	st.set_limit(piece_bytes);
+	auto const first = st.start(piece_index_t{0}, piece_place::memory);
+	TEST_CHECK(st.write_block(*first, 0, block_of('f')));
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::file);
+	first->place = piece_place::transfer;
+	st.partial_transfer_done(*first, true);
+	TEST_CHECK(first->place == piece_place::file);
+	TEST_EQUAL(alloc.blocks_in_use(), 0);
+	TEST_EQUAL(st.reserved_bytes(), 0);
+	TEST_CHECK(st.decide(piece_index_t{1}, false) == piece_place::memory);
+}

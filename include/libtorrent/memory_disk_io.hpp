@@ -164,20 +164,15 @@ namespace libtorrent {
 		void set_policy(torrent_handle const&, memory_owner_t, memory_policy, span<file_index_t const> files = {});
 
 		// the number of bytes the pool may hold, for all sessions. It is 0
-		// until this is called: every piece goes to the file. The limit is
-		// soft: it is checked when a piece starts, and a piece that starts
-		// while the pool holds at least the limit goes to the file (see
-		// spilled_pieces()). Lowering it drops nothing already held. The
-		// bytes of retired entries still in use by disk jobs
-		// (retired_bytes()) are not counted against it
+		// until this is called: every piece goes to the file.
+		// Admission reserves a whole piece, including its short block rounded to
+		// 16 KiB. Retired and transferring generations retain their reservations
+		// until their RAM is freed. Lowering the limit drops no accepted piece.
 		void set_limit(std::int64_t bytes);
 
-		// the number of bytes one torrent may hold, -1 (the default) for no
-		// limit of its own. A piece of the torrent starts in memory only
-		// while both the pool holds less than its limit and the torrent less
-		// than this one; it is checked when a piece starts, as the pool's
-		// limit. At the limit a piece goes to the file, or is declined under
-		// memory_policy::memory_only
+		// The same admission limit for one storage; -1 disables its own limit.
+		// A piece that cannot fit starts in the file, or is declined under
+		// memory_policy::memory_only.
 		void set_limit(torrent_handle const&, std::int64_t bytes);
 
 		// a one-shot request to store the given pieces in the file: a piece
@@ -266,12 +261,17 @@ namespace libtorrent {
 		memory_held held_bytes(torrent_handle const&) const;
 		std::int64_t held_bytes() const;
 
+		// Whole-piece reservations, including transferring and retired generations,
+		// of removed torrents too.
+		std::int64_t reserved_bytes() const;
+
 		// bytes of forgotten pieces that are still in use by disk jobs, of
 		// removed torrents too
 		std::int64_t retired_bytes() const;
 
 		// pieces that were bound for memory and went to the file because the
-		// pool was at its limit, of removed torrents too
+		// pool or the torrent could not reserve the whole piece, of removed
+		// torrents too
 		std::int64_t spilled_pieces() const;
 
 		// pieces declined under memory_policy::memory_only, of removed

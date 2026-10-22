@@ -17,6 +17,7 @@ see LICENSE file.
 #include <vector>
 
 #include "libtorrent/config.hpp"
+#include "libtorrent/disk_interface.hpp"
 #include "libtorrent/memory_disk_io.hpp"
 #include "libtorrent/units.hpp"
 #include "libtorrent/span.hpp"
@@ -77,6 +78,7 @@ namespace libtorrent::aux {
 		aux::vector<char*, int> blocks;
 		// non-null blocks
 		int num_blocks = 0;
+		std::int64_t reserved_bytes = 0;
 		// non-pad blocks not received yet. 0 means the piece is complete
 		int missing_blocks = 0;
 		// an async_hash answered for this entry with every block it hashed
@@ -215,21 +217,15 @@ namespace libtorrent::aux {
 		void drop_owner(memory_owner_t owner);
 		void set_torrent_policy(memory_policy policy);
 		memory_policy torrent_policy() const { return m_torrent_policy; }
-		// rules 1-5: persist (one-shot or of any owner) -> file; a file
-		// claim covers it -> file; at the limit (at_limit: the pool holds >=
-		// its limit, or the storage holds >= its own limit) -> file, or
-		// none for a strict piece; a memory or memory_only claim covers it
-		// -> memory; otherwise the torrent policy (memory and memory_only
-		// -> memory). It changes no claim: a one-shot persist piece stays in
-		// its set until start() starts it in the file. A piece that rule 3
-		// sends to the file counts in spilled_pieces() only if rules 4-5
-		// would have sent it to memory. none means the piece is declined: the
-		// caller starts no entry and calls decline()
+		// Persist and FILE claims win. Otherwise an insufficient full slot spills
+		// a memory piece, or returns none for memory_only (the caller declines).
+		// Only fallback from memory to file counts in spilled_pieces().
 		piece_place decide(piece_index_t piece, bool at_limit);
-		// the place rules 1, 2, 4 and 5 give the piece, the limit aside. A
-		// piece held in memory whose wanted place is the file is moved there
+		// the place persist, FILE claims, memory claims and the torrent policy
+		// give the piece, the limit aside. A piece held in memory whose wanted
+		// place is the file is moved there
 		piece_place wanted_place(piece_index_t piece) const;
-		// the piece goes to memory by rules 4-5 under memory_only: a memory_only
+		// the piece goes to memory under memory_only: a memory_only
 		// claim covers it, or no memory claim does and the torrent policy is
 		// memory_only. Such a piece is never sent to the file by the limit
 		bool strict(piece_index_t piece) const;
@@ -237,9 +233,15 @@ namespace libtorrent::aux {
 		// the bytes this storage may hold, -1 for no limit of its own
 		void set_limit(std::int64_t bytes) { m_limit = bytes; }
 		std::int64_t limit() const { return m_limit; }
-		// the storage holds at least its own limit
-		bool at_own_limit() const
-		{ return m_limit >= 0 && m_held_complete + m_held_partial >= m_limit; }
+		bool at_own_limit(piece_index_t piece) const
+		{
+			return m_limit >= 0 && reservation_size(piece) > m_limit - m_reserved_bytes;
+		}
+		std::int64_t reservation_size(piece_index_t piece) const
+		{
+			return std::int64_t(blocks_in_piece(piece)) * default_block_size;
+		}
+		std::int64_t reserved_bytes() const { return m_reserved_bytes; }
 
 		// declined pieces. A strict piece that cannot be stored is declined:
 		// decline() starts its tombstone (the piece then has no entry: one
@@ -276,8 +278,8 @@ namespace libtorrent::aux {
 		std::int64_t held_partial() const { return m_held_partial; }
 		// bytes of retired entries that are still pinned
 		std::int64_t retired_bytes() const { return m_retired_bytes; }
-		// pieces decide() sent to the file because the pool was at its
-		// limit, that would have gone to memory otherwise
+		// pieces that were bound for memory and that decide() sent to the
+		// file because the pool or the torrent could not reserve the whole piece
 		int spilled_pieces() const { return m_spilled_pieces; }
 
 		file_storage const& files() const { return m_files; }
@@ -325,6 +327,7 @@ namespace libtorrent::aux {
 		bool locked() const;
 		void retire_entry(std::shared_ptr<memory_piece_entry> e);
 		void free_blocks(memory_piece_entry& e);
+		void release_reservation(memory_piece_entry& e);
 		// frees the blocks dropped from e while it was pinned
 		void free_dropped(memory_piece_entry& e);
 		// adds (sign 1) or removes (sign -1) the bytes of the current entry e
@@ -360,6 +363,7 @@ namespace libtorrent::aux {
 		std::int64_t m_held_complete = 0;
 		std::int64_t m_held_partial = 0;
 		std::int64_t m_retired_bytes = 0;
+		std::int64_t m_reserved_bytes = 0;
 		int m_spilled_pieces = 0;
 		int m_declined_pieces = 0;
 		int m_persist_failures = 0;

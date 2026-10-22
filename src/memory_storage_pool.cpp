@@ -123,6 +123,17 @@ namespace {
 		return ret;
 	}
 
+	std::int64_t memory_pool_impl::reserved_bytes() const
+	{
+		TORRENT_ASSERT(mutex.owned_by_this_thread());
+		std::int64_t ret = 0;
+		for (auto const& r : storages)
+			ret += r.storage->reserved_bytes();
+		for (auto const& r : retired)
+			ret += r.storage->reserved_bytes();
+		return ret;
+	}
+
 	std::int64_t memory_pool_impl::retired_bytes() const
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
@@ -586,6 +597,12 @@ namespace {
 	{
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		return m_impl->held_bytes();
+	}
+
+	std::int64_t memory_storage_pool::reserved_bytes() const
+	{
+		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+		return m_impl->reserved_bytes();
 	}
 
 	std::int64_t memory_storage_pool::retired_bytes() const
