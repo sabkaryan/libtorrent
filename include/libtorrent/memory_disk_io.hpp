@@ -105,6 +105,44 @@ namespace libtorrent {
 		typed_bitfield<piece_index_t> partial;
 	};
 
+	// the pieces and bytes of one torrent in the pool, all taken at one
+	// moment (see memory_storage_pool::snapshot()). A piece is in at most
+	// one of the five sets; a piece in none has no bytes in the pool and
+	// none in the file that the pool knows of
+	struct memory_snapshot
+	{
+		// 0 if the snapshot was taken; memory_storage_pool::not_managed or
+		// memory_storage_pool::invalid_handle otherwise, and then the sets
+		// are empty and the numbers 0
+		int status = 0;
+
+		// pieces held in memory (place memory) whose every block is present
+		typed_bitfield<piece_index_t> ram_complete;
+		// pieces held in memory with missing blocks
+		typed_bitfield<piece_index_t> ram_partial;
+		// pieces being moved from memory to the file (place transfer). Their
+		// blocks still in memory count in the held bytes
+		typed_bitfield<piece_index_t> transfer;
+		// pieces the default backend can read from the file: the torrent has
+		// the piece (it passed its hash check), the piece is "in file" (as
+		// filter_resume() keeps it) and its current bytes are not in memory
+		typed_bitfield<piece_index_t> file_ready;
+		// pieces whose bytes go to (or were written to) the file but that are
+		// not file_ready: blocks missing in the file, or not checked yet
+		typed_bitfield<piece_index_t> file_pending;
+
+		// the torrent's held bytes (as held_bytes(torrent_handle)), its
+		// pending_persist_bytes() and its reserved bytes
+		std::int64_t held_complete = 0;
+		std::int64_t held_partial = 0;
+		std::int64_t pending_persist = 0;
+		std::int64_t reserved = 0;
+		// the pool's held_bytes(), reserved_bytes() and retired_bytes()
+		std::int64_t pool_held = 0;
+		std::int64_t pool_reserved = 0;
+		std::int64_t pool_retired = 0;
+	};
+
 	// the shared state of the in-memory disk backend and the calls of the
 	// client. The pool is created by the client and handed to
 	// memory_disk_io_constructor(); one pool may serve several sessions, and
@@ -120,8 +158,8 @@ namespace libtorrent {
 	// storage yet, because it has no metadata, waits for it and applies
 	// once the storage is created.
 	//
-	// Only forget_piece() waits for the network thread; every other call
-	// works under the pool's mutex and returns at once.
+	// Only forget_piece() and snapshot() wait for the network thread; every
+	// other call works under the pool's mutex and returns at once.
 	struct TORRENT_EXPORT memory_storage_pool
 	{
 		// the construction parameters of the pool
@@ -136,6 +174,9 @@ namespace libtorrent {
 		static constexpr int not_in_memory = -1;
 		// returned by calls naming a torrent that has no storage in the pool
 		static constexpr int not_managed = -2;
+		// the status of snapshot() for a handle without a torrent object
+		// (never had one, or its torrent was removed and released)
+		static constexpr int invalid_handle = -3;
 
 		// constructs an empty pool. Its limit is 0 (every piece goes to the
 		// file) until set_limit() is called
@@ -260,6 +301,28 @@ namespace libtorrent {
 		// no storage in the pool), and by the whole pool
 		memory_held held_bytes(torrent_handle const&) const;
 		std::int64_t held_bytes() const;
+
+		// where the pieces of the handle's torrent are and the bytes the pool
+		// holds, all at one moment: one task on the network thread of the
+		// handle's session reads which pieces the torrent has, then the pool's
+		// state under its mutex. The answers of the default backend that
+		// change the place of a piece or its "in file" flag, and the
+		// torrent's own state, change only on that thread, so nothing changes
+		// between the two reads.
+		//
+		// Only the storage of the handle's torrent object is read, never one
+		// found by info-hash nor what the pool keeps of removed torrents. The
+		// call only reads: it reads no piece data, issues no disk job and
+		// changes nothing.
+		//
+		// It waits for the network thread and must not be called from it, as
+		// forget_piece(). It visits every piece of the torrent under the
+		// pool's mutex.
+		//
+		// A file_ready piece is one the default backend has been handed in
+		// full. Whether its bytes are on the disk (a write cache, no fsync)
+		// and whether the file is still there is not checked
+		memory_snapshot snapshot(torrent_handle const&) const;
 
 		// Whole-piece reservations, including transferring and retired generations,
 		// of removed torrents too.

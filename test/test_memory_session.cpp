@@ -2565,3 +2565,511 @@ TORRENT_TEST(e2e_restart_with_filtered_resume)
 	remove_all("tmp1" + suffix, ec);
 	remove_all("tmp2" + suffix, ec);
 }
+
+namespace {
+
+std::vector<int> bits(typed_bitfield<piece_index_t> const& b)
+{
+	std::vector<int> ret;
+	for (piece_index_t p{0}; p < b.end_index(); ++p)
+		if (b.get_bit(p)) ret.push_back(static_cast<int>(p));
+	return ret;
+}
+
+// the snapshot was taken, every set has a bit per piece and no piece is in
+// two sets
+bool consistent(memory_snapshot const& s, int const n)
+{
+	if (s.status != 0) return false;
+	std::vector<typed_bitfield<piece_index_t> const*> const sets{&s.ram_complete, &s.ram_partial
+		, &s.transfer, &s.file_ready, &s.file_pending};
+	for (auto const* b : sets)
+		if (b->size() != n) return false;
+	for (piece_index_t p{0}; p < piece_index_t{n}; ++p)
+	{
+		int in = 0;
+		for (auto const* b : sets) in += b->get_bit(p) ? 1 : 0;
+		if (in > 1) return false;
+	}
+	return true;
+}
+
+bool is_empty(memory_snapshot const& s)
+{
+	return s.ram_complete.size() == 0 && s.ram_partial.size() == 0 && s.transfer.size() == 0
+		&& s.file_ready.size() == 0 && s.file_pending.size() == 0
+		&& s.held_complete == 0 && s.held_partial == 0 && s.pending_persist == 0
+		&& s.reserved == 0 && s.pool_held == 0 && s.pool_reserved == 0 && s.pool_retired == 0;
+}
+
+} // anonymous namespace
+
+#if defined TORRENT_LINUX
+// a piece moved from memory to the file. Before the move it is in
+// memory; while the write gate holds the move it is in transfer, its
+// bytes held and pending; once moved it is file_ready and nothing is held
+TORRENT_TEST(snapshot_transfer_to_file)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_transfer");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		memory_snapshot const before = pool->snapshot(th);
+		TEST_CHECK(consistent(before, num_pieces));
+		TEST_CHECK(bits(before.ram_complete) == std::vector<int>{0});
+		TEST_EQUAL(before.ram_partial.count() + before.transfer.count(), 0);
+		TEST_EQUAL(before.file_ready.count() + before.file_pending.count(), 0);
+		TEST_EQUAL(before.held_complete, piece_size);
+		TEST_EQUAL(before.held_partial, 0);
+		TEST_EQUAL(before.pending_persist, 0);
+		TEST_EQUAL(before.reserved, piece_size);
+		TEST_EQUAL(before.pool_held, piece_size);
+		TEST_EQUAL(before.pool_reserved, piece_size);
+		TEST_EQUAL(before.pool_retired, 0);
+
+		set_hold_writes(true);
+		file_index_t const f0[] = {file_index_t{0}};
+		pool->set_policy(th, 1, memory_policy::file, f0);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+		memory_snapshot const during = pool->snapshot(th);
+		TEST_CHECK(consistent(during, num_pieces));
+		TEST_CHECK(bits(during.transfer) == std::vector<int>{0});
+		TEST_EQUAL(during.ram_complete.count() + during.file_ready.count() + during.file_pending.count(), 0);
+		TEST_EQUAL(during.held_complete, piece_size);
+		TEST_EQUAL(during.pending_persist, piece_size);
+
+		set_hold_writes(false);
+		TEST_CHECK(wait_for([&] { return pool->snapshot(th).file_ready.count() == 1; }));
+		memory_snapshot const after = pool->snapshot(th);
+		TEST_CHECK(consistent(after, num_pieces));
+		TEST_CHECK(bits(after.file_ready) == std::vector<int>{0});
+		TEST_EQUAL(after.ram_complete.count() + after.transfer.count() + after.file_pending.count(), 0);
+		TEST_EQUAL(after.held_complete, 0);
+		TEST_EQUAL(after.pending_persist, 0);
+		TEST_EQUAL(after.pool_held, 0);
+		TEST_CHECK(in_file(*ses, th, p));
+		TEST_EQUAL(pool->persist_failures(th), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
+
+#if defined TORRENT_LINUX
+// a piece forgotten while the write gate holds its move: its entry is
+// retired, its bytes count in the pool's retired bytes until the move lets
+// go of them, and the piece is in no set
+TORRENT_TEST(snapshot_retired_under_transfer)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_retired");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+
+		set_hold_writes(true);
+		file_index_t const f0[] = {file_index_t{0}};
+		pool->set_policy(th, 1, memory_policy::file, f0);
+		TEST_CHECK(wait_for([] { return held_writes() > 0; }));
+		TEST_EQUAL(pool->forget_piece(th, p).code, 0);
+		memory_snapshot const s = pool->snapshot(th);
+		TEST_CHECK(consistent(s, num_pieces));
+		TEST_EQUAL(s.ram_complete.count() + s.transfer.count() + s.file_ready.count()
+			+ s.file_pending.count(), 0);
+		TEST_EQUAL(s.held_complete, 0);
+		TEST_EQUAL(s.pool_held, 0);
+		TEST_EQUAL(s.pool_retired, piece_size);
+		TEST_EQUAL(s.pool_retired, pool->retired_bytes());
+
+		set_hold_writes(false);
+		TEST_CHECK(wait_for([&] { return pool->snapshot(th).pool_retired == 0; }));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
+
+// pieces whose bytes go to the file. A piece with half its blocks written
+// is file_pending (the default backend answers its writes only once it
+// writes the piece); with every block written behind libtorrent's back it is
+// "in file" but the torrent does not have it (no hash check): still
+// file_pending. A piece libtorrent writes and checks is file_ready
+TORRENT_TEST(snapshot_file_pending_until_checked)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_file_pending");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		pool->set_policy(th, 1, memory_policy::file);
+		piece_index_t const p{3};
+
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		auto first = std::make_shared<answers>();
+		on_network(*ses, [&](aux::session_impl& s)
+		{
+			for (int b = 0; b < 2; ++b)
+			{
+				peer_request const r{p, b * default_block_size, default_block_size};
+				s.disk_thread().async_write(t->storage(), r
+					, piece_ptr(content, p) + std::size_t(b) * default_block_size, {}
+					, [first](storage_error const& e) { TEST_CHECK(!e); (*first)(e); }, {});
+			}
+			s.disk_thread().submit_jobs();
+		});
+		TEST_CHECK(wait_for([&] { return pool->snapshot(th).file_pending.count() == 1; }));
+		memory_snapshot const half = pool->snapshot(th);
+		TEST_CHECK(consistent(half, num_pieces));
+		TEST_CHECK(bits(half.file_pending) == std::vector<int>{3});
+		TEST_EQUAL(half.file_ready.count(), 0);
+		TEST_EQUAL(half.held_complete + half.held_partial, 0);
+
+		TEST_CHECK(write_blocks(*ses, th, content, p, 2, 4));
+		TEST_CHECK(wait_for([&] { return first->answered == 2; }));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, p); }));
+		TEST_CHECK(!th.have_piece(p));
+		memory_snapshot const unchecked = pool->snapshot(th);
+		TEST_CHECK(consistent(unchecked, num_pieces));
+		TEST_CHECK(bits(unchecked.file_pending) == std::vector<int>{3});
+		TEST_EQUAL(unchecked.file_ready.count(), 0);
+
+		piece_index_t const q{2};
+		TEST_CHECK(add_pieces(*ses, th, content, {q}));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, q); }));
+		memory_snapshot const checked = pool->snapshot(th);
+		TEST_CHECK(consistent(checked, num_pieces));
+		TEST_CHECK(bits(checked.file_ready) == std::vector<int>{2});
+		TEST_CHECK(bits(checked.file_pending) == std::vector<int>{3});
+		TEST_EQUAL(checked.ram_complete.count() + checked.transfer.count(), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a piece "in file" that the torrent does not have and that has no entry
+// (as after a hash check of the file that failed) is file_pending, never
+// file_ready
+TORRENT_TEST(snapshot_in_file_without_piece)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_in_file_only");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{5};
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		on_network(*ses, [&t, p](aux::session_impl& s)
+			{ aux::memory_set_in_file_for_test(s.disk_thread(), t->storage(), p, true); });
+		memory_snapshot const s = pool->snapshot(th);
+		TEST_CHECK(consistent(s, num_pieces));
+		TEST_CHECK(bits(s.file_pending) == std::vector<int>{5});
+		TEST_EQUAL(s.file_ready.count(), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// after a restart with filtered resume data, the pieces the pool had in
+// the file are file_ready with no entry in the new pool, and nothing else
+// is in a set
+TORRENT_TEST(snapshot_after_restart)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_restart");
+	add_torrent_params rd;
+	{
+		auto const pool = make_pool(memory_policy::memory);
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}, piece_index_t{1}, piece_index_t{2}}));
+		piece_index_t const set[] = {piece_index_t{1}};
+		pool->persist(th, set);
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		TEST_CHECK(in_file(*ses, th, piece_index_t{1}));
+		rd = save_resume(*ses, th);
+		pool->filter_resume(th, rd);
+		rd.ti = std::make_shared<torrent_info>(*th.torrent_file());
+	}
+	TEST_EQUAL(rd.have_pieces.count(), 1);
+
+	auto const pool2 = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool2);
+		rd.save_path = path;
+		rd.flags &= ~torrent_flags::auto_managed;
+		rd.flags &= ~torrent_flags::paused;
+		torrent_handle const th = ses->add_torrent(rd);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		memory_snapshot const s = pool2->snapshot(th);
+		TEST_CHECK(consistent(s, num_pieces));
+		TEST_CHECK(bits(s.file_ready) == std::vector<int>{1});
+		TEST_EQUAL(s.ram_complete.count() + s.ram_partial.count() + s.transfer.count()
+			+ s.file_pending.count(), 0);
+		TEST_EQUAL(s.held_complete + s.held_partial, 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a move to the file that fails (the file is a directory) leaves the piece
+// in memory: ram_complete, in no file set
+TORRENT_TEST(snapshot_failed_transfer)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_failed_transfer");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		piece_index_t const p{0};
+		TEST_CHECK(add_pieces(*ses, th, content, {p}));
+		error_code ec;
+		lt::create_directories(combine_path(path, combine_path("unregistered", "a")), ec);
+		TEST_CHECK(!ec);
+
+		piece_index_t const set[] = {p};
+		pool->persist(th, set);
+		TEST_CHECK(wait_for([&] { return pool->persist_failures(th) == 1; }));
+		TEST_CHECK(wait_for([&] { return pool->pending_persist_bytes(th) == 0; }));
+		memory_snapshot const s = pool->snapshot(th);
+		TEST_CHECK(consistent(s, num_pieces));
+		TEST_CHECK(bits(s.ram_complete) == std::vector<int>{0});
+		TEST_EQUAL(s.transfer.count() + s.file_ready.count() + s.file_pending.count(), 0);
+		TEST_EQUAL(s.held_complete, piece_size);
+		TEST_CHECK(!in_file(*ses, th, p));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// a handle without a storage in the pool: removed (the pool keeps a record
+// of it with the same info-hash), of a session on another pool, or no
+// torrent at all. Nothing is found by info-hash: the sets are empty
+TORRENT_TEST(snapshot_not_managed)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_not_managed");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		auto const other_pool = make_pool(memory_policy::memory);
+		auto other = make_session(other_pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		torrent_handle const foreign = add(*other, make_torrent(content), path + "_other");
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(wait_state(foreign, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}}));
+		piece_index_t const set[] = {piece_index_t{1}};
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{1}}));
+		pool->persist(th, set);
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, piece_index_t{1}); }));
+
+		memory_snapshot const f = pool->snapshot(foreign);
+		TEST_EQUAL(f.status, memory_storage_pool::not_managed);
+		TEST_CHECK(is_empty(f));
+
+		ses->remove_torrent(th);
+		TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+		TEST_EQUAL(access::residues(*pool), 1);
+		// not_managed while the torrent object lives, invalid_handle once
+		// it is released
+		memory_snapshot const r = pool->snapshot(th);
+		TEST_CHECK(r.status == memory_storage_pool::not_managed
+			|| r.status == memory_storage_pool::invalid_handle);
+		TEST_CHECK(is_empty(r));
+
+		memory_snapshot const n = pool->snapshot(torrent_handle());
+		TEST_EQUAL(n.status, memory_storage_pool::invalid_handle);
+		TEST_CHECK(is_empty(n));
+	}
+	error_code ec;
+	remove_all(path, ec);
+	remove_all(path + "_other", ec);
+}
+
+// the set of pieces changes while the held bytes stay the same: one piece
+// forgotten, another one of the same size written. The snapshot names the
+// new set
+TORRENT_TEST(snapshot_same_bytes_other_pieces)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_same_bytes");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}, piece_index_t{2}}));
+		memory_snapshot const a = pool->snapshot(th);
+		TEST_CHECK(consistent(a, num_pieces));
+		TEST_CHECK(bits(a.ram_complete) == (std::vector<int>{0, 2}));
+
+		TEST_EQUAL(pool->forget_piece(th, piece_index_t{0}).code, 0);
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{1}}));
+		memory_snapshot const b = pool->snapshot(th);
+		TEST_CHECK(consistent(b, num_pieces));
+		TEST_EQUAL(b.held_complete, a.held_complete);
+		TEST_EQUAL(b.pool_held, a.pool_held);
+		TEST_CHECK(bits(b.ram_complete) == (std::vector<int>{1, 2}));
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+namespace {
+
+// what a snapshot must not change, read through the other calls
+struct pool_state
+{
+	std::vector<int> complete;
+	std::vector<int> partial;
+	std::vector<bool> in_file;
+	std::vector<bool> have;
+	std::vector<std::int64_t> numbers;
+
+	pool_state(lt::session& ses, memory_storage_pool const& pool, torrent_handle const& th)
+	{
+		memory_pieces const m = pool.in_memory(th);
+		complete = bits(m.complete);
+		partial = bits(m.partial);
+		for (int i = 0; i < num_pieces; ++i)
+		{
+			in_file.push_back(::in_file(ses, th, piece_index_t{i}));
+			have.push_back(th.have_piece(piece_index_t{i}));
+		}
+		memory_held const h = pool.held_bytes(th);
+		numbers = {h.complete, h.partial, pool.held_bytes(), pool.reserved_bytes(), pool.retired_bytes()
+			, pool.spilled_pieces(), pool.declined_pieces(), pool.hash_missing_blocks()
+			, pool.pending_persist_bytes(th), pool.persist_failures(th), access::blocks_in_use(pool)
+			, aux::memory_hasher_background_blocks_for_test()};
+	}
+
+	bool operator==(pool_state const& o) const
+	{
+		return complete == o.complete && partial == o.partial && in_file == o.in_file
+			&& have == o.have && numbers == o.numbers;
+	}
+};
+
+} // anonymous namespace
+
+// a snapshot changes nothing: pieces in memory, partial, in the file and
+// in the file unchecked, before and after many snapshots
+TORRENT_TEST(snapshot_reads_only)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_reads_only");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{0}, piece_index_t{1}}));
+		TEST_CHECK(write_blocks(*ses, th, content, piece_index_t{2}, 0, 1));
+		// pieces 4 and 5 start in the file
+		piece_index_t const to_file[] = {piece_index_t{4}, piece_index_t{5}};
+		pool->persist(th, to_file);
+		TEST_CHECK(add_pieces(*ses, th, content, {piece_index_t{4}}));
+		TEST_CHECK(write_blocks(*ses, th, content, piece_index_t{5}, 0, 4));
+		TEST_CHECK(wait_for([&] { return in_file(*ses, th, piece_index_t{4}) && in_file(*ses, th, piece_index_t{5}); }));
+
+		pool_state const before(*ses, *pool, th);
+		memory_snapshot first;
+		for (int i = 0; i < 50; ++i)
+		{
+			memory_snapshot const s = pool->snapshot(th);
+			TEST_CHECK(consistent(s, num_pieces));
+			if (i == 0) first = s;
+		}
+		pool_state const after(*ses, *pool, th);
+		TEST_CHECK(before == after);
+		TEST_CHECK(bits(first.ram_complete) == (std::vector<int>{0, 1}));
+		TEST_CHECK(bits(first.ram_partial) == std::vector<int>{2});
+		TEST_CHECK(bits(first.file_ready) == std::vector<int>{4});
+		TEST_CHECK(bits(first.file_pending) == std::vector<int>{5});
+		TEST_EQUAL(first.held_complete, 2 * piece_size);
+		TEST_EQUAL(first.held_partial, default_block_size);
+		TEST_EQUAL(first.pool_held, 2 * piece_size + default_block_size);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+
+// snapshots taken while every piece moves from memory to the file: each
+// one sees every piece exactly once, in memory, in transfer or ready in
+// the file, and held and pending bytes that match those sets
+TORRENT_TEST(snapshot_during_transfers)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("snapshot_during_transfers");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		torrent_handle const th = add(*ses, make_torrent(content), path);
+		TEST_CHECK(wait_state(th, torrent_status::downloading));
+		std::vector<piece_index_t> all;
+		std::vector<int> all_ints;
+		for (int i = 0; i < num_pieces; ++i)
+		{
+			all.emplace_back(i);
+			all_ints.push_back(i);
+		}
+		TEST_CHECK(add_pieces(*ses, th, content, all));
+#if defined TORRENT_LINUX
+		slow_writes = true;
+#endif
+		pool->set_persist(th, 1, all);
+		int snapshots = 0;
+		int with_transfer = 0;
+		bool bad = false;
+		auto const end = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		for (;;)
+		{
+			memory_snapshot const s = pool->snapshot(th);
+			++snapshots;
+			bool const ok = consistent(s, num_pieces)
+				&& s.ram_complete.count() + s.transfer.count() + s.file_ready.count() == num_pieces
+				&& s.ram_partial.count() == 0 && s.file_pending.count() == 0
+				&& s.held_complete == std::int64_t(piece_size) * (s.ram_complete.count() + s.transfer.count())
+				&& s.held_partial == 0
+				&& s.pending_persist == std::int64_t(piece_size) * s.transfer.count();
+			if (!ok && !bad)
+			{
+				bad = true;
+				std::printf("snapshot %d: ram %d transfer %d ready %d pending %d held %lld pending bytes %lld\n"
+					, snapshots, s.ram_complete.count(), s.transfer.count(), s.file_ready.count()
+					, s.file_pending.count(), static_cast<long long>(s.held_complete)
+					, static_cast<long long>(s.pending_persist));
+			}
+			if (s.transfer.count() > 0) ++with_transfer;
+			if (bits(s.file_ready) == all_ints) break;
+			if (std::chrono::steady_clock::now() > end) break;
+		}
+#if defined TORRENT_LINUX
+		slow_writes = false;
+		TEST_CHECK(with_transfer > 0);
+#endif
+		std::printf("snapshots %d, with a piece in transfer %d\n", snapshots, with_transfer);
+		TEST_CHECK(!bad);
+		TEST_CHECK(bits(pool->snapshot(th).file_ready) == all_ints);
+		TEST_EQUAL(pool->held_bytes(), 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}

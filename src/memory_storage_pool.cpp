@@ -593,6 +593,106 @@ namespace {
 		return {s->held_complete(), s->held_partial()};
 	}
 
+namespace {
+
+	// the snapshot of storage s, whose torrent has the pieces in `have`.
+	// The caller holds the pool's mutex
+	void fill_snapshot(memory_snapshot& ret, aux::memory_pool_impl const& impl
+		, aux::memory_storage const& s, typed_bitfield<piece_index_t> const& have)
+	{
+		int const n = s.files().num_pieces();
+		ret.ram_complete.resize(n, false);
+		ret.ram_partial.resize(n, false);
+		ret.transfer.resize(n, false);
+		ret.file_ready.resize(n, false);
+		ret.file_pending.resize(n, false);
+		for (auto const p : s.files().piece_range())
+		{
+			auto const e = s.current(p);
+			piece_place const place = e ? e->place : piece_place::none;
+			if (place == piece_place::memory)
+			{
+				if (e->num_blocks == 0) continue;
+				if (e->missing_blocks == 0) ret.ram_complete.set_bit(p);
+				else ret.ram_partial.set_bit(p);
+				continue;
+			}
+			if (place == piece_place::transfer)
+			{
+				ret.transfer.set_bit(p);
+				ret.pending_persist += std::int64_t(e->num_blocks) * default_block_size;
+				continue;
+			}
+			bool const in_file = s.in_file(p);
+			bool const has = p < have.end_index() && have.get_bit(p);
+			if (in_file && has) ret.file_ready.set_bit(p);
+			else if (in_file || place == piece_place::file) ret.file_pending.set_bit(p);
+		}
+		ret.held_complete = s.held_complete();
+		ret.held_partial = s.held_partial();
+		ret.reserved = s.reserved_bytes();
+		ret.pool_held = impl.held_bytes();
+		ret.pool_reserved = impl.reserved_bytes();
+		ret.pool_retired = impl.retired_bytes();
+	}
+}
+
+	memory_snapshot memory_storage_pool::snapshot(torrent_handle const& th) const
+	{
+		memory_snapshot ret;
+		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		if (!t)
+		{
+			ret.status = invalid_handle;
+			return ret;
+		}
+		ret.status = not_managed;
+		{
+			std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
+			if (!m_impl->storage_of(t)) return ret;
+		}
+
+		auto& ses = static_cast<aux::session_impl&>(t->session());
+		std::shared_ptr<aux::memory_pool_impl> const impl = m_impl;
+		bool done = false;
+		std::exception_ptr ex;
+		dispatch(ses.get_context(), [&ret, &done, &ex, &ses, t, impl]
+		{
+#ifndef BOOST_NO_EXCEPTIONS
+			try {
+#endif
+				// read before the pool's mutex: libtorrent is never called
+				// with it held
+				typed_bitfield<piece_index_t> have;
+				if (t->valid_metadata())
+				{
+					int const n = t->torrent_file().num_pieces();
+					have.resize(n, false);
+					for (piece_index_t p{0}; p < piece_index_t{n}; ++p)
+						if (t->have_piece(p)) have.set_bit(p);
+				}
+				std::lock_guard<aux::memory_pool_mutex> l(impl->mutex);
+				// the storage cannot be added or removed in between: that
+				// runs on this thread too
+				if (std::shared_ptr<aux::memory_storage> const s = impl->storage_of(t))
+				{
+					ret.status = 0;
+					fill_snapshot(ret, *impl, *s, have);
+				}
+#ifndef BOOST_NO_EXCEPTIONS
+			} catch (...) {
+				ex = std::current_exception();
+			}
+#endif
+			std::unique_lock<std::mutex> l(ses.mut);
+			done = true;
+			ses.cond.notify_all();
+		});
+		aux::torrent_wait(done, ses);
+		if (ex) std::rethrow_exception(ex);
+		return ret;
+	}
+
 	std::int64_t memory_storage_pool::held_bytes() const
 	{
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
