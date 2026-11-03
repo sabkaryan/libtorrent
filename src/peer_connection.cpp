@@ -4348,7 +4348,8 @@ namespace {
 			m_peer_info->prefer_utp = true;
 			// a peer entry has two fast reconnects for its lifetime, and an
 			// encrypted outgoing handshake spends them too; after that the uTP
-			// attempt waits the usual min_reconnect_time
+			// attempt waits the usual reconnect backoff,
+			// min_reconnect_time * (failcount + 1)
 			fast_reconnect(true);
 		}
 
