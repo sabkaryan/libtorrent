@@ -156,6 +156,7 @@ namespace libtorrent::aux {
 		, banned(false)
 		, supports_utp(true) // assume peers support utp
 		, confirmed_supports_utp(false)
+		, prefer_utp(false)
 		, supports_holepunch(false)
 		, web_seed(false)
 		, protocol_v2(false)

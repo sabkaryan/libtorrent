@@ -1670,7 +1670,7 @@ namespace {
 				p->supports_utp = true;
 				// #error make sure we make this a connection candidate
 				// in case it has too many failures for instance
-				t->connect_to_peer(p, true);
+				t->connect_to_peer(p, true, true);
 				// mark this connection to be in holepunch mode
 				// so that it will retry faster and stick to uTP while it's
 				// retrying

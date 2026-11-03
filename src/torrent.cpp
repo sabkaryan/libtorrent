@@ -8122,7 +8122,8 @@ namespace {
 	};
 #endif
 
-	bool torrent::connect_to_peer(torrent_peer* peerinfo, bool const ignore_limit)
+	bool torrent::connect_to_peer(torrent_peer* peerinfo, bool const ignore_limit
+		, bool const force_utp)
 	{
 		TORRENT_ASSERT(is_single_thread());
 		INVARIANT_CHECK;
@@ -8191,10 +8192,16 @@ namespace {
 		else
 #endif
 		{
+			bool const utp_capable = peerinfo->supports_utp
+				|| peerinfo->confirmed_supports_utp;
+			// with outgoing_tcp_first, uTP is the fallback after a failed TCP
+			// attempt (prefer_utp) or what a hole punch asks for
+			bool const utp_next = settings().get_bool(settings_pack::outgoing_tcp_first)
+				? force_utp || (peerinfo->prefer_utp && utp_capable)
+				: utp_capable;
 			if (settings().get_bool(settings_pack::enable_outgoing_utp)
 				&& (!settings().get_bool(settings_pack::enable_outgoing_tcp)
-					|| peerinfo->supports_utp
-					|| peerinfo->confirmed_supports_utp))
+					|| utp_next))
 			{
 				sm = m_ses.utp_socket_manager();
 			}

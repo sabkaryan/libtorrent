@@ -193,6 +193,10 @@ namespace libtorrent::aux {
 		std::uint32_t supports_utp:1;
 		// we have been connected via uTP at least once
 		std::uint32_t confirmed_supports_utp:1;
+		// with outgoing_tcp_first: a TCP connection attempt to this endpoint
+		// failed, so the next outgoing attempt uses uTP. Cleared when that uTP
+		// attempt fails and when the port changes.
+		std::uint32_t prefer_utp:1;
 		std::uint32_t supports_holepunch:1;
 		// this is set to one for web seeds. Web seeds
 		// are not stored in the policy m_peers list,

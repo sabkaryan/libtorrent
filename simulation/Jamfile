@@ -72,3 +72,4 @@ run test_allow_multiple_connections_per_pid.cpp ;
 
 run test_time_critical.cpp ;
 run test_memory_only.cpp ;
+run test_outgoing_tcp_first.cpp ;

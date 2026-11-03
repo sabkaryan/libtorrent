@@ -1084,6 +1084,13 @@ namespace aux {
 			// naturally evicted.
 			apply_filter_to_dht,
 
+			// when both enable_outgoing_tcp and enable_outgoing_utp are set,
+			// outgoing connections to a peer start with TCP and use uTP only
+			// once a TCP connection attempt to that peer has failed. When
+			// false (the default), uTP is tried first and TCP after a failed
+			// uTP attempt. A connection a hole punch asks for stays uTP.
+			outgoing_tcp_first,
+
 			max_bool_setting_internal
 		};
 

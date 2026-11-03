@@ -4289,6 +4289,21 @@ namespace {
 			m_connecting = false;
 		}
 
+		bool const tcp_first = m_settings.get_bool(settings_pack::outgoing_tcp_first)
+			&& m_settings.get_bool(settings_pack::enable_outgoing_tcp)
+			&& m_settings.get_bool(settings_pack::enable_outgoing_utp);
+
+		// with outgoing_tcp_first a uTP attempt follows a failed TCP attempt to
+		// the same endpoint, so there is nothing to retry right away. The next
+		// attempt starts with TCP again, after the usual backoff.
+		if (tcp_first && is_utp(m_socket) && m_peer_info && !m_holepunch_mode)
+		{
+			m_peer_info->supports_utp = false;
+			m_peer_info->prefer_utp = false;
+			disconnect(e, operation_t::connect, failure);
+			return;
+		}
+
 		// a connection attempt using uTP just failed
 		// mark this peer as not supporting uTP
 		// we'll never try it again (unless we're trying holepunch)
@@ -4323,6 +4338,17 @@ namespace {
 			return;
 		}
 
+		// with outgoing_tcp_first a failed TCP attempt makes the next attempt to
+		// this endpoint uTP. It does not count as a failure: the peer may still
+		// be reachable over uTP. The scheduler makes that attempt, within its limits.
+		bool const utp_fallback = tcp_first && !is_utp(m_socket) && m_peer_info
+			&& (m_peer_info->supports_utp || m_peer_info->confirmed_supports_utp);
+		if (utp_fallback)
+		{
+			m_peer_info->prefer_utp = true;
+			fast_reconnect(true);
+		}
+
 		if (m_holepunch_mode)
 			fast_reconnect(true);
 
@@ -4340,7 +4366,7 @@ namespace {
 		}
 #endif
 
-		disconnect(e, operation_t::connect, failure);
+		disconnect(e, operation_t::connect, utp_fallback ? normal : failure);
 	}
 
 	// the error argument defaults to 0, which means deliberate disconnect

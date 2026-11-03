@@ -695,7 +695,9 @@ namespace libtorrent::aux {
 #endif
 
 		void connect_to_url_seed(std::list<web_seed_t>::iterator);
-		bool connect_to_peer(torrent_peer*, bool ignore_limit = false);
+		// force_utp: the connection is for a hole punch and must be uTP,
+		// whatever outgoing_tcp_first would pick
+		bool connect_to_peer(torrent_peer*, bool ignore_limit = false, bool force_utp = false);
 		bool create_peer_connection(torrent_peer* peerinfo, aux::socket_type socket, tcp::endpoint endpoint);
 
 		int priority() const;

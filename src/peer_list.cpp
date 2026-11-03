@@ -945,6 +945,8 @@ namespace libtorrent::aux {
 #endif
 
 		bool const was_conn_cand = is_connect_candidate(*p);
+		// a failed TCP attempt says nothing about another port
+		if (p->port != port) p->prefer_utp = false;
 		p->port = std::uint16_t(port);
 		p->source |= static_cast<std::uint8_t>(src);
 		p->connectable = true;
@@ -1082,6 +1084,7 @@ namespace libtorrent::aux {
 		p->connectable = true;
 
 		TORRENT_ASSERT(p->address() == remote.address());
+		if (p->port != remote.port()) p->prefer_utp = false;
 		p->port = remote.port();
 		p->source |= static_cast<std::uint8_t>(src);
 
@@ -1178,6 +1181,7 @@ namespace libtorrent::aux {
 				return nullptr; // the peer is already connected
 
 			// update and return it
+			if (p->port != remote.port()) p->prefer_utp = false;
 			p->port = remote.port();
 			return p;
 		}
