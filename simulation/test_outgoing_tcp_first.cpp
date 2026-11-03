@@ -77,6 +77,7 @@ struct outcome
 	std::vector<lt::milliseconds> end_at;
 	bool established_utp = false;
 	bool established_tcp = false;
+	lt::milliseconds block_at{-1};
 };
 
 bool is_utp(lt::socket_type_t const t)
@@ -98,6 +99,11 @@ struct run_opts
 	int new_port = 0;
 	// the firewall starts dropping UDP when the reconnect starts
 	bool drop_udp_on_reconnect = false;
+	// the seed drops this many established TCP connections, one at a time; at
+	// the last drop the firewall starts dropping TCP connection attempts
+	int tcp_connections_before_block = 0;
+	// both sessions use the default encryption policy (pe_enabled)
+	bool encrypt = false;
 };
 
 // a downloader at 50.0.0.1 is told about a seed at 50.0.0.2:6881 and nothing
@@ -126,6 +132,11 @@ outcome run(run_opts const o)
 	ps.settings.set_bool(settings_pack::enable_outgoing_tcp, false);
 	ps.settings.set_bool(settings_pack::enable_outgoing_utp, false);
 	ps.settings.set_str(settings_pack::peer_fingerprint, "-SE0001-");
+	if (o.encrypt)
+	{
+		ps.settings.set_int(settings_pack::in_enc_policy, settings_pack::pe_enabled);
+		ps.settings.set_int(settings_pack::out_enc_policy, settings_pack::pe_enabled);
+	}
 	ps.disk_io_constructor = test_disk().set_seed(true);
 	auto seed = std::make_shared<lt::session>(ps, *ios_s);
 
@@ -143,6 +154,11 @@ outcome run(run_opts const o)
 	// a finished torrent stops connecting to the seed: keep it unfinished for
 	// the whole run (9 pieces of 16 kiB take minutes at this rate)
 	pd.settings.set_int(settings_pack::download_rate_limit, 500);
+	if (o.encrypt)
+	{
+		pd.settings.set_int(settings_pack::in_enc_policy, settings_pack::pe_enabled);
+		pd.settings.set_int(settings_pack::out_enc_policy, settings_pack::pe_enabled);
+	}
 	pd.disk_io_constructor = test_disk();
 	auto dl = std::make_shared<lt::session>(pd, *ios_d);
 
@@ -156,6 +172,8 @@ outcome run(run_opts const o)
 	outcome r;
 	bool reconnect_done = false;
 	bool port_sent = false;
+	int tcp_drops = 0;
+	bool tcp_dropping = false; // a dropped TCP connection has not ended yet
 	bool stopped = false;
 	lt::torrent_handle seed_handle;
 	lt::torrent_handle dl_handle;
@@ -190,6 +208,7 @@ outcome run(run_opts const o)
 			r.ends.push_back(std::string(is_utp(pd->socket_type) ? "utp " : "tcp ")
 				+ lt::operation_name(pd->op));
 			r.end_at.push_back(lt::duration_cast<lt::milliseconds>(lt::clock_type::now() - start));
+			if (!is_utp(pd->socket_type)) tcp_dropping = false;
 		}
 	}, 0);
 
@@ -208,6 +227,24 @@ outcome run(run_opts const o)
 				if (p.flags & (lt::peer_info::connecting | lt::peer_info::handshake)) continue;
 				if (p.flags & lt::peer_info::utp_socket) r.established_utp = true;
 				else r.established_tcp = true;
+			}
+			bool tcp_up = false;
+			for (auto const& p : peers)
+				if (!(p.flags & (lt::peer_info::connecting | lt::peer_info::handshake))
+					&& !(p.flags & lt::peer_info::utp_socket)) tcp_up = true;
+			if (tcp_drops < o.tcp_connections_before_block && tcp_up && !tcp_dropping)
+			{
+				// one established TCP connection, counted once: the next drop
+				// waits for its peer_disconnected_alert
+				++tcp_drops;
+				tcp_dropping = true;
+				if (tcp_drops == o.tcp_connections_before_block)
+				{
+					wall->drop_tcp = true;
+					r.block_at = lt::duration_cast<lt::milliseconds>(lt::clock_type::now() - start);
+				}
+				seed_handle.pause();
+				seed_handle.resume();
 			}
 			if (o.reconnect && r.established_utp && !reconnect_done && (!peers.empty() || port_sent))
 			{
@@ -601,4 +638,54 @@ TORRENT_TEST(tcp_first_fallback_attempts_control_high_connection_speed)
 {
 	auto const v = run_starts_per_second(50);
 	TEST_CHECK(max_starts_in_a_second(v) > 2);
+}
+
+namespace {
+
+// from the TCP failure after the block to the uTP attempt that follows it
+lt::milliseconds fallback_gap(outcome const& r)
+{
+	lt::milliseconds tcp_failed{-1};
+	for (std::size_t i = 0; i < r.ends.size(); ++i)
+		if (r.end_at[i] > r.block_at && r.ends[i] == "tcp connect") { tcp_failed = r.end_at[i]; break; }
+	if (tcp_failed.count() < 0) return lt::milliseconds(-1);
+	for (auto const& a : r.attempts)
+		if (a.at >= tcp_failed && a.utp) return a.at - tcp_failed;
+	return lt::milliseconds(-1);
+}
+
+} // anonymous namespace
+
+// with the default encryption policy every encrypted outgoing handshake spends
+// one of the peer entry's two fast reconnects. After one TCP connection the
+// fallback still has one left: the uTP attempt follows the TCP failure at once
+TORRENT_TEST(tcp_first_fallback_is_fast_after_one_encrypted_connection)
+{
+	run_opts o;
+	o.encrypt = true;
+	o.tcp_connections_before_block = 1;
+	o.duration = 120;
+	auto const r = run(o);
+	auto const gap = fallback_gap(r);
+	std::printf("attempts: %s blocked at %d ms, fallback gap %d ms\n"
+		, transports(r).c_str(), int(r.block_at.count()), int(gap.count()));
+	TEST_CHECK(gap.count() >= 0);
+	TEST_CHECK(gap < lt::seconds(2));
+}
+
+// after two encrypted TCP connections both fast reconnects are spent: the uTP
+// attempt waits min_reconnect_time * (failcount + 1) = 10 s, and failcount did
+// not grow from the TCP failure (that would make it 20 s)
+TORRENT_TEST(tcp_first_fallback_waits_once_fast_reconnects_are_spent)
+{
+	run_opts o;
+	o.encrypt = true;
+	o.tcp_connections_before_block = 2;
+	o.duration = 150;
+	auto const r = run(o);
+	auto const gap = fallback_gap(r);
+	std::printf("attempts: %s blocked at %d ms, fallback gap %d ms\n"
+		, transports(r).c_str(), int(r.block_at.count()), int(gap.count()));
+	TEST_CHECK(gap >= lt::seconds(10));
+	TEST_CHECK(gap < lt::seconds(12));
 }

@@ -4293,9 +4293,9 @@ namespace {
 			&& m_settings.get_bool(settings_pack::enable_outgoing_tcp)
 			&& m_settings.get_bool(settings_pack::enable_outgoing_utp);
 
-		// with outgoing_tcp_first a uTP attempt follows a failed TCP attempt to
-		// the same endpoint, so there is nothing to retry right away. The next
-		// attempt starts with TCP again, after the usual backoff.
+		// in this mode a uTP attempt is either the fallback after a failed TCP
+		// attempt or the first attempt to a peer whose uTP worked before; either
+		// way the next attempt starts with TCP, after the usual backoff
 		if (tcp_first && is_utp(m_socket) && m_peer_info && !m_holepunch_mode)
 		{
 			m_peer_info->supports_utp = false;
@@ -4346,6 +4346,9 @@ namespace {
 		if (utp_fallback)
 		{
 			m_peer_info->prefer_utp = true;
+			// a peer entry has two fast reconnects for its lifetime, and an
+			// encrypted outgoing handshake spends them too; after that the uTP
+			// attempt waits the usual min_reconnect_time
 			fast_reconnect(true);
 		}
 

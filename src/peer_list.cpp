@@ -945,8 +945,9 @@ namespace libtorrent::aux {
 #endif
 
 		bool const was_conn_cand = is_connect_candidate(*p);
-		// a failed TCP attempt says nothing about another port
-		if (p->port != port) p->prefer_utp = false;
+		// the port differs (equal ports returned above): a failed TCP attempt
+		// says nothing about another port
+		p->prefer_utp = false;
 		p->port = std::uint16_t(port);
 		p->source |= static_cast<std::uint8_t>(src);
 		p->connectable = true;
