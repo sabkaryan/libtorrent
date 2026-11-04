@@ -4341,7 +4341,10 @@ namespace {
 		// with outgoing_tcp_first a failed TCP attempt makes the next attempt to
 		// this endpoint uTP. It does not count as a failure: the peer may still
 		// be reachable over uTP. The scheduler makes that attempt, within its limits.
+		// Only while the entry still names this endpoint: a source may have moved
+		// it to another port during the attempt, and that port is untried.
 		bool const utp_fallback = tcp_first && !is_utp(m_socket) && m_peer_info
+			&& m_peer_info->ip() == remote()
 			&& (m_peer_info->supports_utp || m_peer_info->confirmed_supports_utp);
 		if (utp_fallback)
 		{

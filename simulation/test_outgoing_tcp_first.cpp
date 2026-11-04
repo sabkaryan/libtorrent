@@ -23,6 +23,7 @@ see LICENSE file.
 #include "libtorrent/socket_type.hpp"
 #include "libtorrent/aux_/deadline_timer.hpp"
 
+#include <algorithm>
 #include <functional>
 
 #include <map>
@@ -104,6 +105,9 @@ struct run_opts
 	int tcp_connections_before_block = 0;
 	// both sessions use the default encryption policy (pe_enabled)
 	bool encrypt = false;
+	// while the first outgoing attempt is still connecting, the downloader is
+	// told the seed's port is this one (0: never)
+	int port_moves_while_connecting = 0;
 };
 
 // a downloader at 50.0.0.1 is told about a seed at 50.0.0.2:6881 and nothing
@@ -245,6 +249,13 @@ outcome run(run_opts const o)
 				}
 				seed_handle.pause();
 				seed_handle.resume();
+			}
+			if (o.port_moves_while_connecting != 0 && !port_sent && !r.attempts.empty() && r.ends.empty())
+			{
+				// one entry per IP: the entry takes the new port while its
+				// connection to the old one is still being made
+				port_sent = true;
+				dl_handle.connect_peer(lt::tcp::endpoint(seed_ip, std::uint16_t(o.port_moves_while_connecting)));
 			}
 			if (o.reconnect && r.established_utp && !reconnect_done && (!peers.empty() || port_sent))
 			{
@@ -467,6 +478,28 @@ TORRENT_TEST(tcp_first_new_port_starts_with_tcp)
 	if (after.empty()) return;
 	TEST_EQUAL(after.front().port, 6882);
 	TEST_CHECK(!after.front().utp);
+}
+
+// the entry moves to a new port while its TCP attempt to the old port is still
+// connecting: that attempt's failure says nothing about the new port, so the
+// first attempt there is TCP, not the uTP fallback
+TORRENT_TEST(tcp_first_port_moved_during_tcp_attempt_starts_with_tcp)
+{
+	run_opts o;
+	o.drop_tcp = true;
+	o.port_moves_while_connecting = 6882;
+	o.duration = 120;
+	auto const r = run(o);
+	std::printf("attempts: %s\n", transports(r).c_str());
+	for (auto const& a : r.attempts)
+		std::printf("  %d ms %s :%d\n", int(a.at.count()), a.utp ? "utp" : "tcp", a.port);
+	TEST_CHECK(!r.attempts.empty() && r.attempts.front().port == 6881 && !r.attempts.front().utp);
+	TEST_CHECK(!r.ends.empty() && r.ends.front() == "tcp connect");
+	auto const moved = std::find_if(r.attempts.begin(), r.attempts.end()
+		, [](attempt const& a) { return a.port == 6882; });
+	TEST_CHECK(moved != r.attempts.end());
+	if (moved == r.attempts.end()) return;
+	TEST_CHECK(!moved->utp);
 }
 
 namespace {
