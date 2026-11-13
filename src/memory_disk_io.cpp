@@ -260,7 +260,7 @@ namespace {
 				m_pool->declined_of_removed += s.declined_pieces();
 				if (s.pinned())
 				{
-					m_pool->retired.push_back({rec->storage, rec->owner, &m_ios});
+					m_pool->retired.push_back({rec->storage, rec->owner});
 					++m_pool->storages_retired_pinned;
 				}
 				rec->storage.reset();

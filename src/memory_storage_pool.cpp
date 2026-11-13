@@ -209,13 +209,13 @@ namespace {
 		pending.erase(it);
 	}
 
-	std::pair<std::shared_ptr<void>, io_context*> memory_pool_impl::release_retired(memory_storage const& s)
+	std::shared_ptr<void> memory_pool_impl::release_retired(memory_storage const& s)
 	{
 		TORRENT_ASSERT(mutex.owned_by_this_thread());
 		auto const it = std::find_if(retired.begin(), retired.end()
 			, [&s](retired_storage const& r) { return r.storage.get() == &s; });
 		if (it == retired.end()) return {};
-		std::pair<std::shared_ptr<void>, io_context*> ret(std::move(it->owner), it->ios);
+		std::shared_ptr<void> ret = std::move(it->owner);
 		retired.erase(it);
 		return ret;
 	}

@@ -107,15 +107,15 @@ namespace libtorrent::aux {
 	// * the default disk backend is never called with the mutex held:
 	//   remove_torrent() releases the default backend's storage outside it
 	// * handlers of the caller are never called with the mutex held, and
-	//   neither is a torrent object released (a retired storage keeps one
-	//   alive; memory_entry_ref drops it after the mutex, on the network
-	//   thread: see memory_entry_ref)
+	//   neither is the owner of a retired storage's file_storage released
+	//   (memory_entry_ref drops it after the mutex)
 	//
 	// Removed torrents. remove_torrent() retires every entry of the
 	// storage. If a job still pins one, the storage is kept in `retired`
-	// with the torrent object it was created for (it owns the file_storage
-	// the storage refers to) until the last pin drops, and is freed then,
-	// under the mutex. Its counters stay in the pool's
+	// with the owner of the file_storage it refers to (what the session
+	// passed to new_torrent(): its torrent_info) until the last pin
+	// drops, and is freed then, under the mutex. Its counters stay in the
+	// pool's
 	struct memory_pool_impl
 	{
 		explicit memory_pool_impl(int slab_bytes);
@@ -163,13 +163,6 @@ namespace libtorrent::aux {
 			// session passed to new_torrent(). Null for a storage created
 			// without one
 			std::shared_ptr<void> owner;
-			// the network thread's io_context of the session the torrent
-			// lived in: the owner is released there. It outlives
-			// every pin: pins are held only by that session's disk
-			// backend, its hasher threads and the default backend's
-			// threads (each holds a work guard on it), and by the
-			// completions they post to it
-			io_context* ios = nullptr;
 		};
 		std::vector<retired_storage> retired;
 		// storages removed while an entry of theirs was pinned, in all
@@ -238,10 +231,9 @@ namespace libtorrent::aux {
 		// holds mutex
 		void apply_pending(std::shared_ptr<void> const& torrent, memory_storage& s);
 		// the last pin of the removed storage s dropped: forgets its record
-		// and returns the torrent object it kept and the io_context of its
-		// network thread, where the torrent is to be released (after the
-		// mutex). The caller holds mutex
-		std::pair<std::shared_ptr<void>, io_context*> release_retired(memory_storage const& s);
+		// and returns the owner of its file_storage, to be released after
+		// the storage and the mutex. The caller holds mutex
+		std::shared_ptr<void> release_retired(memory_storage const& s);
 		// the record of the storage created for the torrent object, nullptr
 		// if it has none. The caller holds mutex
 		storage_ref const* ref_of(std::shared_ptr<void> const& torrent) const;
