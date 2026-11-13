@@ -380,8 +380,8 @@ namespace libtorrent {
 	// returns a disk_io_constructor_type for session_params that creates
 	// the in-memory disk backend on top of the default disk backend, with
 	// ``pool`` as its shared state. The backend reads the torrent object the
-	// session passes to new_torrent() (the session's own torrent); a direct
-	// user of disk_interface passes an empty one. ``pool`` must not be
+	// session names in storage_params::torrent (the session's own torrent); a
+	// direct user of disk_interface leaves it empty. ``pool`` must not be
 	// null: a null one throws std::invalid_argument
 	TORRENT_EXPORT disk_io_constructor_type memory_disk_io_constructor(std::shared_ptr<memory_storage_pool>);
 }

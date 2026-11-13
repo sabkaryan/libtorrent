@@ -20,6 +20,7 @@ see LICENSE file.
 #include "libtorrent/download_priority.hpp"
 #include "libtorrent/string_view.hpp"
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace libtorrent {
@@ -140,6 +141,13 @@ namespace libtorrent {
 		// hybrid torrent has both flags set.
 		bool v1;
 		bool v2;
+
+		// the torrent object the storage is for, the one
+		// torrent_handle::native_handle() refers to, so that a disk back end
+		// can tell which torrent a storage belongs to. Empty when the storage
+		// is not created by a session. The disk I/O must not keep the torrent
+		// alive: it is destructed on the network thread
+		std::weak_ptr<void> torrent;
 	};
 }
 

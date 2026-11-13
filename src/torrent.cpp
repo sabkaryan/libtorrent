@@ -1975,6 +1975,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			m_torrent_file->v1() && !m_disable_v1_hashes,
 			m_torrent_file->v2()
 		};
+		params.torrent = weak_from_this();
 
 		// latched here rather than in the constructor so it is read at the
 		// same time the backend reads it for the storage. Once it is part of

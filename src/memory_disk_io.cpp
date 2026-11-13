@@ -150,17 +150,19 @@ namespace {
 		// torrent, and the claims made by torrent_handle while the torrent
 		// had no storage (no metadata)
 		storage_holder new_torrent(storage_params const& params
-			, std::shared_ptr<void> const& torrent) override
+			, std::shared_ptr<void> const& owner) override
 		{
 			auto rec = std::make_shared<storage_record>();
-			rec->inner = m_inner->new_torrent(params, torrent);
+			rec->inner = m_inner->new_torrent(params, owner);
+			rec->owner = owner;
+			std::shared_ptr<void> const torrent = params.torrent.lock();
 			rec->own_jobs_of_piece.resize(params.files.num_pieces(), 0);
 			rec->observer = std::make_shared<transfer_observer>(*this, rec);
 			// every info-hash of the torrent: storage_params::info_hash is
 			// only the best one (the truncated v2 of a hybrid torrent), while
-			// a registration may name its v1. The torrent object is the
-			// session's aux::torrent (its only caller, on the network
-			// thread); tests that drive a disk_interface pass none
+			// a registration may name its v1. storage_params::torrent is the
+			// session's aux::torrent (set by its only caller, on the network
+			// thread); tests that drive a disk_interface leave it empty
 			info_hash_t const ih = torrent
 				? static_cast<aux::torrent const*>(torrent.get())->info_hash()
 				: info_hash_t{};
@@ -232,8 +234,6 @@ namespace {
 			// answered (finish_step()), not under their jobs
 			if (rec->steps == 0) rec->inner.reset();
 			else m_draining.push_back(rec);
-			// the torrent object, released after the mutex
-			std::shared_ptr<void> torrent;
 			{
 				// the storage frees its blocks into the pool's allocator: the
 				// last reference to it is dropped under the mutex. A hash job
@@ -246,7 +246,6 @@ namespace {
 				memory_storage& s = *rec->storage;
 				if (it != storages.end())
 				{
-					torrent = it->torrent.lock();
 					// the "in file" flags outlive the storage, for
 					// filter_resume()
 					m_pool->add_residue(it->info_hashes, s, m_backend);
@@ -261,7 +260,7 @@ namespace {
 				m_pool->declined_of_removed += s.declined_pieces();
 				if (s.pinned())
 				{
-					m_pool->retired.push_back({rec->storage, torrent, &m_ios});
+					m_pool->retired.push_back({rec->storage, rec->owner, &m_ios});
 					++m_pool->storages_retired_pinned;
 				}
 				rec->storage.reset();
@@ -705,6 +704,9 @@ namespace {
 		{
 			storage_holder inner;
 			std::shared_ptr<memory_storage> storage;
+			// the owner of the file_storage the storage refers to (what the
+			// session passed to new_torrent(), its torrent_info)
+			std::shared_ptr<void> owner;
 			fence_state fence;
 			// our own jobs of the storage (async_hash and async_hash2 of
 			// pieces in memory), from their issue until their handler ran, in

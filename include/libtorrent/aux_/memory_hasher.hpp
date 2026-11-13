@@ -79,8 +79,8 @@ namespace libtorrent::aux {
 		std::shared_ptr<memory_pool_impl> m_pool;
 		std::shared_ptr<memory_storage> m_storage;
 		std::shared_ptr<memory_piece_entry> m_entry;
-		// the torrent object of a removed storage whose last pin this was,
-		// and the io_context of its network thread. Released when this
+		// the owner of the file_storage of a removed storage whose last pin
+		// this was, and the io_context of its network thread. Released when this
 		// reference is destroyed, which is after the pool's mutex
 		std::shared_ptr<void> m_keep_alive;
 		// outlives every pin, as memory_pool_impl::retired_storage::ios

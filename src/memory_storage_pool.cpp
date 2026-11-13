@@ -215,7 +215,7 @@ namespace {
 		auto const it = std::find_if(retired.begin(), retired.end()
 			, [&s](retired_storage const& r) { return r.storage.get() == &s; });
 		if (it == retired.end()) return {};
-		std::pair<std::shared_ptr<void>, io_context*> ret(std::move(it->torrent), it->ios);
+		std::pair<std::shared_ptr<void>, io_context*> ret(std::move(it->owner), it->ios);
 		retired.erase(it);
 		return ret;
 	}

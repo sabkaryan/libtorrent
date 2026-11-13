@@ -135,8 +135,8 @@ namespace libtorrent::aux {
 		// one storage of a memory_disk_io of the pool
 		struct storage_ref
 		{
-			// the torrent object new_torrent() was given, the one
-			// torrent_handle::native_handle() refers to. Compared by owner
+			// the torrent object of the storage (storage_params::torrent), the
+			// one torrent_handle::native_handle() refers to. Compared by owner
 			// (owner_before), never by address: a torrent object at the
 			// address of a removed one is another torrent
 			std::weak_ptr<void> torrent;
@@ -159,11 +159,12 @@ namespace libtorrent::aux {
 		struct retired_storage
 		{
 			std::shared_ptr<memory_storage> storage;
-			// the torrent object, the owner of the file_storage the storage
-			// refers to. Null for a storage created without one
-			std::shared_ptr<void> torrent;
+			// the owner of the file_storage the storage refers to, what the
+			// session passed to new_torrent(). Null for a storage created
+			// without one
+			std::shared_ptr<void> owner;
 			// the network thread's io_context of the session the torrent
-			// lived in: the torrent object is released there. It outlives
+			// lived in: the owner is released there. It outlives
 			// every pin: pins are held only by that session's disk
 			// backend, its hasher threads and the default backend's
 			// threads (each holds a work guard on it), and by the
