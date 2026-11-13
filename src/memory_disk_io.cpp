@@ -215,7 +215,7 @@ namespace {
 
 		// the entries not pinned are freed now, a pinned one when its last
 		// pin goes: the storage is then kept by the pool as retired, with
-		// the torrent object that owns its file_storage, until the last pin
+		// the owner of its file_storage, until the last pin
 		// drops (memory_entry_ref::release()). Jobs parked
 		// behind a fence of the storage answer operation_aborted once the
 		// fence lowers (the fence itself answers as the default backend
