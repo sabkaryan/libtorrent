@@ -195,8 +195,10 @@ private:
 
 	// insert a write job's block (already accounted for by
 	// disk_cache::account_pending_write(), see async_write()) into the cache.
-	// Returns the insert flags (need_hasher_kick). If insert() throws, the
-	// pending-write accounting is rolled back and the exception propagates.
+	// Returns the insert flags (need_hasher_kick, write_rejected). A rejected
+	// write is not in the cache: its pending-write accounting is rolled back,
+	// as when insert() throws, and the caller fails the job. If insert()
+	// throws, the exception propagates.
 	// Does NOT kick the hasher or flush, that re-enters the fence,
 	// so it must run with no fence mutex held. The repost callback in
 	// add_completed_jobs_impl() calls this while a fence mutex is held and
