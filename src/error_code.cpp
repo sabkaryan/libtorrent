@@ -282,6 +282,7 @@ namespace libtorrent {
 			 "v1 and v2 hashes do not describe the same data",
 			 "a file in the v2 metadata has the pad attribute set",
 			 "directory structure in torrent file exceeds depth limit",
+			 "the specified piece has not been written to the part file",
 			 "the disk backend declined to store the block"}
 		};
 		// clang-format on
