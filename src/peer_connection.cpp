@@ -1068,9 +1068,10 @@ namespace {
 
 		int const rate = download_rate_estimate();
 
+		// Convert all outstanding bytes to milliseconds, including sent requests.
 		return milliseconds((std::int64_t(m_outstanding_bytes) + extra_bytes
-								+ std::int64_t(m_queued_time_critical) * t->block_size() * 1000)
-			/ rate);
+								+ std::int64_t(m_queued_time_critical) * t->block_size())
+			* 1000 / rate);
 	}
 
 	int peer_connection::download_rate_estimate() const
