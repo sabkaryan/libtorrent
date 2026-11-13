@@ -21,6 +21,7 @@ see LICENSE file.
 
 #include "libtorrent/aux_/disable_warnings_push.hpp"
 #include <boost/asio/dispatch.hpp>
+#include <boost/asio/post.hpp>
 #include "libtorrent/aux_/disable_warnings_pop.hpp"
 
 #include <algorithm>
@@ -316,6 +317,32 @@ namespace {
 
 namespace {
 
+	// the torrent of a handle, locked on the caller's thread. When the torrent
+	// is removed meanwhile, this may be the last reference to it, but a
+	// torrent must be destructed on the network thread: the reference is
+	// handed over to it, as torrent_handle's calls do
+	struct locked_torrent
+	{
+		explicit locked_torrent(torrent_handle const& th) : t(th.native_handle()) {}
+		locked_torrent(locked_torrent const&) = delete;
+		locked_torrent& operator=(locked_torrent const&) = delete;
+		~locked_torrent()
+		{
+			if (!t) return;
+			auto& ses = t->session();
+#ifndef BOOST_NO_EXCEPTIONS
+			// out of memory: the reference is released here, as a throwing
+			// call of torrent_handle's would
+			try {
+#endif
+				post(ses.get_context(), [p = std::move(t)] {});
+#ifndef BOOST_NO_EXCEPTIONS
+			} catch (...) {}
+#endif
+		}
+		std::shared_ptr<aux::torrent> t;
+	};
+
 	// whether a claim may send pieces held in memory to the file
 	enum class moves : bool { no, yes };
 
@@ -327,7 +354,8 @@ namespace {
 	void claim(aux::memory_pool_impl& impl, torrent_handle const& th
 		, std::function<void(aux::memory_storage&)> op, moves const m)
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		if (!t) return;
 		std::lock_guard<aux::memory_pool_mutex> l(impl.mutex);
 		if (auto const* r = impl.ref_of(t))
@@ -407,7 +435,8 @@ namespace {
 	// piece that has not arrived has no entry, and is not counted
 	std::int64_t memory_storage_pool::pending_persist_bytes(torrent_handle const& th) const
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		std::shared_ptr<aux::memory_storage> const st = m_impl->storage_of(t);
 		if (!st) return not_managed;
@@ -425,7 +454,8 @@ namespace {
 
 	int memory_storage_pool::persist_failures(torrent_handle const& th) const
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t);
 		if (!s) return not_managed;
@@ -435,7 +465,8 @@ namespace {
 	memory_forget_result memory_storage_pool::forget_piece(torrent_handle const& th
 		, piece_index_t const piece)
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		if (!t) return {not_managed, piece_place::none};
 		{
 			std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
@@ -450,7 +481,7 @@ namespace {
 		memory_forget_result ret{not_managed, piece_place::none};
 		bool done = false;
 		std::exception_ptr ex;
-		dispatch(ses.get_context(), [&ret, &done, &ex, &ses, t, impl, piece]
+		dispatch(ses.get_context(), [&ret, &done, &ex, &ses, &t, impl, piece]
 		{
 #ifndef BOOST_NO_EXCEPTIONS
 			try {
@@ -503,7 +534,8 @@ namespace {
 	int read_piece(aux::memory_pool_impl& impl, torrent_handle const& th, piece_index_t const piece
 		, int const offset, int const len, Acquire const& acquire, Release const& release)
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		std::lock_guard<aux::memory_pool_mutex> l(impl.mutex);
 		std::shared_ptr<aux::memory_storage> const st = impl.storage_of(t);
 		if (!st) return memory_storage_pool::not_managed;
@@ -565,7 +597,8 @@ namespace {
 
 	memory_pieces memory_storage_pool::in_memory(torrent_handle const& th) const
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t);
 		if (!s) return {};
@@ -586,7 +619,8 @@ namespace {
 
 	memory_held memory_storage_pool::held_bytes(torrent_handle const& th) const
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 		std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t);
 		if (!s) return {not_managed, not_managed};
@@ -640,7 +674,8 @@ namespace {
 	memory_snapshot memory_storage_pool::snapshot(torrent_handle const& th) const
 	{
 		memory_snapshot ret;
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		if (!t)
 		{
 			ret.status = invalid_handle;
@@ -656,7 +691,7 @@ namespace {
 		std::shared_ptr<aux::memory_pool_impl> const impl = m_impl;
 		bool done = false;
 		std::exception_ptr ex;
-		dispatch(ses.get_context(), [&ret, &done, &ex, &ses, t, impl]
+		dispatch(ses.get_context(), [&ret, &done, &ex, &ses, &t, impl]
 		{
 #ifndef BOOST_NO_EXCEPTIONS
 			try {
@@ -737,7 +772,8 @@ namespace {
 
 	void memory_storage_pool::filter_resume(torrent_handle const& th, add_torrent_params& atp) const
 	{
-		std::shared_ptr<aux::torrent> const t = th.native_handle();
+		locked_torrent const ref(th);
+		std::shared_ptr<aux::torrent> const& t = ref.t;
 		{
 			std::lock_guard<aux::memory_pool_mutex> l(m_impl->mutex);
 			if (std::shared_ptr<aux::memory_storage> const s = m_impl->storage_of(t))

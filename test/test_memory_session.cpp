@@ -3098,3 +3098,60 @@ TORRENT_TEST(snapshot_during_transfers)
 	error_code ec;
 	remove_all(path, ec);
 }
+
+#ifndef TORRENT_DISABLE_EXTENSIONS
+// a call into the pool locks the torrent on the caller's thread. When the
+// torrent is removed meanwhile, the caller's reference may be the last one,
+// and the torrent must still be destructed on the network thread. Here the
+// session lets go of its last reference while a second thread keeps calling
+// into the pool: most of the time that thread holds a reference then
+TORRENT_TEST(torrent_destructed_on_network_thread)
+{
+	std::vector<char> const content = random_content();
+	std::string const path = complete("released_on_network_thread");
+	auto const pool = make_pool(memory_policy::memory);
+	{
+		auto ses = make_session(pool);
+		std::thread::id network;
+		std::promise<std::thread::id> added;
+		post(ses->native_handle()->get_context(), [&added] { added.set_value(std::this_thread::get_id()); });
+		network = added.get_future().get();
+
+		int wrong = 0;
+		for (int round = 0; round < 20; ++round)
+		{
+			std::promise<std::thread::id> destructed;
+			add_torrent_params atp = make_torrent(content);
+			atp.extensions.push_back([&destructed](torrent_handle const&, client_data_t)
+				-> std::shared_ptr<torrent_plugin> { return std::make_shared<release_probe>(&destructed); });
+			torrent_handle const th = add(*ses, atp, path);
+			std::shared_ptr<aux::torrent> keep = th.native_handle();
+			TEST_CHECK(keep);
+			ses->remove_torrent(th);
+			TEST_CHECK(wait_alert<torrent_removed_alert>(*ses, [](torrent_removed_alert const&) { return true; }));
+			// only this test holds the torrent now
+			TEST_CHECK(wait_for([&keep] { return keep.use_count() == 1; }));
+
+			std::atomic<bool> stop{false};
+			std::thread caller([&] {
+				while (!stop)
+				{
+					pool->held_bytes(th);
+					pool->pending_persist_bytes(th);
+					pool->in_memory(th);
+				}
+			});
+			post(ses->native_handle()->get_context(), [k = std::move(keep)] {});
+			std::future<std::thread::id> f = destructed.get_future();
+			bool const done = f.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+			stop = true;
+			caller.join();
+			TEST_CHECK(done);
+			if (done && f.get() != network) ++wrong;
+		}
+		TEST_EQUAL(wrong, 0);
+	}
+	error_code ec;
+	remove_all(path, ec);
+}
+#endif
