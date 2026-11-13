@@ -11,6 +11,7 @@ see LICENSE file.
 #include "libtorrent/aux_/resolve_links.hpp"
 #include "libtorrent/torrent_info.hpp"
 #include "libtorrent/aux_/numeric_cast.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 
 namespace libtorrent::aux {
 
@@ -39,7 +40,7 @@ resolve_links::resolve_links(std::shared_ptr<torrent_info const> ti)
 			m_file_sizes.insert({fs.file_size(i), i});
 
 		if (v2)
-			m_file_roots.insert({fs.root(i), i});
+			m_file_roots.insert({{fs.root(i), fs.file_size(i)}, i});
 	}
 
 	m_links.resize(m_torrent_file->num_files());
@@ -100,7 +101,8 @@ void resolve_links::match_v1(
 			piece_index_t our_piece = m_torrent_file->layout().map_file(
 				idx, 0, 0).piece;
 
-			int const num_pieces = int((file_size + piece_size - 1) / piece_size);
+			int const num_pieces =
+				static_cast<int>(aux::ceil_div(file_size, std::int64_t(piece_size)));
 
 			bool match = true;
 			for (int p = 0; p < num_pieces; ++p, ++their_piece, ++our_piece)
@@ -132,7 +134,9 @@ void resolve_links::match_v2(filenames const& fs, std::string const& save_path)
 		// it in m_torrent_file
 		if (fs.pad_file_at(i)) continue;
 
-		auto const iter = m_file_roots.find(fs.root(i));
+		// BEP 52 doesn't distinguish leaf hashes from interior nodes, so a
+		// matching root alone doesn't imply identical content
+		auto const iter = m_file_roots.find({fs.root(i), fs.file_size(i)});
 		if (iter == m_file_roots.end()) continue;
 
 		auto const idx = iter->second;

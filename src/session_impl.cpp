@@ -58,6 +58,7 @@ see LICENSE file.
 #include "libtorrent/alert_types.hpp"
 #include "libtorrent/aux_/invariant_check.hpp"
 #include "libtorrent/aux_/bt_peer_connection.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 #include "libtorrent/peer_connection_handle.hpp"
 #include "libtorrent/ip_filter.hpp"
 #include "libtorrent/socket.hpp"
@@ -68,6 +69,7 @@ see LICENSE file.
 #include "libtorrent/kademlia/node_entry.hpp"
 #endif
 #include "libtorrent/aux_/enum_net.hpp"
+#include "libtorrent/aux_/escape_string.hpp" // for is_valid_i2p_destination
 #include "libtorrent/upnp.hpp"
 #include "libtorrent/natpmp.hpp"
 #include "libtorrent/aux_/lsd.hpp"
@@ -2474,6 +2476,10 @@ retry:
 
 	void session_impl::on_i2p_open(error_code const& ec)
 	{
+		// the SAM session was closed or replaced
+		if (ec == boost::asio::error::operation_aborted)
+			return;
+
 		if (ec)
 		{
 			if (m_alerts.should_post<i2p_alert>())
@@ -2536,7 +2542,20 @@ retry:
 #endif
 			return;
 		}
-		incoming_connection(std::move(*m_i2p_listen_socket));
+
+		// reject before a peer_connection exists, so an invalid destination
+		// cannot trigger the torrent's connection limit eviction
+		if (!is_valid_i2p_destination(std::get<i2p_stream>(*m_i2p_listen_socket).destination()))
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			if (should_log())
+				session_log(" <== INCOMING CONNECTION [ rejected, invalid i2p destination ]");
+#endif
+		}
+		else
+		{
+			incoming_connection(std::move(*m_i2p_listen_socket));
+		}
 		m_i2p_listen_socket.reset();
 		open_new_incoming_i2p_connection();
 	}
@@ -2609,7 +2628,8 @@ retry:
 			return;
 		}
 
-		auto s = std::static_pointer_cast<aux::listen_socket_t>(si)->udp_sock;
+		auto ls = std::static_pointer_cast<aux::listen_socket_t>(si);
+		auto& s = ls->udp_sock;
 
 		s->sock.send_hostname(hostname, port, p, ec, flags);
 
@@ -2618,8 +2638,11 @@ retry:
 		{
 			s->write_blocked = true;
 			ADD_OUTSTANDING_ASYNC("session_impl::on_udp_writeable");
-			s->sock.async_write(std::bind(&session_impl::on_udp_writeable
-				, this, s, _1));
+			s->sock.async_write(std::bind(&session_impl::on_udp_writeable,
+				this,
+				std::weak_ptr<listen_socket_t>(ls),
+				ls->ssl,
+				_1));
 		}
 	}
 
@@ -2636,7 +2659,8 @@ retry:
 			return;
 		}
 
-		auto s = std::static_pointer_cast<aux::listen_socket_t>(si)->udp_sock;
+		auto ls = std::static_pointer_cast<aux::listen_socket_t>(si);
+		auto& s = ls->udp_sock;
 
 		// the destination address family matching the local socket's address
 		// family does not hold for proxies that we talk to over IPv4 but can
@@ -2651,35 +2675,37 @@ retry:
 		{
 			s->write_blocked = true;
 			ADD_OUTSTANDING_ASYNC("session_impl::on_udp_writeable");
-			s->sock.async_write(std::bind(&session_impl::on_udp_writeable
-				, this, s, _1));
+			s->sock.async_write(std::bind(&session_impl::on_udp_writeable,
+				this,
+				std::weak_ptr<listen_socket_t>(ls),
+				ls->ssl,
+				_1));
 		}
 	}
 
-	void session_impl::on_udp_writeable(std::weak_ptr<session_udp_socket> sock, error_code const& ec)
+	void session_impl::on_udp_writeable(
+		std::weak_ptr<listen_socket_t> ls, transport const ssl, error_code const&)
 	{
 		COMPLETE_ASYNC("session_impl::on_udp_writeable");
-		if (ec) return;
 
-		auto s = sock.lock();
-		if (!s) return;
+		if (auto l = ls.lock())
+		{
+			l->udp_sock->write_blocked = false;
+		}
 
-		s->write_blocked = false;
-
+		// the error is ignored on purpose. Stalled uTP sockets only discover
+		// a closed socket by retrying the send, and they are never deleted
+		// while stalled
 #ifdef TORRENT_SSL_PEERS
-		auto i = std::find_if(
-			m_listen_sockets.begin(), m_listen_sockets.end()
-			, [&s] (std::shared_ptr<listen_socket_t> const& ls) { return ls->udp_sock == s; });
+		if (ssl == transport::ssl)
+		{
+			m_ssl_utp_socket_manager.writable(ls);
+			return;
+		}
+#else
+		TORRENT_UNUSED(ssl);
 #endif
-
-		// notify the utp socket manager it can start sending on the socket again
-		struct utp_socket_manager& mgr =
-#ifdef TORRENT_SSL_PEERS
-			(i != m_listen_sockets.end() && (*i)->ssl == transport::ssl) ? m_ssl_utp_socket_manager :
-#endif
-			m_utp_socket_manager;
-
-		mgr.writable();
+		m_utp_socket_manager.writable(ls);
 	}
 
 
@@ -3473,7 +3499,7 @@ retry:
 		int const header = (ipv6 ? 40 : 20) + 20;
 		int const mtu = 1500;
 		int const packet_size = mtu - header;
-		int const overhead = std::max(1, (bytes + packet_size - 1) / packet_size) * header;
+		int const overhead = std::max(1, aux::ceil_div(bytes, packet_size)) * header;
 		m_stats_counters.inc_stats_counter(counters::sent_ip_overhead_bytes
 			, overhead);
 		m_stats_counters.inc_stats_counter(counters::recv_ip_overhead_bytes
@@ -6492,6 +6518,12 @@ retry:
 
 	session_impl::~session_impl()
 	{
+		// the network thread has exited by now, so this is the only thread
+		// touching session state. Registering it lets the single thread checks
+		// hold for everything destructed from here, including torrents kept
+		// alive by the disk I/O
+		thread_started();
+
 		// since we're destructing the session, no more alerts will make it out to
 		// the user. So stop posting them now
 		m_alerts.set_alert_mask({});

@@ -1010,6 +1010,7 @@ namespace libtorrent::aux {
 		}
 
 		bool disable_v1_hashes() const { return m_disable_v1_hashes; }
+		bool disable_hash_checks() const { return m_disable_hash_checks; }
 
 		// like torrent_info::piece_size_for_req(), but when disable_v1_hashes
 		// was set at the time the torrent was added, the engine treats the torrent
@@ -1071,8 +1072,9 @@ namespace libtorrent::aux {
 		void completed();
 
 #if TORRENT_USE_I2P
-		void on_i2p_resolve(error_code const& ec, char const* dest, peer_source_flags_t const source);
-		void add_i2p_peer(sha256_hash const& dest, peer_source_flags_t source);
+		void on_i2p_resolve(
+			error_code const& ec, char const* dest, peer_source_flags_t source, pex_flags_t flags);
+		void add_i2p_peer(sha256_hash const& dest, peer_source_flags_t source, pex_flags_t flags);
 		bool is_i2p() const { return m_i2p; }
 
 		// returns true if this tracker is compatible with the torrent's
@@ -1177,6 +1179,12 @@ namespace libtorrent::aux {
 
 		// this is the handler for write failure piece synchronization
 		void on_piece_fail_sync(piece_index_t piece, piece_block b);
+
+		// restore_piece() drops requests that peers still have outstanding.
+		// Register them with the picker again, otherwise a later
+		// abort_download() from those peers would hit blocks they aren't
+		// registered on. An empty blocks list means all blocks
+		void mark_queued_blocks_downloading(piece_index_t piece, span<int const> blocks);
 
 		void add_redundant_bytes(int b, waste_reason reason);
 		void add_failed_bytes(int b);
@@ -1833,6 +1841,12 @@ namespace libtorrent::aux {
 		// doesn't cause a mismatch between the storage (which was set up as
 		// v2-only) and the engine's block-sizing logic.
 		bool m_disable_v1_hashes:1;
+
+		// latched when the storage is created. The disk backend latches it at
+		// the same time for the storage, and the two must not diverge.
+		// TODO: in master, add this to storage_params so the backends take it
+		// from there instead of reading the setting in new_torrent()
+		bool m_disable_hash_checks:1;
 		// ----
 
 		// the maximum number of uploads for this torrent

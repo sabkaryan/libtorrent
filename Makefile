@@ -334,6 +334,7 @@ SOURCES = \
   disk_cache.cpp                  \
   disk_completed_queue.cpp        \
   disk_io_thread_pool.cpp         \
+  disk_tick_thread.cpp            \
   disk_job_fence.cpp              \
   disk_job_pool.cpp               \
   drive_info.cpp                  \
@@ -564,6 +565,7 @@ HEADERS = \
   aux_/bind_to_device.hpp           \
   aux_/buffer.hpp                   \
   aux_/byteswap.hpp                 \
+  aux_/ceil_div.hpp                 \
   aux_/bloom_filter.hpp             \
   aux_/bt_peer_connection.hpp       \
   aux_/container_wrapper.hpp        \
@@ -588,6 +590,7 @@ HEADERS = \
   aux_/visit_block_iovecs.hpp       \
   aux_/disk_completed_queue.hpp     \
   aux_/disk_io_thread_pool.hpp      \
+  aux_/disk_tick_thread.hpp         \
   aux_/disk_job_fence.hpp           \
   aux_/disk_job_pool.hpp            \
   aux_/drive_info.hpp               \
@@ -829,6 +832,7 @@ SIM_SOURCES = \
   test_dht_bootstrap.cpp \
   test_dht_rate_limit.cpp \
   test_dht_storage.cpp \
+  test_disk_tick_thread.cpp \
   test_error_handling.cpp \
   test_fast_extensions.cpp \
   test_http_connection.cpp \
@@ -939,9 +943,10 @@ TEST_SOURCES = \
   test_direct_dht.cpp \
   test_disk_cache.cpp \
   test_disk_io.cpp \
+  test_disk_tick_thread.cpp \
   test_forget_piece.cpp \
-  test_memory_session.cpp \
   test_memory_disk_io.cpp \
+  test_memory_session.cpp \
   test_piece_flushed_alert.cpp \
   test_slow_hash.cpp \
   test_dos_blocker.cpp \
@@ -962,6 +967,7 @@ TEST_SOURCES = \
   test_heterogeneous_queue.cpp \
   test_http_connection.cpp \
   test_http_parser.cpp \
+  test_i2p_connection.cpp \
   test_identify_client.cpp \
   test_info_hash.cpp \
   test_io.cpp \
@@ -1166,8 +1172,11 @@ TEST_TORRENTS = \
   v2_invalid_piece_layer.torrent \
   v2_invalid_piece_layer_root.torrent \
   v2_invalid_piece_layer_size.torrent \
+  v2_same_root_single_piece.torrent \
+  v2_same_root_multi_piece.torrent \
   v2_unknown_piece_layer_entry.torrent \
   v2_multiple_files.torrent \
+  v2_identical_files.torrent \
   v2_bad_file_alignment.torrent \
   v2_unordered_files.torrent \
   v2_overlong_integer.torrent \
@@ -1205,12 +1214,17 @@ TEST_EXTRA = Jamfile \
   root3.xml                          \
   ssl/regenerate_test_certificate.sh \
   ssl/dhparams.pem                   \
+  ssl/cn_mismatch_certificate.pem    \
   ssl/invalid_peer_certificate.pem   \
   ssl/invalid_peer_private_key.pem   \
   ssl/peer_certificate.pem           \
   ssl/peer_private_key.pem           \
   ssl/root_ca_cert.pem               \
   ssl/root_ca_private.pem            \
+  ssl/san_certificate.pem            \
+  ssl/san_mismatch_certificate.pem   \
+  ssl/san_mismatch_cn_match_certificate.pem \
+  ssl/san_wildcard_certificate.pem   \
   ssl/server.pem                     \
   zeroes.gz \
   corrupt.gz \

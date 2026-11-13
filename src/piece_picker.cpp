@@ -25,6 +25,7 @@ see LICENSE file.
 #include "libtorrent/bitfield.hpp"
 #include "libtorrent/aux_/random.hpp"
 #include "libtorrent/aux_/alloca.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 #include "libtorrent/aux_/range.hpp"
 #include "libtorrent/performance_counters.hpp" // for counters
 #include "libtorrent/alert_types.hpp" // for picker_log_alert
@@ -128,11 +129,11 @@ namespace libtorrent::aux {
 		m_total_size = total_size;
 		m_piece_size = piece_size;
 
-		int const blocks_in_piece
-			= (piece_size + block_size() - 1) / block_size();
-		int const blocks_in_last_piece
-			= ((total_size % piece_size) + block_size() - 1) / block_size();
-		int const num_pieces = int((total_size + piece_size - 1) / piece_size);
+		int const blocks_in_piece = aux::ceil_div(piece_size, block_size());
+		int const blocks_in_last_piece =
+			aux::ceil_div(static_cast<int>(total_size % piece_size), block_size());
+		int const num_pieces =
+			static_cast<int>(aux::ceil_div(total_size, std::int64_t(piece_size)));
 
 #ifdef TORRENT_PICKER_LOG
 		std::cerr << "[" << this << "] " << "piece_picker::resize()" << std::endl;
@@ -1979,8 +1980,8 @@ namespace {
 		// 2048 corresponds to 32 MiB
 		// TODO: 2 make the 2048 limit configurable
 		const int num_partials = int(m_downloads[piece_pos::piece_downloading].size());
-		if (num_partials > num_peers * 3 / 2
-			|| num_partials * blocks_per_piece() > 2048)
+		if (!(options & ignore_partial_limit)
+			&& (num_partials > num_peers * 3 / 2 || num_partials * blocks_per_piece() > 2048))
 		{
 			// if we have too many partial pieces, prioritize completing
 			// them. In order for this to have an affect, also disable
@@ -2848,7 +2849,7 @@ get_out:
 		// round to even pieces and expand in order to get the number of
 		// contiguous pieces we want
 		int const blocks = blocks_per_piece();
-		int const whole_pieces = (contiguous_blocks + blocks - 1) / blocks;
+		int const whole_pieces = aux::ceil_div(contiguous_blocks, blocks);
 
 		piece_index_t start = piece;
 		piece_index_t lower_limit;
@@ -3779,7 +3780,7 @@ get_out:
 	int piece_picker::blocks_per_piece() const
 	{
 		int const blk_size = block_size();
-		int ret = (m_piece_size + blk_size - 1) / blk_size;
+		int const ret = aux::ceil_div(m_piece_size, blk_size);
 		TORRENT_ASSERT(ret > 0);
 		return ret;
 	}

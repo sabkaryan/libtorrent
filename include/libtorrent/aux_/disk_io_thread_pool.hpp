@@ -92,48 +92,64 @@ namespace libtorrent::aux {
 		// if it returns false the thread should not exit
 		bool try_thread_exit(std::thread::id id);
 
-		// get the thread id of the first thread in the internal vector
-		// since this is the first thread it will remain the same until the first
-		// thread exits
-		// it can be used to trigger maintenance jobs which should only run on one thread
-		std::thread::id first_thread_id();
 		int num_threads()
 		{
 			std::lock_guard<std::mutex> l(m_mutex);
 			return int(m_threads.size());
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// precondition: the job mutex must be held when this is called
 		void append(jobqueue_t jobs)
 		{
 			m_queued_jobs.append(std::move(jobs));
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// precondition: the job mutex must be held when this is called
 		void push_back(aux::disk_job* j)
 		{
 			m_queued_jobs.push_back(j);
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// precondition: the job mutex must be held when this is called
 		aux::disk_job* pop_front()
 		{
 			return m_queued_jobs.pop_front();
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// precondition: the job mutex must be held when this is called
 		bool empty() const
 		{
 			return m_queued_jobs.empty();
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// pulls up to max_match jobs matching pred off the front of the
+		// queue into out, stopping at the first non-matching job rather
+		// than scanning the rest of the queue.
+		// precondition: the job mutex must be held when this is called
+		template <typename Pred>
+		void extract_matching(jobqueue_t& out, int const max_match, Pred pred)
+		{
+			int matched = 0;
+			while (matched < max_match && !m_queued_jobs.empty())
+			{
+				aux::disk_job* j = m_queued_jobs.pop_front();
+				if (!pred(j))
+				{
+					m_queued_jobs.push_front(j);
+					break;
+				}
+				out.push_back(j);
+				++matched;
+			}
+		}
+
+		// precondition: the job mutex must be held when this is called
 		int queue_size() const
 		{
 			return m_queued_jobs.size();
 		}
 
-		// TODO: the job mutex must be held when this is called
+		// precondition: the job mutex must be held when this is called
 		void submit_jobs()
 		{
 			if (m_queued_jobs.empty()) return;

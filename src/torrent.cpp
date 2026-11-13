@@ -42,6 +42,7 @@ see LICENSE file.
 #include <set>
 #include <map>
 #include <vector>
+#include <array>
 #include <cctype>
 #include <memory>
 #include <numeric>
@@ -50,6 +51,7 @@ see LICENSE file.
 #include <functional>
 
 #include "libtorrent/aux_/torrent.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 
 #ifdef TORRENT_SSL_PEERS
 #include "libtorrent/aux_/ssl_stream.hpp"
@@ -107,6 +109,7 @@ see LICENSE file.
 #include "libtorrent/aux_/apply_pad_files.hpp"
 #include "libtorrent/aux_/tracker_list.hpp"
 #include "libtorrent/aux_/tracker_manager.hpp"
+#include "libtorrent/aux_/scope_end.hpp"
 
 #ifndef TORRENT_DISABLE_LOGGING
 #include "libtorrent/aux_/session_impl.hpp" // for tracker_logger
@@ -209,10 +212,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		, m_state(torrent_status::checking_resume_data)
 	{}
 
-	torrent::torrent(
-		aux::session_interface& ses
-		, bool const session_paused
-		, add_torrent_params&& p)
+	torrent::torrent(aux::session_interface& ses, bool const session_paused, add_torrent_params&& p)
 		: torrent_hot_members(ses, p, session_paused)
 		, m_total_uploaded(p.total_uploaded)
 		, m_total_downloaded(p.total_downloaded)
@@ -251,6 +251,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		, m_enable_lsd(!bool(p.flags & torrent_flags::disable_lsd))
 		, m_i2p(bool(p.flags & torrent_flags::i2p_torrent))
 		, m_disable_v1_hashes(false)
+		, m_disable_hash_checks(false)
 		, m_max_uploads((1 << 24) - 1)
 		, m_num_uploads(0)
 		, m_enable_pex(!bool(p.flags & torrent_flags::disable_pex))
@@ -259,7 +260,8 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 #if TORRENT_ABI_VERSION < 4
 		, m_v2_piece_layers_validated(false)
 #endif
-		, m_connect_boost_counter(static_cast<std::uint8_t>(settings().get_int(settings_pack::torrent_connect_boost)))
+		, m_connect_boost_counter(
+			  static_cast<std::uint8_t>(settings().get_int(settings_pack::torrent_connect_boost)))
 		, m_incomplete(0xffffff)
 		, m_announce_to_dht(!(p.flags & torrent_flags::paused))
 		, m_ssl_torrent(false)
@@ -798,18 +800,14 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// been closed by the time the torrent is destructed. And they are
 		// supposed to be closed. So we can still do the invariant check.
 
-		// however, the torrent object may be destructed from the main
-		// thread when shutting down, if the disk cache has references to it.
-		// this means that the invariant check that this is called from the
-		// network thread cannot be maintained
-
-		// other than at shutdown, the torrent must be destructed on the
-		// network thread. The peer list returns its entries to the session's
-		// peer allocator, which is not thread safe, and extensions expect
-		// their destructors to run on the network thread, like their
-		// callbacks. The disk storage holds a reference to the torrent and
-		// may be released from another thread, so whoever does that has to
-		// hand the last reference over to the network thread
+		// the torrent must be destructed on the network thread. The peer list
+		// returns its entries to the session's peer allocator, which is not
+		// thread safe, and extensions expect their destructors to run on the
+		// network thread, like their callbacks. This is why the disk I/O is
+		// not handed a reference to the torrent, only to its torrent_info.
+		// At shutdown, the thread destructing the session registers itself
+		// as the network thread first
+		TORRENT_ASSERT(m_ses.is_single_thread());
 
 		TORRENT_ASSERT(m_peer_class == peer_class_t{0});
 		TORRENT_ASSERT(m_connections.empty());
@@ -841,7 +839,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		}
 
 		const int piece_size = piece_size_for_req(piece);
-		const int blocks_in_piece = (piece_size + block_size() - 1) / block_size();
+		const int blocks_in_piece = aux::ceil_div(piece_size, block_size());
 
 		TORRENT_ASSERT(blocks_in_piece > 0);
 		TORRENT_ASSERT(piece_size > 0);
@@ -1249,30 +1247,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			// unlock the piece and restore it, as if no block was
 			// ever downloaded for it.
 			m_picker->restore_piece(piece);
-			// a peer may still wait for a block of the piece: one also
-			// requested from another peer, which delivered it first.
-			// mark_as_writing() took the block out of the requested state, so
-			// cancel_request() left this request wanted, and restore_piece()
-			// dropped the requests the picker counted. Give the picker back
-			// the requests peers still wait for, as on_piece_sync() does
-			// after a failed hash
-			for (auto* p : m_connections)
-			{
-				TORRENT_INCREMENT(m_iterating_connections);
-				for (auto const& b : p->download_queue())
-				{
-					if (b.timed_out || b.not_wanted) continue;
-					if (b.block.piece_index != piece) continue;
-					m_picker->mark_as_downloading(b.block, p->peer_info_struct()
-						, p->picker_options());
-				}
-				for (auto const& b : p->request_queue())
-				{
-					if (b.block.piece_index != piece) continue;
-					m_picker->mark_as_downloading(b.block, p->peer_info_struct()
-						, p->picker_options());
-				}
-			}
+			mark_queued_blocks_downloading(piece, {});
 		}
 
 		update_gauge();
@@ -1400,6 +1375,13 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 
 		if (m_have_all) pp->we_have_all();
 
+		// every picker needs the pad bytes, not only the first one. A seed's
+		// picker is released, and the one made here when it needs one again
+		// (say a file is skipped) would otherwise count the padding as
+		// payload in its byte counts (total_wanted, total_done)
+		aux::apply_pad_files(m_torrent_file->layout(),
+			[&](piece_index_t const piece, int const bytes) { pp->set_pad_bytes(piece, bytes); });
+
 		// initialize the file progress too
 		if (m_file_progress.empty())
 			m_file_progress.init(*pp, m_torrent_file->layout());
@@ -1500,7 +1482,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			return;
 
 		int const piece_size = piece_size_for_req(piece);
-		int const blocks_in_piece = (piece_size + block_size() - 1) / block_size();
+		int const blocks_in_piece = aux::ceil_div(piece_size, block_size());
 
 		if (m_deleted) return;
 
@@ -1775,6 +1757,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// Go through the alternate names in the certificate looking for matching DNS entries
 		auto* gens = static_cast<GENERAL_NAMES*>(
 			X509_get_ext_d2i(cert, NID_subject_alt_name, nullptr, nullptr));
+		auto const free_gens = aux::scope_end([gens] { GENERAL_NAMES_free(gens); });
 
 		for (int i = 0; i < sk_GENERAL_NAME_num(gens); ++i)
 		{
@@ -1788,7 +1771,8 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			);
 
 #ifndef TORRENT_DISABLE_LOGGING
-			if (i > 1) names += " | n: ";
+			if (!names.empty())
+				names += " | n: ";
 			names.append(torrent_name.data(), torrent_name.size());
 #endif
 			if (torrent_name == "*"_sv || torrent_name == expected)
@@ -1849,38 +1833,46 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// We don't use gnutls_x509_crt_check_hostname()
 		// as it doesn't handle wildcards the way we need here
 
-		char buf[256];
-		unsigned int seq = 0;
-		while(true) {
-			size_t len = sizeof(buf);
-			int ret = gnutls_x509_crt_get_subject_alt_name(cert, seq, buf, &len, nullptr);
-			if(ret == GNUTLS_E_REQUESTED_DATA_NOT_AVAILABLE) break;
-			if(ret == GNUTLS_E_SUCCESS)
+		std::array<char, 256> buf;
+		for (unsigned int seq = 0;; ++seq)
+		{
+			size_t len = buf.size();
+			int const ret =
+				gnutls_x509_crt_get_subject_alt_name(cert, seq, buf.data(), &len, nullptr);
+			// a DNS name is at most 253 characters, longer entries are malformed
+			if (ret == GNUTLS_E_SHORT_MEMORY_BUFFER)
+				continue;
+			if (ret < 0)
+				break;
+			if (ret != GNUTLS_SAN_DNSNAME)
+				continue;
+
+			string_view const torrent_name(buf.data(), len);
+#ifndef TORRENT_DISABLE_LOGGING
+			if (!names.empty())
+				names += " | n: ";
+			names.append(torrent_name.data(), torrent_name.size());
+#endif
+			if (torrent_name == "*"_sv || torrent_name == expected)
 			{
-				string_view const torrent_name(buf, len);
 #ifndef TORRENT_DISABLE_LOGGING
-				if (!names.empty()) names += " | n: ";
-				names.append(torrent_name.data(), torrent_name.size());
-#endif
-				if (torrent_name == "*"_sv || torrent_name == expected)
-				{
-#ifndef TORRENT_DISABLE_LOGGING
-					match = true;
-					continue;
+				match = true;
+				// if we're logging, keep looping over all names,
+				// for completeness of the log
+				continue;
 #else
-					return true;
+				return true;
 #endif
-				}
 			}
-			++seq;
 		}
 
 		// no match in the alternate names, so try the common name
-		size_t len = sizeof(buf);
-		int ret = gnutls_x509_crt_get_dn_by_oid(cert, GNUTLS_OID_X520_COMMON_NAME, 0, 0, buf, &len);
+		size_t len = buf.size();
+		int ret = gnutls_x509_crt_get_dn_by_oid(
+			cert, GNUTLS_OID_X520_COMMON_NAME, 0, 0, buf.data(), &len);
 		if(ret == GNUTLS_E_SUCCESS)
 		{
-			string_view const torrent_name(buf, len);
+			string_view const torrent_name(buf.data(), len);
 #ifndef TORRENT_DISABLE_LOGGING
 			if (!names.empty()) names += " | n: ";
 			names.append(torrent_name.data(), torrent_name.size());
@@ -1984,9 +1976,17 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			m_torrent_file->v2()
 		};
 
-		// the shared_from_this() will create an intentional
-		// cycle of ownership, se the hpp file for description.
-		m_storage = m_ses.disk_thread().new_torrent(params, shared_from_this());
+		// latched here rather than in the constructor so it is read at the
+		// same time the backend reads it for the storage. Once it is part of
+		// storage_params this can move to the constructor
+		m_disable_hash_checks = settings().get_bool(settings_pack::disable_hash_checks);
+
+		// the storage references m_torrent_file's file_storage, so the disk I/O
+		// keeps the torrent_info alive while it has jobs for the storage. It
+		// must not keep the torrent alive, that has to be destructed on the
+		// network thread
+		m_storage = m_ses.disk_thread().new_torrent(
+			params, std::const_pointer_cast<torrent_info>(m_torrent_file));
 	}
 
 	peer_connection* torrent::find_lowest_ranking_peer() const
@@ -2051,8 +2051,8 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			return;
 		}
 
-		int const blocks_per_piece
-			= (m_torrent_file->piece_length() + default_block_size - 1) / default_block_size;
+		int const blocks_per_piece =
+			aux::ceil_div(m_torrent_file->piece_length(), default_block_size);
 		if (blocks_per_piece > piece_picker::max_blocks_per_piece)
 		{
 			set_error(errors::invalid_piece_size, torrent_status::error_file_none);
@@ -2149,9 +2149,9 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 			aux::apply_pad_files(fs, [&](piece_index_t const piece, int const bytes)
 			{
 				m_padding_bytes += bytes;
+				// need_picker() has set the pad bytes in the picker
 				if (bytes == fs.piece_size(piece))
 					have_pieces.push_back(piece);
-				m_picker->set_pad_bytes(piece, bytes);
 			});
 
 			for (auto i : have_pieces)
@@ -2801,7 +2801,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		boost::tribool hash_passed[2]
 			= { boost::indeterminate, boost::indeterminate };
 
-		if (!settings().get_bool(settings_pack::disable_hash_checks))
+		if (!m_disable_hash_checks)
 		{
 			if (torrent_file().info_hashes().has_v1() && !m_disable_v1_hashes)
 				hash_passed[0] = piece_hash == m_torrent_file->hash_for_piece(piece);
@@ -3963,6 +3963,11 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		TORRENT_UNUSED(tracker_ips);
 #endif
 
+		pex_flags_t flags = v == protocol_version::V2 ? pex_lt_v2 : pex_flags_t(0);
+		// a v2-only torrent has no v1 info hash to connect with
+		if (!torrent_file().info_hashes().has_v1())
+			flags |= pex_lt_v2;
+
 		// for each of the peers we got from the tracker
 		for (auto const& i : resp.peers)
 		{
@@ -3978,9 +3983,10 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 				if (string_ends_with(i.hostname, ".i2p"))
 				{
 					ADD_OUTSTANDING_ASYNC("torrent::on_i2p_resolve");
-					r.i2pconn->async_name_lookup(i.hostname.c_str()
-						, [self = shared_from_this()] (error_code const& ec, char const* dest)
-						{ self->torrent::on_i2p_resolve(ec, dest, peer_info::tracker); });
+					r.i2pconn->async_name_lookup(i.hostname.c_str(),
+						[self = shared_from_this(), flags](error_code const& ec, char const* dest) {
+							self->torrent::on_i2p_resolve(ec, dest, peer_info::tracker, flags);
+						});
 				}
 				else
 				{
@@ -3989,7 +3995,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 					// that in the i2p_peer object directly
 					torrent_state st = get_peer_list_state();
 					need_peer_list();
-					if (m_peer_list->add_i2p_peer(i.hostname, peer_info::tracker, {}, &st))
+					if (m_peer_list->add_i2p_peer(i.hostname, peer_info::tracker, flags, &st))
 						state_updated();
 					peers_erased(st.erased);
 				}
@@ -4023,7 +4029,7 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		{
 			for (auto const& i : resp.i2p_peers)
 			{
-				add_i2p_peer(i.destination, peer_info::tracker);
+				add_i2p_peer(i.destination, peer_info::tracker, flags);
 			}
 		}
 #endif
@@ -4036,8 +4042,6 @@ aux::vector<download_priority_t, piece_index_t> file_to_piece_prio(
 		// 2. it might make sense to have a tracker extension in the future where
 		//    trackers records a peer's internal and external IP, and match up
 		//    peers on the same local network
-
-		pex_flags_t flags = v == protocol_version::V2 ? pex_lt_v2 : pex_flags_t(0);
 
 		bool need_update = false;
 		for (auto const& i : resp.peers4)
@@ -4321,25 +4325,32 @@ namespace {
 #endif
 
 #if TORRENT_USE_I2P
-	void torrent::add_i2p_peer(sha256_hash const& dest, peer_source_flags_t const source)
+	void torrent::add_i2p_peer(
+		sha256_hash const& dest, peer_source_flags_t const source, pex_flags_t const flags)
 	{
 		// TODO: store i2p addresses as a 32 byte sha256 hash in the
 		// i2p_peer object, rather than resolving it into the full vase64
 		// destination. We should keep the full destination as a cache in the
 		// i2p_peer object still.
+
+		// i2p_connection queues lookups until the SAM session is up
+		if (settings().get_str(settings_pack::i2p_hostname).empty())
+			return;
 		i2p_connection& i2pconn = session().i2p_conn();
-		if (!i2pconn.is_open()) return;
 
 		std::string destination = base32encode_i2p(dest);
 		destination += ".b32.i2p";
 
 		ADD_OUTSTANDING_ASYNC("torrent::on_i2p_resolve");
-		i2pconn.async_name_lookup(destination.c_str()
-			, [self = shared_from_this(), source] (error_code const& ec, char const* d)
-			{ self->torrent::on_i2p_resolve(ec, d, source); });
+		i2pconn.async_name_lookup(destination.c_str(),
+			[self = shared_from_this(), source, flags](error_code const& ec, char const* d) {
+				self->torrent::on_i2p_resolve(ec, d, source, flags);
+			});
 	}
 
-	void torrent::on_i2p_resolve(error_code const& ec, char const* dest, peer_source_flags_t const source) try
+	void torrent::on_i2p_resolve(
+		error_code const& ec, char const* dest, peer_source_flags_t const source, pex_flags_t flags)
+	try
 	{
 		TORRENT_ASSERT(is_single_thread());
 
@@ -4352,9 +4363,12 @@ namespace {
 #endif
 		if (ec || m_abort || m_ses.is_aborted()) return;
 
+		// a v2-only torrent has no v1 info hash to connect with
+		if (!torrent_file().info_hashes().has_v1())
+			flags |= pex_lt_v2;
 		need_peer_list();
 		torrent_state st = get_peer_list_state();
-		if (m_peer_list->add_i2p_peer(dest, source, {}, &st))
+		if (m_peer_list->add_i2p_peer(dest, source, flags, &st))
 			state_updated();
 		peers_erased(st.erased);
 
@@ -4568,13 +4582,13 @@ namespace {
 		boost::tribool passed = boost::indeterminate;
 		boost::tribool v2_passed = boost::indeterminate;
 
-		if (settings().get_bool(settings_pack::disable_hash_checks))
-		{
-			passed = v2_passed = true;
-		}
-		else if (error)
+		if (error)
 		{
 			passed = v2_passed = false;
+		}
+		else if (m_disable_hash_checks)
+		{
+			passed = v2_passed = true;
 		}
 		else
 		{
@@ -5319,8 +5333,14 @@ namespace {
 				{
 					peer_id const pid = p->connection
 						? p->connection->pid() : peer_id();
-					m_ses.alerts().emplace_alert<peer_ban_alert>(
-						get_handle(), p->ip(), pid);
+#if TORRENT_USE_I2P
+					peer_endpoint_t const ep = p->is_i2p_addr
+						? peer_endpoint_t(i2p_destination_hash(p->dest()))
+						: peer_endpoint_t(p->ip());
+#else
+					peer_endpoint_t const ep = p->ip();
+#endif
+					m_ses.alerts().emplace_alert<peer_ban_alert>(get_handle(), ep, pid);
 				}
 
 				// mark the peer as banned
@@ -5381,8 +5401,16 @@ namespace {
 		// and mark it as being interesting for download
 		TORRENT_ASSERT(!m_picker->have_piece(piece));
 
-		// loop over all peers and re-request potential duplicate
-		// blocks to this piece
+		mark_queued_blocks_downloading(piece, blocks);
+	}
+	catch (...)
+	{
+		handle_exception();
+	}
+
+	void torrent::mark_queued_blocks_downloading(
+		piece_index_t const piece, span<int const> const blocks)
+	{
 		for (auto* p : m_connections)
 		{
 			TORRENT_INCREMENT(m_iterating_connections);
@@ -5407,7 +5435,6 @@ namespace {
 			}
 		}
 	}
-	catch (...) { handle_exception(); }
 
 	void torrent::peer_has(piece_index_t const index, peer_connection const* peer)
 	{
@@ -7368,10 +7395,10 @@ namespace {
 		// The SSRF mitigation for web seeds is that any HTTP server on the
 		// local network may not use any query string parameters. this can't
 		// be evaluated when the hostname is resolved by the proxy (see
-		// settings_pack::proxy_hostnames), since peer_info.addr is then an
+		// settings_pack::proxy_hostnames), since the endpoint address is then an
 		// unspecified placeholder rather than the real target address
 		if (settings().get_bool(settings_pack::ssrf_mitigation) && address_known
-			&& aux::is_local(web->peer_info.addr) && path.find('?') != std::string::npos)
+			&& aux::is_local(a.address()) && path.find('?') != std::string::npos)
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			if (should_log())
@@ -8768,11 +8795,11 @@ namespace {
 #ifndef TORRENT_DISABLE_LOGGING
 			if (should_log())
 			{
-				debug_log("CLOSING CONNECTION \"%s\" peer list full "
-					"connections: %d limit: %d"
-					, print_endpoint(p->remote()).c_str()
-					, num_peers()
-					, m_max_connections);
+				debug_log("CLOSING CONNECTION \"%s\" rejected by peer list "
+						  "connections: %d limit: %d",
+					print_endpoint(p->remote()).c_str(),
+					num_peers(),
+					m_max_connections);
 			}
 #endif
 			p->disconnect(errors::too_many_connections, operation_t::bittorrent);
@@ -12212,14 +12239,9 @@ namespace {
 
 		std::uint8_t const gen = m_picker_generation;
 
-		if (settings().get_bool(settings_pack::disable_hash_checks))
-		{
-			// short-circuit the hash check if it's disabled
-			m_picker->started_hash_job(piece);
-			on_piece_verified(std::move(hashes), piece, sha1_hash(), storage_error{}, gen);
-			return;
-		}
-
+		// with disable_hash_checks the backend returns zero hashes, but the
+		// job is still posted. It is what tells the backend the piece is
+		// complete and can be flushed and evicted
 		span<sha256_hash> v2_span(hashes);
 		// mark the piece as hashing before dispatching: with 0 disk threads
 		// (aio_threads=0, e.g. simulations), async_hash() may invoke its

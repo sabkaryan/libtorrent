@@ -205,7 +205,7 @@ namespace libtorrent {
 
 			 // i2p errors
 			 "no i2p router is set up",
-			 "",
+			 "i2p acceptor not available yet",
 			 "",
 			 "",
 			 "",
@@ -283,6 +283,7 @@ namespace libtorrent {
 			 "a file in the v2 metadata has the pad attribute set",
 			 "directory structure in torrent file exceeds depth limit",
 			 "the specified piece has not been written to the part file",
+			 "files with the same root hash have different sizes",
 			 "the disk backend declined to store the block"}
 		};
 		// clang-format on

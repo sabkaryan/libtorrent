@@ -153,6 +153,7 @@ set(libtorrent_aux_include_files
 	bt_peer_connection.hpp
 	buffer.hpp
 	byteswap.hpp
+	ceil_div.hpp
 	chained_buffer.hpp
 	choker.hpp
 	copy_ptr.hpp
@@ -175,6 +176,7 @@ set(libtorrent_aux_include_files
 	mmap_disk_job.hpp
 	disk_job.hpp
 	disk_io_thread_pool.hpp
+	disk_tick_thread.hpp
 	disk_job_fence.hpp
 	disk_job_pool.hpp
 	drive_info.hpp
@@ -346,6 +348,7 @@ set(sources
 	disk_cache.cpp
 	disk_completed_queue.cpp
 	disk_io_thread_pool.cpp
+	disk_tick_thread.cpp
 	disk_job_fence.cpp
 	disk_job_pool.cpp
 	drive_info.cpp
@@ -767,6 +770,19 @@ target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME mutabl
 	DESCRIPTION "Enables mutable torrent support" DISABLED TORRENT_DISABLE_MUTABLE_TORRENTS)
 target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME streaming DEFAULT ON
 	DESCRIPTION "Enables support for piece deadline" DISABLED TORRENT_DISABLE_STREAMING)
+target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME super-seeding DEFAULT ON
+	DESCRIPTION "Enables super seeding feature" DISABLED TORRENT_DISABLE_SUPERSEEDING)
+target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME share-mode DEFAULT ON
+	DESCRIPTION "Enables share-mode feature" DISABLED TORRENT_DISABLE_SHARE_MODE)
+target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME predictive-pieces DEFAULT ON
+	DESCRIPTION "Enables predictive piece announce feature" DISABLED TORRENT_DISABLE_PREDICTIVE_PIECES)
+feature_option(fpic "Force build with -fPIC" OFF)
+target_optional_compile_definitions(torrent-rasterbar PUBLIC FEATURE NAME mmap-disk-io DEFAULT ON
+	DESCRIPTION "Enables mmap disk storage" DISABLED TORRENT_HAVE_MMAP=0 TORRENT_HAVE_MAP_VIEW_OF_FILE=0)
+
+if (fpic)
+	target_compile_options(torrent-rasterbar PRIVATE -fPIC)
+endif()
 
 if(NOT gnutls)
 	find_public_dependency(OpenSSL)

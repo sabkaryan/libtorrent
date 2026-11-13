@@ -13,6 +13,7 @@ see LICENSE file.
 #include "libtorrent/config.hpp"
 
 #include <mutex>
+#include <atomic>
 #include <memory>
 #include <optional>
 
@@ -41,7 +42,8 @@ namespace libtorrent::aux {
 		// constructs the pread_storage based on the given storage_params.
 		// ``file_pool`` is the cache of file handles that the storage will use.
 		// All files it opens will ask the file_pool to open them.
-		pread_storage(storage_params const& params, aux::file_pool&);
+		pread_storage(
+			storage_params const& params, aux::file_pool&, bool disable_hash_checks = false);
 
 		// hidden
 		~pread_storage();
@@ -70,6 +72,13 @@ namespace libtorrent::aux {
 			, piece_index_t piece, int offset, aux::open_mode_t mode
 			, disk_job_flags_t flags
 			, storage_error&);
+		int readv(settings_interface const& sett,
+			span<span<char> const> bufs,
+			piece_index_t const piece,
+			int offset,
+			open_mode_t const mode,
+			disk_job_flags_t const flags,
+			storage_error& error);
 		int write(settings_interface const&, span<char const> buffer
 			, piece_index_t piece, int offset, aux::open_mode_t mode
 			, disk_job_flags_t flags
@@ -90,12 +99,8 @@ namespace libtorrent::aux {
 		file_storage const& files() const { return m_files; }
 		filenames names() const;
 
-		bool set_need_tick()
-		{
-			bool const prev = m_need_tick;
-			m_need_tick = true;
-			return prev;
-		}
+		// returns whether a tick was already pending
+		bool set_need_tick() { return m_need_tick.exchange(true); }
 
 		void do_tick()
 		{
@@ -103,7 +108,7 @@ namespace libtorrent::aux {
 			tick();
 		}
 
-		void set_owner(std::shared_ptr<void> const& tor) { m_torrent = tor; }
+		void set_owner(std::shared_ptr<void> const& owner) { m_owner = owner; }
 
 		storage_index_t storage_index() const { return m_storage_index; }
 		void set_storage_index(storage_index_t st) { m_storage_index = st; }
@@ -118,6 +123,7 @@ namespace libtorrent::aux {
 
 		bool v1() const { return m_v1; }
 		bool v2() const { return m_v2; }
+		bool disable_hash_checks() const { return m_disable_hash_checks; }
 
 		// SHA-256 block hashes deposited by the v2 hash queue
 		// (disk_cache::drain_v2_hash_queue) for later consumption by hash and
@@ -132,17 +138,12 @@ namespace libtorrent::aux {
 		void drop_precomputed_v2(piece_index_t piece);
 
 	private:
-
-		bool m_need_tick = false;
+		std::atomic<bool> m_need_tick{false};
 		file_storage const& m_files;
 
-		// the reason for this to be a void pointer
-		// is to avoid creating a dependency on the
-		// torrent. This shared_ptr is here only
-		// to keep the torrent object alive until
-		// the storage destructs. This is because
-		// the file_storage object is owned by the torrent.
-		std::shared_ptr<void> m_torrent;
+		// keeps whatever owns m_files alive until the storage destructs. It's
+		// opaque to avoid a dependency on the torrent
+		std::shared_ptr<void> m_owner;
 
 		storage_index_t m_storage_index{0};
 
@@ -208,6 +209,9 @@ namespace libtorrent::aux {
 		// this is a v2 torrent. If both v1 and v2 are set, it's a hybrid
 		// torrent
 		bool m_v2;
+		// latched for the lifetime of the storage, it must agree with the
+		// torrent's view of the setting
+		bool m_disable_hash_checks;
 
 		// SHA-256 block hashes deposited by the v2 hash queue
 		// (disk_cache::drain_v2_hash_queue) as each v2 block is hashed in

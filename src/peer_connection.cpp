@@ -26,6 +26,7 @@ see LICENSE file.
 
 #include "libtorrent/config.hpp"
 #include "libtorrent/aux_/peer_connection.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 #include "libtorrent/aux_/merge_block_requests.hpp"
 #include "libtorrent/entry.hpp"
 #include "libtorrent/bencode.hpp"
@@ -57,6 +58,7 @@ see LICENSE file.
 #include "libtorrent/aux_/array.hpp"
 #include "libtorrent/aux_/set_socket_buffer.hpp"
 #include "libtorrent/aux_/set_traffic_class.hpp"
+#include "libtorrent/aux_/scope_end.hpp"
 
 #if TORRENT_USE_ASSERTS
 #include <set>
@@ -105,7 +107,8 @@ namespace {
 		, m_peer_info(pack.peerinfo)
 		, m_counters(*pack.stats_counters)
 		, m_num_pieces(0)
-		, m_max_out_request_queue(aux::clamp_assign<std::uint16_t>(m_settings.get_int(settings_pack::max_out_request_queue)))
+		, m_max_out_request_queue(aux::clamp_assign<std::uint16_t>(
+			  m_settings.get_int(settings_pack::max_out_request_queue)))
 		, m_remote(pack.endp)
 		, m_disk_thread(*pack.disk_thread)
 		, m_ios(*pack.ios)
@@ -132,6 +135,7 @@ namespace {
 		, m_has_metadata(true)
 		, m_exceeded_limit(false)
 		, m_slow_start(true)
+		, m_mutates_send_buffer(false)
 	{
 		m_counters.inc_stats_counter(counters::num_tcp_peers
 			+ static_cast<std::uint8_t>(socket_type_idx(m_socket)));
@@ -452,8 +456,11 @@ namespace {
 
 		if (t && t->alerts().should_post<peer_connect_alert>())
 		{
-			t->alerts().emplace_alert<peer_connect_alert>(
-				t->get_handle(), remote(), pid(), socket_type_idx(m_socket), peer_connect_alert::direction_t::out);
+			t->alerts().emplace_alert<peer_connect_alert>(t->get_handle(),
+				remote_endpoint(),
+				pid(),
+				socket_type_idx(m_socket),
+				peer_connect_alert::direction_t::out);
 		}
 #ifndef TORRENT_DISABLE_LOGGING
 		if (should_log(peer_log_alert::info))
@@ -1202,9 +1209,7 @@ namespace {
 #if TORRENT_USE_I2P
 		if (auto s = std::get_if<i2p_stream>(&m_socket))
 		{
-			// TODO: store the sah256 hash of the destination in the
-			// i2p_peer struct, so we don't have to recompute it every time
-			return hasher256(base64decode_i2p(s->destination())).final();
+			return i2p_destination_hash(s->destination());
 		}
 #endif
 		return m_remote;
@@ -2527,18 +2532,18 @@ namespace {
 		// make sure this request
 		// is legal and that the peer
 		// is not choked
-		if (r.piece < piece_index_t(0)
-			|| r.piece >= t->torrent_file().end_piece()
+		if (r.piece < piece_index_t(0) || r.piece >= t->torrent_file().end_piece()
 			|| (!t->user_have_piece(r.piece)
 #ifndef TORRENT_DISABLE_PREDICTIVE_PIECES
 				&& !t->is_predictive_piece(r.piece)
 #endif
 				&& !t->seed_mode())
-			|| r.start < 0
-			|| r.start >= ti.piece_size(r.piece)
+			|| r.start < 0 || r.start >= ti.piece_size(r.piece)
 			|| r.length <= 0
-			|| r.length + r.start > ti.piece_size(r.piece)
-			|| r.length > t->block_size())
+			// check the length against the block size before adding it to
+			// start. both are peer supplied and a length of INT_MAX would
+			// overflow the sum
+			|| r.length > t->block_size() || r.length + r.start > ti.piece_size(r.piece))
 		{
 			m_counters.inc_stats_counter(counters::invalid_piece_requests);
 
@@ -2594,8 +2599,7 @@ namespace {
 
 		// if we have choked the client
 		// ignore the request
-		int const blocks_per_piece =
-			(ti.piece_length() + t->block_size() - 1) / t->block_size();
+		int const blocks_per_piece = aux::ceil_div(ti.piece_length(), t->block_size());
 
 		// disconnect peers that downloads more than foo times an allowed
 		// fast piece
@@ -2637,6 +2641,7 @@ namespace {
 			TORRENT_ASSERT(r.piece < t->torrent_file().end_piece());
 			TORRENT_ASSERT(r.length <= default_block_size);
 			TORRENT_ASSERT(r.length > 0);
+			TORRENT_ASSERT(!m_iterating_requests);
 
 			m_requests.push_back(r);
 
@@ -2655,6 +2660,11 @@ namespace {
 	void peer_connection::reject_piece(piece_index_t const index)
 	{
 		TORRENT_ASSERT(is_single_thread());
+#if TORRENT_USE_ASSERTS
+		TORRENT_ASSERT(!m_iterating_requests);
+		m_iterating_requests = true;
+		auto const iterating_guard = aux::scope_end([this] { m_iterating_requests = false; });
+#endif
 		for (auto i = m_requests.begin(); i != m_requests.end();)
 		{
 			peer_request const r = *i;
@@ -2779,8 +2789,8 @@ namespace {
 		{
 			if (!t->is_seed())
 			{
-				const int blocks_per_piece = static_cast<int>(
-					(t->torrent_file().piece_length() + t->block_size() - 1) / t->block_size());
+				const int blocks_per_piece =
+					aux::ceil_div(t->torrent_file().piece_length(), t->block_size());
 
 				std::vector<piece_picker::downloading_piece> const& dl_queue
 					= t->picker().get_download_queue();
@@ -2868,8 +2878,11 @@ namespace {
 		{
 			if (t->alerts().should_post<peer_error_alert>())
 			{
-				t->alerts().emplace_alert<peer_error_alert>(t->get_handle(), m_remote
-					, m_peer_id, operation_t::bittorrent, errors::peer_sent_empty_piece);
+				t->alerts().emplace_alert<peer_error_alert>(t->get_handle(),
+					remote_endpoint(),
+					m_peer_id,
+					operation_t::bittorrent,
+					errors::peer_sent_empty_piece);
 			}
 			// This is used as a reject-request by bitcomet
 			incoming_reject_request(p);
@@ -2910,9 +2923,11 @@ namespace {
 		{
 			if (t->alerts().should_post<unwanted_block_alert>())
 			{
-				t->alerts().emplace_alert<unwanted_block_alert>(t->get_handle()
-					, m_remote, m_peer_id, block_finished.block_index
-					, block_finished.piece_index);
+				t->alerts().emplace_alert<unwanted_block_alert>(t->get_handle(),
+					remote_endpoint(),
+					m_peer_id,
+					block_finished.block_index,
+					block_finished.piece_index);
 			}
 #ifndef TORRENT_DISABLE_LOGGING
 			peer_log(peer_log_alert::info, peer_log_alert::invalid_request, "The block we just got was not in the request queue");
@@ -2991,8 +3006,8 @@ namespace {
 			m_snubbed = false;
 			if (t->alerts().should_post<peer_unsnubbed_alert>())
 			{
-				t->alerts().emplace_alert<peer_unsnubbed_alert>(t->get_handle()
-					, m_remote, m_peer_id);
+				t->alerts().emplace_alert<peer_unsnubbed_alert>(
+					t->get_handle(), remote_endpoint(), m_peer_id);
 			}
 		}
 
@@ -3288,8 +3303,10 @@ namespace {
 		if (t->alerts().should_post<block_finished_alert>())
 		{
 			t->alerts().emplace_alert<block_finished_alert>(t->get_handle(),
-				remote(), pid(), block_finished.block_index
-				, block_finished.piece_index);
+				remote_endpoint(),
+				pid(),
+				block_finished.block_index,
+				block_finished.piece_index);
 		}
 
 		disconnect_if_redundant();
@@ -3340,6 +3357,7 @@ namespace {
 #endif
 		if (is_disconnecting()) return;
 
+		TORRENT_ASSERT(!m_iterating_requests);
 		auto const i = std::find(m_requests.begin(), m_requests.end(), r);
 
 		if (i != m_requests.end())
@@ -3712,8 +3730,8 @@ namespace {
 
 		if (t->alerts().should_post<block_downloading_alert>())
 		{
-			t->alerts().emplace_alert<block_downloading_alert>(t->get_handle()
-				, remote(), pid(), block.block_index, block.piece_index);
+			t->alerts().emplace_alert<block_downloading_alert>(
+				t->get_handle(), remote_endpoint(), pid(), block.block_index, block.piece_index);
 		}
 
 		pending_block pb(block);
@@ -3924,6 +3942,11 @@ namespace {
 		m_last_choke.set(m_connect, aux::time_now());
 		m_num_invalid_requests = 0;
 
+#if TORRENT_USE_ASSERTS
+		TORRENT_ASSERT(!m_iterating_requests);
+		m_iterating_requests = true;
+		auto const iterating_guard = aux::scope_end([this] { m_iterating_requests = false; });
+#endif
 		// reject the requests we have in the queue
 		// except the allowed fast pieces
 		for (auto i = m_requests.begin(); i != m_requests.end();)
@@ -4582,14 +4605,18 @@ namespace {
 			if ((error > failure || ec.category() == socks_category())
 				&& alerts.should_post<peer_error_alert>())
 			{
-				alerts.emplace_alert<peer_error_alert>(handle, remote()
-					, pid(), op, ec);
+				alerts.emplace_alert<peer_error_alert>(handle, remote_endpoint(), pid(), op, ec);
 			}
 
 			if (error <= failure && alerts.should_post<peer_disconnected_alert>())
 			{
-				alerts.emplace_alert<peer_disconnected_alert>(handle
-					, remote(), pid(), op, socket_type_idx(m_socket), ec, close_reason);
+				alerts.emplace_alert<peer_disconnected_alert>(handle,
+					remote_endpoint(),
+					pid(),
+					op,
+					socket_type_idx(m_socket),
+					ec,
+					close_reason);
 			}
 		}
 
@@ -5279,8 +5306,8 @@ namespace {
 			m_slow_start = false;
 			if (t->alerts().should_post<peer_snubbed_alert>())
 			{
-				t->alerts().emplace_alert<peer_snubbed_alert>(t->get_handle()
-					, m_remote, m_peer_id);
+				t->alerts().emplace_alert<peer_snubbed_alert>(
+					t->get_handle(), remote_endpoint(), m_peer_id);
 			}
 		}
 		m_desired_queue_size = 1;
@@ -5370,9 +5397,11 @@ namespace {
 
 			if (t->alerts().should_post<block_timeout_alert>())
 			{
-				t->alerts().emplace_alert<block_timeout_alert>(t->get_handle()
-					, remote(), pid(), qe.block.block_index
-					, qe.block.piece_index);
+				t->alerts().emplace_alert<block_timeout_alert>(t->get_handle(),
+					remote_endpoint(),
+					pid(),
+					qe.block.block_index,
+					qe.block.piece_index);
 			}
 
 			// request a new block before removing the previous
@@ -5400,6 +5429,11 @@ namespace {
 	void peer_connection::fill_send_buffer()
 	{
 		TORRENT_ASSERT(is_single_thread());
+#if TORRENT_USE_ASSERTS
+		TORRENT_ASSERT(!m_iterating_requests);
+		m_iterating_requests = true;
+		auto const iterating_guard = aux::scope_end([this] { m_iterating_requests = false; });
+#endif
 #ifdef TORRENT_EXPENSIVE_INVARIANT_CHECKS
 		INVARIANT_CHECK;
 #endif
@@ -5453,9 +5487,16 @@ namespace {
 		// don't just pop the front element here, since in seed mode one request may
 		// be blocked because we have to verify the hash first, so keep going with the
 		// next request. However, only let each peer have one hash verification outstanding
-		// at any given time
-		for (int i = 0; i < int(m_requests.size())
-			&& (send_buffer_size() + m_reading_bytes < buffer_size_watermark); ++i)
+		// at any given time.
+		// The requests this loop reads or rejects leave m_requests in one erase
+		// after it: erasing each one would move all the requests queued behind it
+		// (up to max_allowed_in_request_queue) once per block sent. The ones it
+		// skips are moved down to m_requests[0, keep).
+		int keep = 0;
+		int i = 0;
+		for (; i < int(m_requests.size())
+			 && (send_buffer_size() + m_reading_bytes < buffer_size_watermark);
+			 ++i)
 		{
 			TORRENT_ASSERT(t->ready_for_connections());
 			peer_request const& r = m_requests[i];
@@ -5468,16 +5509,22 @@ namespace {
 
 			bool const seed_mode = t->seed_mode();
 
-			if (seed_mode
-				&& !t->verified_piece(r.piece)
-				&& !m_settings.get_bool(settings_pack::disable_hash_checks))
+			if (seed_mode && !t->verified_piece(r.piece) && !t->disable_hash_checks())
 			{
 				// we're still verifying the hash of this piece
 				// so we can't return it yet.
-				if (t->verifying_piece(r.piece)) continue;
+				if (t->verifying_piece(r.piece))
+				{
+					m_requests[keep++] = r;
+					continue;
+				}
 
 				// only have three outstanding hash check per peer
-				if (m_outstanding_piece_verification >= 3) continue;
+				if (m_outstanding_piece_verification >= 3)
+				{
+					m_requests[keep++] = r;
+					continue;
+				}
 
 				++m_outstanding_piece_verification;
 
@@ -5501,6 +5548,7 @@ namespace {
 				{ conn->wrap(&peer_connection::on_seed_mode_hashed, p, ph, h2, e); });
 
 				t->verifying(r.piece);
+				m_requests[keep++] = r;
 				continue;
 			}
 
@@ -5511,7 +5559,11 @@ namespace {
 				// it very soon, so we have told our peers we have it.
 				// hold off on sending it. If the piece fails later
 				// we will reject this request
-				if (t->is_predictive_piece(r.piece)) continue;
+				if (t->is_predictive_piece(r.piece))
+				{
+					m_requests[keep++] = r;
+					continue;
+				}
 #endif
 #ifndef TORRENT_DISABLE_LOGGING
 				peer_log(peer_log_alert::info, peer_log_alert::piece_failed
@@ -5542,6 +5594,11 @@ namespace {
 				if (read_mode == settings_pack::disable_os_cache)
 					flags |= disk_interface::volatile_read;
 
+				// the block is encrypted in place on its way out, so we cannot
+				// send a buffer the disk subsystem may still hand to someone else
+				if (mutates_send_buffer())
+					flags |= disk_interface::force_copy;
+
 				auto const issue_time = clock_type::now();
 				std::uint16_t const piece_gen = t->piece_generation(r.piece);
 				m_disk_thread.async_read(t->storage(), r
@@ -5550,12 +5607,14 @@ namespace {
 					, flags);
 			}
 			m_last_sent_payload.set(m_connect, clock_type::now());
-			m_requests.erase(m_requests.begin() + i);
+		}
+
+		if (keep < i)
+		{
+			m_requests.erase(m_requests.begin() + keep, m_requests.begin() + i);
 
 			if (m_requests.empty())
 				m_counters.inc_stats_counter(counters::num_peers_up_requests, -1);
-
-			--i;
 		}
 		m_ses.deferred_submit_jobs();
 
@@ -5599,14 +5658,12 @@ namespace {
 #endif
 
 		// we're using the piece hashes here, we need the torrent to be loaded
-		if (!m_settings.get_bool(settings_pack::disable_hash_checks)
-			&& t->info_hash().has_v1() && !t->disable_v1_hashes())
+		if (!t->disable_hash_checks() && t->info_hash().has_v1() && !t->disable_v1_hashes())
 		{
 			hash_failed[protocol_version::V1] = piece_hash != t->torrent_file().hash_for_piece(piece);
 		}
 
-		if (!m_settings.get_bool(settings_pack::disable_hash_checks)
-			&& t->info_hash().has_v2())
+		if (!t->disable_hash_checks() && t->info_hash().has_v2())
 		{
 			hash_failed[protocol_version::V2] = false;
 
@@ -5701,9 +5758,10 @@ namespace {
 		case set_block_hash_result::success:
 		{
 			t->need_picker();
+			TORRENT_ASSERT(result.num_verified >= 0);
 			int const blocks_per_piece = t->torrent_file().layout().blocks_per_piece();
 			for (piece_index_t verified_piece = int(r.piece) + result.first_verified_block / blocks_per_piece
-				, end = int(verified_piece) + (result.num_verified + blocks_per_piece - 1) / blocks_per_piece
+				, end = int(verified_piece) + aux::ceil_div(result.num_verified, blocks_per_piece)
 				; verified_piece < end; ++verified_piece)
 			{
 				if (!t->picker().is_piece_finished(verified_piece)
@@ -6780,8 +6838,8 @@ namespace {
 			// download queue already
 			int outstanding_bytes = 0;
 			int const bs = t->block_size();
-			piece_block last_block(ti.last_piece()
-				, (t->piece_size_for_req(ti.last_piece()) + bs - 1) / bs);
+			piece_block last_block(
+				ti.last_piece(), aux::ceil_div(t->piece_size_for_req(ti.last_piece()), bs));
 
 			for (std::vector<pending_block>::const_iterator i = m_download_queue.begin()
 				, end(m_download_queue.end()); i != end; ++i)

@@ -36,6 +36,7 @@ see LICENSE file.
 #include "libtorrent/aux_/invariant_check.hpp"
 #include "libtorrent/aux_/io_bytes.hpp"
 #include "libtorrent/aux_/io.hpp"
+#include "libtorrent/aux_/ceil_div.hpp"
 #include "libtorrent/aux_/socket_io.hpp"
 #include "libtorrent/extensions.hpp"
 #include "libtorrent/aux_/session_interface.hpp"
@@ -162,6 +163,7 @@ namespace {
 	{
 		if (m_enc_handler.switch_send_crypto(std::move(crypto), send_buffer_size() - get_send_barrier()))
 			set_send_barrier(send_buffer_size());
+		m_mutates_send_buffer = m_enc_handler.mutates_send_buffer();
 	}
 
 	void bt_peer_connection::switch_recv_crypto(std::shared_ptr<crypto_plugin> crypto)
@@ -476,22 +478,7 @@ namespace {
 		{
 			p.flags |= peer_info::i2p_socket;
 			auto const* pi = peer_info_struct();
-			if (pi != nullptr)
-			{
-				try
-				{
-					sha256_hash const b32_addr = hasher256(base64decode_i2p(pi->dest())).final();
-					p.set_i2p_destination(b32_addr);
-				}
-				catch (lt::system_error const&)
-				{
-					p.set_i2p_destination(sha256_hash());
-				}
-			}
-			else
-			{
-				p.set_i2p_destination(sha256_hash());
-			}
+			p.set_i2p_destination(pi != nullptr ? i2p_destination_hash(pi->dest()) : sha256_hash());
 		}
 #endif
 		if (is_utp(get_socket())) p.flags |= peer_info::utp_socket;
@@ -537,7 +524,7 @@ namespace {
 			peer_log(peer_log_alert::info, peer_log_alert::encryption, "initiating encrypted handshake");
 #endif
 
-		m_dh_key_exchange.reset(new dh_key_exchange);
+		m_dh_key_exchange = std::make_unique<dh_key_exchange>();
 
 		int const pad_size = int(random(512));
 
@@ -976,7 +963,8 @@ namespace {
 		// if we don't have the metadata, we cannot
 		// verify the bitfield size
 		if (t->valid_metadata()
-			&& m_recv_buffer.packet_size() - 1 != (t->torrent_file().num_pieces() + CHAR_BIT - 1) / CHAR_BIT)
+			&& m_recv_buffer.packet_size() - 1
+				!= aux::ceil_div(t->torrent_file().num_pieces(), CHAR_BIT))
 		{
 			disconnect(errors::invalid_bitfield_size, operation_t::bittorrent, peer_error);
 			return;
@@ -1250,12 +1238,13 @@ namespace {
 		const char* ptr = recv_buffer.begin() + 1;
 
 		auto const file_root = sha256_hash(ptr);
-		file_index_t const file_index = files.file_index_for_root(file_root);
 		ptr += sha256_hash::size();
 		int const base = aux::read_int32(ptr);
 		int const index = aux::read_int32(ptr);
 		int const count = aux::read_int32(ptr);
 		int const proof_layers = aux::read_int32(ptr);
+		file_index_t const file_index =
+			file_for_hash_response(files, file_root, base, index, count, proof_layers);
 
 		hash_request const hr(file_index, base, index, count, proof_layers);
 
@@ -1342,12 +1331,13 @@ namespace {
 		const char* ptr = recv_buffer.begin() + 1;
 
 		auto const file_root = sha256_hash(ptr);
-		file_index_t const file_index = t->torrent_file().layout().file_index_for_root(file_root);
 		ptr += sha256_hash::size();
 		int const base = aux::read_int32(ptr);
 		int const index = aux::read_int32(ptr);
 		int const count = aux::read_int32(ptr);
 		int const proof_layers = aux::read_int32(ptr);
+		file_index_t const file_index = file_for_hash_response(
+			t->torrent_file().layout(), file_root, base, index, count, proof_layers);
 		hash_request hr(file_index, base, index, count, proof_layers);
 
 #ifndef TORRENT_DISABLE_LOGGING
@@ -1859,6 +1849,28 @@ namespace {
 #endif
 
 		send_buffer(buf);
+	}
+
+	file_index_t bt_peer_connection::file_for_hash_response(file_storage const& fs,
+		sha256_hash const& root,
+		int const base,
+		int const index,
+		int const count,
+		int const proof_layers) const
+	{
+		auto const req = std::find_if(
+			m_hash_requests.begin(), m_hash_requests.end(), [&](hash_request const& r) {
+				return fs.root(r.file) == root && r.base == base && r.index == index
+					&& r.count == count && r.proof_layers == proof_layers;
+			});
+		if (req == m_hash_requests.end())
+			return fs.file_index_for_root(root);
+
+		// torrents where files with the same root differ in size are rejected
+		// when loaded. Requests from peers name only the root, so we couldn't
+		// tell which tree they refer to
+		TORRENT_ASSERT(fs.file_size(req->file) == fs.file_size(fs.file_index_for_root(root)));
+		return req->file;
 	}
 
 	void bt_peer_connection::maybe_send_hash_request()
@@ -2676,14 +2688,10 @@ namespace {
 
 		send_buffer({msg, 13});
 
-		if (buffer.is_mutable())
-		{
-			append_send_buffer(std::move(buffer), r.length);
-		}
-		else
-		{
-			append_const_send_buffer(std::move(buffer), r.length);
-		}
+		// async_read() asks for disk_interface::force_copy whenever this
+		// connection transforms its send buffer in place, so this block is
+		// either exclusively ours to mutate or never written to
+		append_send_buffer(std::move(buffer), r.length);
 
 		m_payloads.emplace_back(send_buffer_size() - r.length, r.length);
 		setup_send();
@@ -3768,6 +3776,10 @@ namespace {
 			peer_log(peer_log_alert::outgoing, peer_log_alert::send_barrier
 				, "encrypted block s = %d", next_barrier);
 #endif
+		// encrypt() retires the last barrier once a bounded encrypted run has
+		// been consumed, which is the other way this connection stops mutating
+		// its send buffer
+		m_mutates_send_buffer = m_enc_handler.mutates_send_buffer();
 		return std::make_tuple(next_barrier, out_iovec);
 	}
 #endif

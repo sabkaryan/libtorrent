@@ -156,13 +156,27 @@ void http_connection::get(std::string const& url, time_duration timeout
 
 	bool const ssl = (protocol == "https");
 
+#if TORRENT_USE_I2P
+	// Keep .i2p requests on SAM, not the configured HTTP proxy.
+	bool const i2p = is_i2p_url(url);
+	if (i2p && i2p_conn == nullptr)
+	{
+		post(m_ios,
+			std::bind(
+				&http_connection::callback, me, error_code(errors::no_i2p_router), span<char>{}));
+		return;
+	}
+#endif
+
 	std::stringstream request;
 
 	// exclude ssl here, because SSL assumes CONNECT support in the
 	// proxy and is handled at the lower layer
-	if (ps && (ps->type == settings_pack::http
-		|| ps->type == settings_pack::http_pw)
-		&& !ssl)
+	if (ps && (ps->type == settings_pack::http || ps->type == settings_pack::http_pw) && !ssl
+#if TORRENT_USE_I2P
+		&& !i2p
+#endif
+	)
 	{
 		// if we're using an http proxy and not an ssl
 		// connection, just do a regular http proxy request
@@ -817,7 +831,13 @@ void http_connection::on_read(error_code const& e
 
 	// if we've hit the limit, double the buffer size
 	if (int(m_recvbuffer.size()) == m_read_pos)
+	{
 		m_recvbuffer.resize(std::min(m_read_pos * 2, m_max_bottled_buffer_size));
+		// the parser refers to the receive buffer, which may just have been
+		// reallocated. Handlers may call get_body() on it if the connection
+		// is closed before the response is finished
+		m_parser.incoming(span<char const>(m_recvbuffer).first(m_read_pos), error);
+	}
 
 	if (m_read_pos == m_max_bottled_buffer_size)
 	{
