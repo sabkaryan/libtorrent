@@ -2491,8 +2491,9 @@ void pread_disk_io::add_completed_jobs_impl(
 
 	// fail the reposted writes the cache rejected, as add_write_to_cache()
 	// does. A fence lowers only once the storage has no outstanding writes or
-	// hashes, so none of its entries should be flushing or hashing here; this
-	// keeps a rejected write from leaking its outstanding-job count if one is
+	// hashes, so none of its entries should be flushing or hashing here, and
+	// no write should be rejected; should one be anyway, it is failed rather
+	// than left holding its outstanding-job count
 	while (!ctx.rejected_writes.empty())
 	{
 		auto* j = static_cast<aux::pread_disk_job*>(ctx.rejected_writes.pop_front());
