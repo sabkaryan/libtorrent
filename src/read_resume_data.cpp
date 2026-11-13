@@ -198,8 +198,10 @@ namespace {
 					}
 					else
 					{
+						// mask has a bit per tree node and verified a bit per
+						// block, neither is bounded by the piece count.
 						ret.verified_leaf_hashes.push_back(
-							bitfield_from_resume(str, std::int64_t(piece_limit) * 2, ec));
+							bitfield_from_resume(str, std::numeric_limits<int>::max(), ec));
 						if (ec)
 							return ret;
 					}
@@ -224,7 +226,7 @@ namespace {
 					else
 					{
 						ret.merkle_tree_mask.push_back(
-							bitfield_from_resume(str, std::int64_t(piece_limit) * 2, ec));
+							bitfield_from_resume(str, std::numeric_limits<int>::max(), ec));
 						if (ec)
 							return ret;
 					}
@@ -251,10 +253,15 @@ namespace {
 		ret.last_download = std::time_t(rd.dict_find_int_value("last_download", 0));
 		ret.last_upload = std::time_t(rd.dict_find_int_value("last_upload", 0));
 
-		// scrape data cache
-		ret.num_complete = int(rd.dict_find_int_value("num_complete", -1));
-		ret.num_incomplete = int(rd.dict_find_int_value("num_incomplete", -1));
-		ret.num_downloaded = int(rd.dict_find_int_value("num_downloaded", -1));
+		// scrape data cache. Older versions wrote the internal 24-bit "unknown"
+		// sentinel (0xffffff) verbatim instead of -1
+		auto const read_scrape = [&rd](char const* key) {
+			std::int64_t const v = rd.dict_find_int_value(key, -1);
+			return (v < 0 || v >= 0xffffff) ? -1 : int(v);
+		};
+		ret.num_complete = read_scrape("num_complete");
+		ret.num_incomplete = read_scrape("num_incomplete");
+		ret.num_downloaded = read_scrape("num_downloaded");
 
 		// torrent settings
 		ret.max_uploads = int(rd.dict_find_int_value("max_uploads", -1));

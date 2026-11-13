@@ -2063,16 +2063,22 @@ namespace {
 		// upload_only
 		if (bdecode_node const m = root.dict_find_dict("m"))
 		{
-			m_upload_only_id = std::uint8_t(m.dict_find_int_value("upload_only", 0));
-			m_holepunch_id = std::uint8_t(m.dict_find_int_value("ut_holepunch", 0));
-			m_dont_have_id = std::uint8_t(m.dict_find_int_value("lt_donthave", 0));
+			// extension message IDs are a single byte on the wire. An ID
+			// that doesn't fit is treated as the extension being disabled
+			auto const ext_id = [&m](string_view const name) {
+				std::int64_t const id = m.dict_find_int_value(name, 0);
+				return (id > 0 && id <= 255) ? std::uint8_t(id) : std::uint8_t(0);
+			};
+			m_upload_only_id = ext_id("upload_only");
+			m_holepunch_id = ext_id("ut_holepunch");
+			m_dont_have_id = ext_id("lt_donthave");
 		}
 
 		// there is supposed to be a remote listen port
-		int const listen_port = int(root.dict_find_int_value("p"));
-		if (listen_port > 0 && peer_info_struct() != nullptr)
+		std::int64_t const listen_port = root.dict_find_int_value("p");
+		if (listen_port > 0 && listen_port <= 65535 && peer_info_struct() != nullptr
+			&& t->update_peer_port(int(listen_port), peer_info_struct(), peer_info::incoming))
 		{
-			t->update_peer_port(listen_port, peer_info_struct(), peer_info::incoming);
 			received_listen_port();
 			if (is_disconnecting()) return;
 		}
@@ -2229,7 +2235,7 @@ namespace {
 			int const counter = (packet_type <= msg_dht_port)
 				? counters::num_incoming_choke + packet_type
 				: (packet_type <= msg_allowed_fast)
-				? counters::num_incoming_suggest + packet_type
+				? counters::num_incoming_suggest + packet_type - msg_suggest_piece
 				: counters::num_incoming_extended;
 
 			stats_counters().inc_stats_counter(counter);

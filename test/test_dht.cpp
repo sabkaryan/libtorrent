@@ -40,6 +40,7 @@ see LICENSE file.
 #include "libtorrent/kademlia/dht_observer.hpp"
 #include "libtorrent/kademlia/dht_tracker.hpp"
 
+#include <array>
 #include <limits>
 #include <numeric>
 #include <cstdarg>
@@ -227,6 +228,12 @@ struct msg_args
 
 	msg_args& sig(signature const& s)
 	{ a["sig"] = s.bytes; return *this; }
+
+	msg_args& raw_sig(std::string s)
+	{
+		a["sig"] = std::move(s);
+		return *this;
+	}
 
 	msg_args& seq(sequence_number s)
 	{ a["seq"] = s.value; return *this; }
@@ -1203,6 +1210,33 @@ namespace {
 
 span<char const> const empty_salt;
 
+// a rejected put is answered with an error message carrying the given code
+void expect_put_error(bdecode_node const& response, int const code)
+{
+	key_desc_t const desc_error[] = {
+		{"e", bdecode_node::list_t, 2, 0},
+		{"y", bdecode_node::string_t, 1, 0},
+	};
+	bdecode_node desc_error_keys[2];
+	std::array<char, 200> error_string;
+
+	bool const ret = verify_message(response, desc_error, desc_error_keys, error_string);
+	if (ret)
+	{
+		std::printf("put response: %s\n", print_entry(response).c_str());
+		TEST_EQUAL(desc_error_keys[1].string_value(), "e");
+		TEST_EQUAL(desc_error_keys[0].list_int_value_at(0), code);
+	}
+	else
+	{
+		std::printf("   invalid put response: %s\n%s\nexpected error %d\n",
+			error_string.data(),
+			print_entry(response).c_str(),
+			code);
+		TEST_ERROR(error_string.data());
+	}
+}
+
 // TODO: 3 split this up into smaller tests
 void test_put(address(&rand_addr)())
 {
@@ -1226,14 +1260,6 @@ void test_put(address(&rand_addr)())
 	};
 
 	bdecode_node desc2_keys[1];
-
-	key_desc_t const desc_error[] =
-	{
-		{ "e", bdecode_node::list_t, 2, 0 },
-		{ "y", bdecode_node::string_t, 1, 0},
-	};
-
-	bdecode_node desc_error_keys[2];
 
 	// ==== get / put mutable items ===
 
@@ -1389,19 +1415,93 @@ void test_put(address(&rand_addr)())
 				.seq(seq)
 				.salt(salt));
 
-		ret = verify_message(response, desc_error, desc_error_keys, t.error_string);
-		if (ret)
+		// 206 is the code for invalid signature
+		expect_put_error(response, 206);
+
+		// a put with only some of seq, k and sig is neither a mutable nor an
+		// immutable put. It must be rejected as a protocol error rather than
+		// stored as an immutable item with the key and signature ignored
+		std::printf("PUT key without signature\n");
+
+		send_dht_request(t.dht_node,
+			"put",
+			t.source,
+			&response,
+			msg_args().token(token).value(items[1].ent).key(pk).salt(salt));
+
+		expect_put_error(response, 203);
+
+		send_dht_request(t.dht_node, "get", t.source, &response, msg_args().target(target_id));
+		// the same with a token issued for the immutable target, which is
+		// what would have stored it as an immutable item. Use a value that is
+		// not among the items announced during setup, so its immutable target
+		// is known to be empty regardless of which of those items were evicted
+		std::printf("PUT key and seq without signature\n");
+
 		{
-			std::printf("put response: %s\n", print_entry(response).c_str());
-			TEST_EQUAL(desc_error_keys[1].string_value(), "e");
-			// 206 is the code for invalid signature
-			TEST_EQUAL(desc_error_keys[0].list_int_value_at(0), 206);
+			entry unstored_value;
+			unstored_value["unstored"] = "value";
+
+			std::array<char, 1020> value_buf;
+			span<char const> const immutable_v =
+				span<char const>(value_buf).first(bencode(value_buf.begin(), unstored_value));
+			sha1_hash const immutable_target = item_target_id(immutable_v);
+
+			send_dht_request(
+				t.dht_node, "get", t.source, &response, msg_args().target(immutable_target));
+
+			bdecode_node const r = response.dict_find_dict("r");
+			TEST_CHECK(!r.dict_find("v"));
+			std::string const immutable_token(r.dict_find_string_value("token"));
+
+			send_dht_request(t.dht_node,
+				"put",
+				t.source,
+				&response,
+				msg_args()
+					.token(immutable_token)
+					.value(unstored_value)
+					.key(pk)
+					.seq(seq)
+					.salt(salt));
+
+			expect_put_error(response, 203);
+
+			send_dht_request(
+				t.dht_node, "get", t.source, &response, msg_args().target(immutable_target));
+
+			TEST_CHECK(!response.dict_find_dict("r").dict_find("v"));
+
+			// a signature of the wrong length must be rejected by the message
+			// parser rather than turn the message into an immutable put
+			std::printf("PUT with truncated signature\n");
+
+			send_dht_request(t.dht_node,
+				"put",
+				t.source,
+				&response,
+				msg_args()
+					.token(immutable_token)
+					.value(unstored_value)
+					.key(pk)
+					.seq(seq)
+					.raw_sig(std::string(signature::len - 1, 'x'))
+					.salt(salt));
+
+			expect_put_error(response, 203);
+
+			send_dht_request(
+				t.dht_node, "get", t.source, &response, msg_args().target(immutable_target));
+
+			TEST_CHECK(!response.dict_find_dict("r").dict_find("v"));
 		}
-		else
+
+		send_dht_request(t.dht_node, "get", t.source, &response, msg_args().target(target_id));
+
 		{
-			std::printf("   invalid put response: %s\n%s\n"
-				, t.error_string, print_entry(response).c_str());
-			TEST_ERROR(t.error_string);
+			bdecode_node const r = response.dict_find_dict("r");
+			TEST_CHECK(r.dict_find("sig"));
+			TEST_EQUAL(r.dict_find_int_value("seq"), seq.value);
 		}
 
 		// === test conditional get ===
@@ -1481,21 +1581,8 @@ void test_put(address(&rand_addr)())
 				.cas(cas)
 				.salt(salt));
 
-		ret = verify_message(response, desc_error, desc_error_keys, t.error_string);
-		if (ret)
-		{
-			std::printf("put response: %s\n"
-				, print_entry(response).c_str());
-			TEST_EQUAL(desc_error_keys[1].string_value(), "e");
-			// 301 is the error code for CAS hash mismatch
-			TEST_EQUAL(desc_error_keys[0].list_int_value_at(0), 301);
-		}
-		else
-		{
-			std::printf("   invalid put response: %s\n%s\nExpected failure 301 (CAS hash mismatch)\n"
-				, t.error_string, print_entry(response).c_str());
-			TEST_ERROR(t.error_string);
-		}
+		// 301 is the error code for CAS hash mismatch
+		expect_put_error(response, 301);
 	}
 }
 
@@ -1787,14 +1874,18 @@ void test_bootstrap(address(&rand_addr)())
 	}
 
 	udp::endpoint found_node(rand_addr(), 2235);
+	// the response also lists our own node ID, which must not be queried
+	udp::endpoint self_node(rand_addr(), 2236);
 	std::vector<node_entry> nodes;
 	nodes.push_back(node_entry{found_node});
+	nodes.push_back(node_entry{t.dht_node.nid(), self_node});
 	g_sent_packets.clear();
 	if (aux::is_v4(initial_node))
 		send_dht_response(t.dht_node, response, initial_node, msg_args().nodes(nodes));
 	else
 		send_dht_response(t.dht_node, response, initial_node, msg_args().nodes6(nodes));
 
+	TEST_CHECK(find_packet(self_node) == g_sent_packets.end());
 	TEST_EQUAL(g_sent_packets.size(), 1);
 	if (g_sent_packets.empty()) return;
 	TEST_EQUAL(g_sent_packets.front().first, found_node);
@@ -2931,6 +3022,60 @@ TORRENT_TEST(verify_message)
 	std::printf("%s\n", error_string);
 	TEST_EQUAL(error_string, std::string("missing 'C2' key"));
 
+	// an optional key with the wrong type is treated as absent
+	char const test_msg5b[] = "d1:A4:test1:C3:fooe";
+	bdecode(test_msg5b, test_msg5b + sizeof(test_msg5b) - 1, ent, ec);
+	std::printf("%s\n", print_entry(ent).c_str());
+
+	ret = verify_message(ent, msg_desc, msg_keys, error_string);
+	TEST_CHECK(ret);
+	TEST_CHECK(msg_keys[0]);
+	TEST_CHECK(!msg_keys[4]);
+	TEST_CHECK(!msg_keys[5]);
+	TEST_CHECK(!msg_keys[6]);
+
+	{
+		static std::array<key_desc_t, 2> const opt_desc{{
+			{"A", bdecode_node::string_t, 4, key_desc_t::optional},
+			{"B", bdecode_node::int_t, 0, key_desc_t::optional},
+		}};
+		static std::array<key_desc_t, 2> const strict_desc{{
+			{"A", bdecode_node::string_t, 4, key_desc_t::optional | key_desc_t::reject_invalid},
+			{"B", bdecode_node::int_t, 0, key_desc_t::optional | key_desc_t::reject_invalid},
+		}};
+		std::array<bdecode_node, 2> opt_keys;
+
+		// wrong size
+		char const test_msg5c[] = "d1:A3:fooe";
+		bdecode(test_msg5c, test_msg5c + sizeof(test_msg5c) - 1, ent, ec);
+		ret = verify_message_impl(ent, opt_desc, opt_keys, error_string);
+		TEST_CHECK(ret);
+		TEST_CHECK(!opt_keys[0]);
+
+		ret = verify_message_impl(ent, strict_desc, opt_keys, error_string);
+		TEST_CHECK(!ret);
+		TEST_EQUAL(error_string, std::string("invalid value for 'A'"));
+
+		// wrong type
+		char const test_msg5d[] = "d1:B3:fooe";
+		bdecode(test_msg5d, test_msg5d + sizeof(test_msg5d) - 1, ent, ec);
+		ret = verify_message_impl(ent, opt_desc, opt_keys, error_string);
+		TEST_CHECK(ret);
+		TEST_CHECK(!opt_keys[1]);
+
+		ret = verify_message_impl(ent, strict_desc, opt_keys, error_string);
+		TEST_CHECK(!ret);
+		TEST_EQUAL(error_string, std::string("invalid value for 'B'"));
+
+		// absent is fine either way
+		char const test_msg5e[] = "d1:C3:fooe";
+		bdecode(test_msg5e, test_msg5e + sizeof(test_msg5e) - 1, ent, ec);
+		ret = verify_message_impl(ent, strict_desc, opt_keys, error_string);
+		TEST_CHECK(ret);
+		TEST_CHECK(!opt_keys[0]);
+		TEST_CHECK(!opt_keys[1]);
+	}
+
 	// test empty strings [ { "":1 }, "" ]
 	char const test_msg6[] = "ld0:i1ee0:e";
 	bdecode(test_msg6, test_msg6 + sizeof(test_msg6)-1, ent, ec);
@@ -2991,6 +3136,30 @@ TORRENT_TEST(routing_table_uniform)
 	TEST_EQUAL(tbl.num_active_buckets(), 6);
 
 	print_state(std::cout, tbl);
+}
+
+TORRENT_TEST(routing_table_depth)
+{
+	auto sett = test_settings();
+	obs observer;
+
+	sett.set_bool(settings_pack::dht_extended_routing_table, false);
+	sett.set_bool(settings_pack::dht_prefer_verified_node_ids, false);
+	node_id id = to_hash("1234876923549721020394873245098347598635");
+
+	routing_table tbl(id, udp::v4(), 8, sett, &observer);
+
+	// asking for the depth of the empty table must not prevent it from
+	// growing once nodes are added
+	TEST_EQUAL(tbl.depth(), -1);
+
+	for (int i = 255; i >= 0; --i)
+	{
+		id[0] ^= i;
+		tbl.node_seen(id, rand_udp_ep(), 20 + (id[19] & 0xff));
+		id[0] ^= i;
+	}
+	TEST_CHECK(tbl.depth() > 0);
 }
 
 TORRENT_TEST(routing_table_balance)
@@ -3139,6 +3308,52 @@ TORRENT_TEST(routing_table_for_each)
 	v.clear();
 	tbl.for_each_node([&](node_entry const& e) { v.push_back(e); });
 	TEST_EQUAL(v.size(), 8);
+}
+
+TORRENT_TEST(routing_table_split_keeps_replacements)
+{
+	auto sett = test_settings();
+	obs observer;
+
+	sett.set_bool(settings_pack::dht_extended_routing_table, false);
+	sett.set_bool(settings_pack::dht_prefer_verified_node_ids, false);
+	sett.set_bool(settings_pack::dht_restrict_routing_ips, false);
+	node_id const id = to_hash("0100000000000000000000000000000000000000");
+	node_id const replacement = to_hash("2000000000000000000000000000000000000000");
+	udp::endpoint const shared(addr4("3.3.3.3"), 1);
+
+	routing_table tbl(id, udp::v4(), 2, sett, &observer);
+
+	// fill the only bucket with nodes from the far half
+	tbl.node_seen(to_hash("8000000000000000000000000000000000000000"),
+		udp::endpoint(addr4("1.1.1.1"), 1),
+		10);
+	tbl.node_seen(to_hash("9000000000000000000000000000000000000000"), shared, 10);
+
+	// a node with an unknown ID behind the same endpoint, and a replacement
+	// from the near half
+	tbl.heard_about(node_id(), shared);
+	tbl.heard_about(replacement, udp::endpoint(addr4("4.4.4.4"), 1));
+
+	// a node from the near half splits the bucket, moving the replacement to
+	// the new bucket, but is itself rejected for changing the ID of the node at
+	// the shared endpoint. The new bucket has no live nodes, but it must keep
+	// its replacement
+	tbl.node_seen(to_hash("3000000000000000000000000000000000000000"), shared, 10);
+
+	int nodes;
+	int replacements;
+	std::tie(nodes, replacements, std::ignore) = tbl.size();
+	TEST_EQUAL(nodes, 1);
+	TEST_EQUAL(replacements, 1);
+
+	std::vector<node_entry> v;
+	tbl.for_each_node(nullptr, [&](node_entry const& e) { v.push_back(e); });
+	TEST_EQUAL(v.size(), 1);
+	if (v.size() == 1)
+		TEST_CHECK(v[0].id == replacement);
+
+	print_state(std::cout, tbl);
 }
 
 TORRENT_TEST(node_set_id)
@@ -3311,6 +3526,44 @@ TORRENT_TEST(rpc_reply_ignores_wrong_port)
 
 	incoming_rpc_message(rpc, response, source, &nid);
 	TEST_EQUAL(nid, response_id);
+}
+
+// a request that's not part of a traversal's results (like the pings sent to
+// refresh the routing table) must only report its short timeout once, and the
+// short timeout must not count as a failure
+TORRENT_TEST(rpc_short_timeout_once)
+{
+	dht_test_setup t(udp::endpoint(addr("10.0.0.1"), 20));
+
+	node_id const id = generate_next();
+	udp::endpoint const ep(addr("10.0.0.2"), 21);
+	t.dht_node.m_table.add_node(node_entry{id, ep, 10, true});
+
+	entry req;
+	req["q"] = "ping";
+
+	g_sent_packets.clear();
+	auto algo = std::make_shared<dht::traversal_algorithm>(t.dht_node, node_id());
+	auto o = t.dht_node.m_rpc.allocate_observer<null_observer>(std::move(algo), ep, id);
+#if TORRENT_USE_ASSERTS
+	o->m_in_constructor = false;
+#endif
+	o->flags |= observer::flag_queried;
+	TEST_CHECK(t.dht_node.m_rpc.invoke(req, ep, o));
+
+	// past the short timeout, but not the full timeout
+	std::this_thread::sleep_for(milliseconds(1100));
+	for (int i = 0; i < 3; ++i)
+		t.dht_node.connection_timeout();
+
+	int fail_count = -1;
+	t.dht_node.m_table.for_each_node([&](node_entry const& e) {
+		if (e.id == id)
+			fail_count = e.fail_count();
+	});
+	std::printf("fail count: %d\n", fail_count);
+	TEST_EQUAL(fail_count, 0);
+	TEST_CHECK(o->has_short_timeout());
 }
 
 #ifndef TORRENT_DISABLE_LOGGING

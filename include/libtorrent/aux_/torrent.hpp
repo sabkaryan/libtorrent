@@ -180,6 +180,11 @@ namespace libtorrent::aux {
 		// web seed from resolving to any local network IPs.
 		bool no_local_ips = false;
 
+		// the number of redirects that led to this web seed. 0 for the web
+		// seeds that weren't created by a redirect. There's a limit to how
+		// long a chain of redirects we follow
+		std::uint8_t redirect_depth = 0;
+
 		// This means we want to preserve the web seed in resume data, but not
 		// use it for the remainder of this session. For example:
 		// this web seed maye have responded with a redirect. The redirected
@@ -219,6 +224,7 @@ namespace libtorrent::aux {
 			removed = std::move(rhs.removed);
 			ephemeral = std::move(rhs.ephemeral);
 			no_local_ips = std::move(rhs.no_local_ips);
+			redirect_depth = std::move(rhs.redirect_depth);
 			disabled = std::move(rhs.disabled);
 			restart_request = std::move(rhs.restart_request);
 			restart_piece = std::move(rhs.restart_piece);
@@ -243,6 +249,13 @@ namespace libtorrent::aux {
 		seconds32 get(time_point32 const now) const
 		{
 			return m_live ? m_total + duration_cast<seconds32>(now - m_anchor) : m_total;
+		}
+
+		// the duration of the current live segment only, excluding
+		// previously accumulated time
+		seconds32 live_for(time_point32 const now) const
+		{
+			return m_live ? duration_cast<seconds32>(now - m_anchor) : seconds32(0);
 		}
 
 		void set_live(bool const live, time_point32 const now)
@@ -738,6 +751,14 @@ namespace libtorrent::aux {
 			, web_seed_t::headers_t const& extra_headers = web_seed_entry::headers_t()
 			, web_seed_flag_t flags = {});
 
+		// same as add_web_seed(), for a URL another web seed redirected to.
+		// redirect_depth is the number of redirects that led to it
+		web_seed_t* add_web_seed_redirect(std::string const& url,
+			std::string const& auth,
+			web_seed_t::headers_t const& extra_headers,
+			web_seed_flag_t flags,
+			int redirect_depth);
+
 		void remove_web_seed(std::string const& url);
 
 		void retry_web_seed(peer_connection* p, std::optional<seconds32> retry = std::nullopt);
@@ -786,7 +807,8 @@ namespace libtorrent::aux {
 		torrent_peer* add_peer(tcp::endpoint const& adr
 			, peer_source_flags_t source, pex_flags_t flags = {});
 		bool ban_peer(torrent_peer* tp);
-		void update_peer_port(int port, torrent_peer* p, peer_source_flags_t src);
+		// returns false if the port was not accepted
+		bool update_peer_port(int port, torrent_peer* p, peer_source_flags_t src);
 		void set_seed(torrent_peer* p, bool s);
 		void set_upload_only(torrent_peer* p, bool s);
 		void clear_failcount(torrent_peer* p);

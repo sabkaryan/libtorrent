@@ -1575,6 +1575,8 @@ namespace {
 		auto t = m_torrent.lock();
 		piece_picker& picker = t->picker();
 		aux::torrent_peer* self_peer = peer_info_struct();
+		if (!m_download_queue.empty())
+			m_counters.inc_stats_counter(counters::num_peers_down_requests, -1);
 		while (!m_download_queue.empty())
 		{
 			pending_block& qe = m_download_queue.back();
@@ -3576,6 +3578,19 @@ namespace {
 				return;
 		}
 
+		// the peer decides how many pieces it allows us to request while
+		// choked, but there's a limit to how many of them we keep track of
+		if (int(m_allowed_fast.size()) >= 30)
+		{
+#ifndef TORRENT_DISABLE_LOGGING
+			peer_log(peer_log_alert::incoming_message,
+				peer_log_alert::invalid_allowed_fast,
+				"%d (too many pieces)",
+				static_cast<int>(index));
+#endif
+			return;
+		}
+
 		// if we don't have the metadata, we'll verify
 		// this piece index later
 		m_allowed_fast.push_back(index);
@@ -4635,6 +4650,12 @@ namespace {
 				}
 			}
 
+			if (!m_requests.empty())
+			{
+				m_counters.inc_stats_counter(counters::num_peers_up_requests, -1);
+				m_requests.clear();
+			}
+
 			if (t->has_picker())
 			{
 				clear_download_queue();
@@ -4649,7 +4670,11 @@ namespace {
 			}
 			else
 			{
-				m_download_queue.clear();
+				if (!m_download_queue.empty())
+				{
+					m_counters.inc_stats_counter(counters::num_peers_down_requests, -1);
+					m_download_queue.clear();
+				}
 				m_request_queue.clear();
 				m_outstanding_bytes = 0;
 			}
@@ -4675,6 +4700,7 @@ namespace {
 		{
 			TORRENT_ASSERT(m_download_queue.empty());
 			TORRENT_ASSERT(m_request_queue.empty());
+			TORRENT_ASSERT(m_requests.empty());
 			m_ses.close_connection(this);
 		}
 
@@ -5478,8 +5504,10 @@ namespace {
 #ifndef TORRENT_DISABLE_LOGGING
 			peer_log(peer_log_alert::info, peer_log_alert::torrent_aborted);
 #endif
+			TORRENT_ASSERT(!m_requests.empty());
 			for (peer_request const& r : m_requests)
 				write_reject_request(r);
+			m_counters.inc_stats_counter(counters::num_peers_up_requests, -1);
 			m_requests.clear();
 			return;
 		}
