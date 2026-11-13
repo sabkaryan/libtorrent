@@ -16,7 +16,9 @@ see LICENSE file.
 #include "libtorrent/torrent_status.hpp"
 #include "libtorrent/torrent_flags.hpp"
 #include "libtorrent/settings_pack.hpp"
+#include "libtorrent/session_stats.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <functional>
@@ -103,6 +105,10 @@ struct reconnect_times
 	// connect candidates and known peers right after `resume`
 	int candidates = -1;
 	int list_peers = -1;
+	// the most connect candidates seen between `dropped` and `resumed`
+	int candidates_dropped = -1;
+	// peer.no_peer_connection_attempts of the session when `resume` is called
+	std::int64_t no_peer_attempts = -1;
 	// the pieces it had when it was finished again, of num_pieces
 	int pieces = -1;
 	int num_pieces = -1;
@@ -170,6 +176,12 @@ std::vector<reconnect_times> run_finished_reconnect(int const min_reconnect_time
 	for (int i = num_pieces / 2; i < num_pieces; ++i)
 		atp.piece_priorities[std::size_t(i)] = lt::dont_download;
 
+	std::vector<reconnect_times> rs(1);
+	int const no_peer_idx = lt::find_metric_idx("peer.no_peer_connection_attempts");
+	TEST_CHECK(no_peer_idx >= 0);
+	// the cycle whose `resume` posted the session stats
+	std::size_t stats_cycle = 0;
+
 	torrent_handle h;
 	print_alerts(*ses, [&](lt::session&, lt::alert const* a) {
 		if (auto const* ta = alert_cast<add_torrent_alert>(a))
@@ -177,10 +189,14 @@ std::vector<reconnect_times> run_finished_reconnect(int const min_reconnect_time
 			h = ta->handle;
 			h.connect_peer(tcp::endpoint(addr("60.0.0.1"), 6881));
 		}
+		else if (auto const* ss = alert_cast<session_stats_alert>(a))
+		{
+			if (no_peer_idx >= 0 && stats_cycle < rs.size())
+				rs[stats_cycle].no_peer_attempts = ss->counters()[no_peer_idx];
+		}
 	});
 	ses->async_add_torrent(atp);
 
-	std::vector<reconnect_times> rs(1);
 	rs.back().num_pieces = num_pieces;
 	// drop_by::pause: the torrent of this cycle was paused
 	bool paused = false;
@@ -215,8 +231,12 @@ std::vector<reconnect_times> run_finished_reconnect(int const min_reconnect_time
 				r.dropped = now;
 				if (drop == drop_by::pause) h.resume();
 			}
+			if (r.dropped >= 0 && r.resumed < 0)
+				r.candidates_dropped = std::max(r.candidates_dropped, st.connect_candidates);
 			if (r.dropped >= 0 && r.resumed < 0 && now - r.dropped >= resume_delay)
 			{
+				stats_cycle = rs.size() - 1;
+				ses->post_session_stats();
 				resume(h, num_pieces, int(rs.size()) - 1);
 				r.resumed = now;
 				lt::torrent_status const after = h.status();
@@ -254,9 +274,10 @@ std::vector<reconnect_times> run_finished_reconnect(int const min_reconnect_time
 	{
 		reconnect_times const& r = rs[i];
 		std::fprintf(stderr, "RESULT cycle=%d finished=%.1f dropped=%.1f resumed=%.1f candidates=%d"
-			" list_peers=%d reconnected=%.1f complete=%.1f pieces=%d/%d\n", int(i), r.finished
-			, r.dropped, r.resumed, r.candidates, r.list_peers, r.reconnected, r.complete, r.pieces
-			, r.num_pieces);
+			" list_peers=%d candidates_dropped=%d no_peer_attempts=%lld reconnected=%.1f complete=%.1f"
+			" pieces=%d/%d\n", int(i), r.finished, r.dropped, r.resumed, r.candidates, r.list_peers
+			, r.candidates_dropped, static_cast<long long>(r.no_peer_attempts), r.reconnected
+			, r.complete, r.pieces, r.num_pieces);
 	}
 	rs.resize(std::size_t(cycles));
 	return rs;
@@ -395,4 +416,22 @@ TORRENT_TEST(finished_reconnect_after_pause_three_cycles)
 		TEST_CHECK(r.complete >= 0);
 		TEST_EQUAL(r.pieces, r.num_pieces / 2);
 	}
+}
+
+// the other direction: a torrent that becomes finished stops counting the
+// seeds it knows as connect candidates right away. Otherwise the seed it
+// drops when it finishes counts as one, and the torrent tries to connect
+// with nobody to connect to until a connect attempt refreshes the count
+TORRENT_TEST(finished_counts_no_candidate)
+{
+	reconnect_times const r = run_finished_reconnect(1, 3, 3
+		, [](torrent_handle const&, int, int) {}).front();
+	TEST_CHECK(r.finished >= 0);
+	TEST_CHECK(r.dropped >= 0);
+	TEST_CHECK(r.resumed >= 0);
+	TEST_EQUAL(r.list_peers, 1);
+	TEST_EQUAL(r.candidates, 0);
+	TEST_EQUAL(r.candidates_dropped, 0);
+	TEST_EQUAL(r.no_peer_attempts, 0);
+	TEST_CHECK(r.reconnected < 0);
 }
