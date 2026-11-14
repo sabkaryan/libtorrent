@@ -10,7 +10,6 @@ see LICENSE file.
 #include <algorithm>
 #include <array>
 #include <functional>
-#include <limits>
 #include <string>
 #include <vector>
 
