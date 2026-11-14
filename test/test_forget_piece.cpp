@@ -205,10 +205,12 @@ struct forget_state
 
 // forgets every piece as soon as it passes the hash check, on the network
 // thread, and punches it out right away if forget_piece() accepted it. This is
-// the earliest a client could possibly do it.
+// the earliest a client could possibly do it. The torrent owns its plugins, so
+// the plugin refers to it weakly: a strong reference would keep both alive
+// forever
 struct forget_on_pass final : torrent_plugin
 {
-	forget_on_pass(std::shared_ptr<aux::torrent> t, io_context& ioc
+	forget_on_pass(std::weak_ptr<aux::torrent> t, io_context& ioc
 		, std::string file, std::shared_ptr<forget_state> s)
 		: m_torrent(std::move(t)), m_ioc(ioc), m_file(std::move(file)), m_state(std::move(s))
 	{}
@@ -217,8 +219,10 @@ struct forget_on_pass final : torrent_plugin
 	{
 		// on_piece_pass() is called from within torrent::we_have(); run
 		// forget_piece() right after it returns instead of re-entering it
-		post(m_ioc, [t = m_torrent, p, file = m_file, state = m_state]
+		post(m_ioc, [w = m_torrent, p, file = m_file, state = m_state]
 		{
+			auto const t = w.lock();
+			if (!t) return;
 			int const r = t->forget_piece(p);
 			std::lock_guard<std::mutex> l(state->mutex);
 			++state->passed;
@@ -236,7 +240,7 @@ struct forget_on_pass final : torrent_plugin
 		});
 	}
 
-	std::shared_ptr<aux::torrent> m_torrent;
+	std::weak_ptr<aux::torrent> m_torrent;
 	io_context& m_ioc;
 	std::string m_file;
 	std::shared_ptr<forget_state> m_state;
