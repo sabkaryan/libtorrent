@@ -1067,7 +1067,8 @@ namespace {
 		return m_requests;
 	}
 
-	time_duration peer_connection::download_queue_time(int const extra_bytes) const
+	time_duration peer_connection::download_queue_time(int const extra_bytes
+		, bool const time_critical_only) const
 	{
 		TORRENT_ASSERT(is_single_thread());
 		auto t = m_torrent.lock();
@@ -1076,7 +1077,8 @@ namespace {
 		int const rate = download_rate_estimate();
 
 		// Convert all outstanding bytes to milliseconds, including sent requests.
-		return milliseconds((std::int64_t(m_outstanding_bytes) + extra_bytes
+		std::int64_t const sent = time_critical_only ? 0 : std::int64_t(m_outstanding_bytes);
+		return milliseconds((sent + extra_bytes
 								+ std::int64_t(m_queued_time_critical) * t->block_size())
 			* 1000 / rate);
 	}

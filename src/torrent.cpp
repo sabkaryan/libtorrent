@@ -11639,9 +11639,12 @@ namespace {
 		// loop until every block has been requested from this piece (i->piece)
 		do
 		{
-			// if this peer's download time exceeds 2 seconds, we're done.
-			// We don't want to build unreasonably long request queues
-			if (!peers.empty() && peers[0]->download_queue_time() > milliseconds(2000))
+			// if this peer's time critical requests not yet sent would take
+			// more than 2 seconds, we're done. We don't want to build
+			// unreasonably long request queues. Requests already sent are not
+			// counted: a peer's pipeline is normally request_queue_time deep,
+			// and counting it would stop re-requesting blocks of a stalled piece
+			if (!peers.empty() && peers[0]->download_queue_time(0, true) > milliseconds(2000))
 			{
 #if TORRENT_DEBUG_STREAMING > 1
 				std::printf("queue time: %d ms, done\n"
@@ -11988,9 +11991,8 @@ namespace {
 					{ return lhs->download_queue_time(16*1024) < rhs->download_queue_time(16*1024); });
 			}
 
-			// if this peer's download time exceeds 2 seconds, we're done.
-			// We don't want to build unreasonably long request queues
-			if (!peers.empty() && peers[0]->download_queue_time() > milliseconds(2000))
+			// see the same check in pick_time_critical_block()
+			if (!peers.empty() && peers[0]->download_queue_time(0, true) > milliseconds(2000))
 				break;
 		}
 

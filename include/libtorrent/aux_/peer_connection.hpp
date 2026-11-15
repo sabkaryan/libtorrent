@@ -418,8 +418,10 @@ namespace libtorrent::aux {
 		// estimate of how long it will take until we have
 		// received all piece requests that we have sent
 		// if extra_bytes is specified, it will include those
-		// bytes as if they've been requested
-		time_duration download_queue_time(int extra_bytes = 0) const;
+		// bytes as if they've been requested. With time_critical_only, only
+		// the time critical requests not yet sent to the peer are counted
+		time_duration download_queue_time(int extra_bytes = 0
+			, bool time_critical_only = false) const;
 
 		// the download rate, in bytes per second, download_queue_time()
 		// assumes for this peer

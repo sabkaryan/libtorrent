@@ -684,6 +684,7 @@ TORRENT_TEST(download_queue_time)
 			p->add_request(piece_block(piece_index_t(0), 0), peer_connection::time_critical));
 		TEST_EQUAL(total_milliseconds(p->download_queue_time()), 327680);
 		TEST_EQUAL(total_milliseconds(p->download_queue_time(0x4000)), 655360);
+		TEST_EQUAL(total_milliseconds(p->download_queue_time(0, true)), 327680);
 		p->send_block_requests();
 	});
 
@@ -697,6 +698,9 @@ TORRENT_TEST(download_queue_time)
 		TEST_EQUAL(p->outstanding_bytes(), 0x4000);
 		TEST_EQUAL(total_milliseconds(p->download_queue_time()), 327680);
 		TEST_EQUAL(total_milliseconds(p->download_queue_time(0x4000)), 655360);
+		// Once sent, the urgent request no longer counts for the time-critical cut-off.
+		TEST_EQUAL(total_milliseconds(p->download_queue_time(0, true)), 0);
+		TEST_EQUAL(total_milliseconds(p->download_queue_time(0x4000, true)), 327680);
 
 		// Also cover a mixture of sent requests, queued urgent requests and
 		// an extra block. Unsent ordinary requests do not delay urgent ones.
@@ -705,6 +709,8 @@ TORRENT_TEST(download_queue_time)
 		TEST_CHECK(p->add_request(piece_block(piece_index_t(2), 0)));
 		TEST_EQUAL(total_milliseconds(p->download_queue_time()), 655360);
 		TEST_EQUAL(total_milliseconds(p->download_queue_time(0x4000)), 983040);
+		// Only the urgent request not yet sent, not the sent one nor the ordinary one.
+		TEST_EQUAL(total_milliseconds(p->download_queue_time(0, true)), 327680);
 		checked = true;
 	});
 
