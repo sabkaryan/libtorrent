@@ -1075,12 +1075,10 @@ namespace {
 
 		int const rate = download_rate_estimate();
 
-		// the scale before upstream 94bffc252: the outstanding bytes divided by
-		// the rate are taken as milliseconds. The time-critical requests on this
-		// line are tuned to it (see the commit that restored it)
+		// Convert all outstanding bytes to milliseconds, including sent requests.
 		return milliseconds((std::int64_t(m_outstanding_bytes) + extra_bytes
-								+ std::int64_t(m_queued_time_critical) * t->block_size() * 1000)
-			/ rate);
+								+ std::int64_t(m_queued_time_critical) * t->block_size())
+			* 1000 / rate);
 	}
 
 	int peer_connection::download_rate_estimate() const
