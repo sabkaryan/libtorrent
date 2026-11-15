@@ -11648,7 +11648,7 @@ namespace {
 			{
 #if TORRENT_DEBUG_STREAMING > 1
 				std::printf("queue time: %d ms, done\n"
-					, int(total_milliseconds(peers[0]->download_queue_time())));
+					, int(total_milliseconds(peers[0]->download_queue_time(0, true))));
 #endif
 				break;
 			}
