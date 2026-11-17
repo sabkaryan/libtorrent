@@ -507,12 +507,16 @@ namespace {
 struct punch_result
 {
 	std::vector<attempt> attempts; // outgoing attempts to the punched endpoint
+	std::vector<attempt> known; // outgoing attempts to the port the entry held before
+	lt::milliseconds punched{-1}; // when the rendezvous message was sent
 };
 
 // a fake peer that supports the hole punch extension connects to the session
 // at 50.0.0.1 and asks it to connect to 50.0.0.2:6881, an endpoint nothing
-// answers at; the session has never tried that endpoint over TCP
-punch_result run_punch()
+// answers at; the session has never tried that endpoint over TCP. With
+// known_port, the session first knows 50.0.0.2 on that port and the
+// rendezvous comes once both attempts there (TCP, then uTP) have failed
+punch_result run_punch(int const known_port = 0)
 {
 	sim::default_config cfg;
 	sim::simulation sim{cfg};
@@ -547,20 +551,40 @@ punch_result run_punch()
 	auto const start = lt::clock_type::now();
 	print_alerts(*ses, [&](lt::session&, lt::alert const* a)
 	{
-		if (lt::alert_cast<lt::add_torrent_alert>(a))
+		auto const now = [&] { return lt::duration_cast<lt::milliseconds>(lt::clock_type::now() - start); };
+		auto const punch = [&]
 		{
-			introducer->connect_to(lt::tcp::endpoint(lt::make_address_v4("50.0.0.1"), 6881), ih);
-			introducer->send_extended(0, std::string("d1:md12:ut_holepunchi4eee"));
 			// connect (1), IPv4 (0), 50.0.0.2, port 6881
 			char const msg[] = {1, 0, 50, 0, 0, 2, char(6881 >> 8), char(6881 & 0xff)};
 			introducer->send_extended(4, lt::span<char const>(msg, sizeof(msg)));
+			// before the handshake is out, connect_to() sends the buffer with it
+			if (known_port != 0) introducer->flush_send_buffer();
+			r.punched = now();
+		};
+		if (auto* at = lt::alert_cast<lt::add_torrent_alert>(a))
+		{
+			introducer->connect_to(lt::tcp::endpoint(lt::make_address_v4("50.0.0.1"), 6881), ih);
+			introducer->send_extended(0, std::string("d1:md12:ut_holepunchi4eee"));
+			if (known_port == 0)
+				punch();
+			else
+				at->handle.connect_peer(lt::tcp::endpoint(target.address(), std::uint16_t(known_port)));
 		}
 		if (auto* pc = lt::alert_cast<lt::peer_connect_alert>(a))
 		{
 			auto const e = std::get<lt::peer_alert::ip_endpoint>(pc->ep);
 			if (pc->direction == lt::peer_connect_alert::direction_t::out && e == target)
-				r.attempts.push_back({lt::duration_cast<lt::milliseconds>(lt::clock_type::now() - start)
-					, is_utp(pc->socket_type), e.port()});
+				r.attempts.push_back({now(), is_utp(pc->socket_type), e.port()});
+			if (pc->direction == lt::peer_connect_alert::direction_t::out && known_port != 0
+				&& e == lt::tcp::endpoint(target.address(), std::uint16_t(known_port)))
+				r.known.push_back({now(), is_utp(pc->socket_type), e.port()});
+		}
+		if (auto* pd = lt::alert_cast<lt::peer_disconnected_alert>(a))
+		{
+			auto const e = std::get<lt::peer_alert::ip_endpoint>(pd->ep);
+			if (known_port != 0 && r.punched.count() < 0 && r.known.size() >= 2
+				&& e == lt::tcp::endpoint(target.address(), std::uint16_t(known_port)))
+				punch();
 		}
 	});
 
@@ -655,6 +679,22 @@ TORRENT_TEST(tcp_first_hole_punch_is_utp_and_does_not_stick)
 	if (r.attempts.size() < 2) return;
 	TEST_CHECK(r.attempts[0].utp);
 	TEST_CHECK(!r.attempts[1].utp);
+}
+
+// the rendezvous names a port other than the one the entry holds: the punched
+// connection goes to the rendezvous endpoint, and the entry keeps its port, so
+// the later ordinary attempts go to the port it held. The transport of the
+// punched connection is the test above
+TORRENT_TEST(tcp_first_hole_punch_connects_to_the_rendezvous_endpoint)
+{
+	auto const r = run_punch(7000);
+	std::printf("punched at %d ms; attempts to the rendezvous endpoint: %d, to the held port: %d\n"
+		, int(r.punched.count()), int(r.attempts.size()), int(r.known.size()));
+	TEST_CHECK(r.punched.count() >= 0);
+	TEST_EQUAL(r.attempts.size(), 1);
+	auto const later = std::count_if(r.known.begin(), r.known.end()
+		, [&](attempt const& a) { return a.at > r.punched; });
+	TEST_CHECK(later > 0);
 }
 
 // the uTP attempts after TCP failures go through the connection scheduler:

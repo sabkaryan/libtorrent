@@ -1040,7 +1040,7 @@ TORRENT_TEST_DISK_IO_WITH_MEMORY(test_pread_disk_io_fence) { disk_io_test_suite(
 
 TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io_hash2_before_flush) { hash2_before_flush_suite(disk_io); }
 
-TORRENT_TEST_DISK_IO(test_disk_io_read_pad_space)
+TORRENT_TEST_DISK_IO_WITH_MEMORY(test_disk_io_read_pad_space)
 {
 	for (int const disk_threads : {0, 1})
 		read_pad_space_impl(disk_io, disk_threads);

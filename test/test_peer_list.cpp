@@ -435,6 +435,37 @@ TORRENT_TEST(update_port_by_source)
 	TEST_EQUAL(p.num_connect_candidates(), 1);
 }
 
+// prefer_utp says that TCP failed on the port the entry holds. A port that is
+// not taken leaves it as it is; a port that is taken is untried and starts
+// with TCP again
+TORRENT_TEST(prefer_utp_follows_the_port_taken)
+{
+	torrent_state st = init_state();
+	mock_torrent t(&st);
+	st.allow_multiple_connections_per_ip = false;
+	peer_list p(allocator);
+	t.m_p = &p;
+
+	torrent_peer* peer1 = p.add_peer(ep("10.0.0.2", 3000), peer_info::tracker, {}, &st);
+	TEST_CHECK(peer1);
+	if (peer1 == nullptr) return;
+	peer1->prefer_utp = true;
+
+	for (peer_source_flags_t const src : {peer_info::pex, peer_info::dht})
+	{
+		TEST_EQUAL(p.add_peer(ep("10.0.0.2", 9020), src, {}, &st), peer1);
+		TEST_EQUAL(peer1->port, 3000);
+		TEST_CHECK(peer1->prefer_utp);
+	}
+
+	TEST_EQUAL(p.add_peer(ep("10.0.0.2", 3000), peer_info::tracker, {}, &st), peer1);
+	TEST_CHECK(peer1->prefer_utp);
+
+	TEST_EQUAL(p.add_peer(ep("10.0.0.2", 4000), peer_info::tracker, {}, &st), peer1);
+	TEST_EQUAL(peer1->port, 4000);
+	TEST_CHECK(!peer1->prefer_utp);
+}
+
 // once the port we hold has failed enough to give up on, pex may replace it
 // and the peer gets a fresh start
 TORRENT_TEST(pex_updates_port_after_giving_up)
