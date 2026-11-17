@@ -712,6 +712,11 @@ namespace libtorrent::aux {
 		// whatever outgoing_tcp_first would pick
 		bool connect_to_peer(torrent_peer*, bool ignore_limit = false, bool force_utp = false);
 		bool create_peer_connection(torrent_peer* peerinfo, aux::socket_type socket, tcp::endpoint endpoint);
+		// target is the endpoint to connect to, which may differ from the
+		// peer's listen port, e.g. the NAT mapping named by a holepunch
+		// rendezvous
+		bool connect_to_peer(torrent_peer*, tcp::endpoint const& target, bool ignore_limit
+			, bool force_utp = false);
 
 		int priority() const;
 #if TORRENT_ABI_VERSION == 1
@@ -844,6 +849,10 @@ namespace libtorrent::aux {
 			, std::function<void(error_code const&, std::vector<aux::rtc_offer>)> handler) override;
 		void on_rtc_offer(aux::rtc_offer const& offer) override;
 		void on_rtc_answer(aux::rtc_answer const& answer) override;
+
+		// false if the proxy or i2p settings don't permit WebRTC
+		bool rtc_allowed() const;
+
 		void on_rtc_stream(aux::rtc_stream_init stream_init);
 #endif
 		void remove_connection(peer_connection const* p);
