@@ -719,9 +719,11 @@ static void unaligned_cross_block_read_impl(
 			lt::peer_request{p, start, length},
 			[&reads_done, read_expected = std::move(expected)](
 				lt::disk_buffer_holder b, lt::storage_error const& e) {
-				TEST_CHECK(!e.ec);
-				TEST_CHECK(std::memcmp(b.data(), read_expected.data(), read_expected.size()) == 0);
 				++reads_done;
+				TEST_CHECK(!e.ec);
+				TEST_CHECK(b);
+				if (e.ec || !b) return;
+				TEST_CHECK(std::memcmp(b.data(), read_expected.data(), read_expected.size()) == 0);
 			});
 		++reads_expected;
 		disk_thread->submit_jobs();
@@ -836,10 +838,12 @@ static void read_pad_space_impl(lt::disk_io_constructor_type disk_io, int const 
 		disk_thread->async_read(storage,
 			lt::peer_request{piece, start, block_size},
 			[&, start](lt::disk_buffer_holder b, lt::storage_error const& e) {
+				++reads_done;
 				TEST_CHECK(!e.ec);
+				TEST_CHECK(b);
+				if (e.ec || !b) return;
 				char const* const want = expected.data() + start;
 				TEST_CHECK(std::memcmp(b.data(), want, std::size_t(block_size)) == 0);
-				++reads_done;
 			});
 		++reads_expected;
 	}
@@ -1491,10 +1495,12 @@ static void test_skip_hash(lt::disk_io_constructor_type disk_io, bool const v1, 
 					expected = lt::span<char const>(buf).subspan(
 						b * lt::default_block_size, lt::default_block_size)](
 					lt::disk_buffer_holder h, lt::storage_error const& ec) {
+					++reads_done;
 					TEST_CHECK(!ec);
+					TEST_CHECK(h);
+					if (ec || !h) return;
 					TEST_CHECK(
 						std::memcmp(h.data(), expected.data(), std::size_t(expected.size())) == 0);
-					++reads_done;
 				});
 		}
 	}
